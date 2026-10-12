@@ -171,6 +171,14 @@ regime:
   context_timeframe: "1d"
   training_days: 540           # ~1,5 años de velas de 1h
   context_training_days: 1500  # velas diarias para el régimen de contexto
+  min_training_samples: 300    # menos velas útiles que esto: no se entrena
+  # Para calcular el régimen actual se usan las últimas velas de este período
+  # (incluye el calentamiento de las features). Con menos no hay datos para
+  # la línea de confianza de 30 días.
+  inference_days: 45
+  context_inference_days: 400
+  display_days: 30             # historia del régimen que se muestra (fondo del gráfico, panel)
+  burn_in_bars: 50             # primeras velas del cálculo que se descartan (arranque del filtro)
   features:
     realized_vol_window: 24    # velas para la volatilidad realizada
     volume_zscore_window: 168  # velas para el z-score del volumen (1 semana)
@@ -180,12 +188,21 @@ regime:
   covariance_type: "full"
   n_restarts: 5                # inicializaciones por cada número de estados
   max_iter: 200
+  tol: 0.0001                  # convergencia del entrenamiento
   random_seed: 42
   retrain_every_days: 7
+  # true = si el modelo tiene más de retrain_every_days días, se reentrena solo
+  # antes de analizar (tarda alrededor de un minuto).
+  auto_retrain: true
   models_dir: "data/models"
+  synthetic_models_dir: "data/models/sintetico"  # modo --offline: nunca pisa los reales
   confirmation_bars: 3         # un régimen nuevo se confirma tras 3 velas seguidas
   instability_window: 20       # ventana para contar cambios de régimen
   instability_max_changes: 4   # más de 4 cambios en 20 velas = "régimen inestable"
+  # Qué cuenta como "cambio" para confirmar e inestabilidad:
+  # "category" = solo cuando cambia el tipo (ej. Neutral → Bajista); pasar de
+  # "Alcista" a "Alcista fuerte" no cuenta. "state" = cualquier cambio de estado.
+  change_level: "category"
   # Nombres según cuántos estados elija el BIC, del más bajista al más alcista.
   # "category" es la categoría canónica que usan los ajustes de riesgo.
   labels:

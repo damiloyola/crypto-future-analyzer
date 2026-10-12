@@ -172,8 +172,8 @@ class IndicatorsConfig(_Strict):
 
 
 class RegimeFeaturesConfig(_Strict):
-    realized_vol_window: int = 24
-    volume_zscore_window: int = 168
+    realized_vol_window: int = Field(24, ge=2)
+    volume_zscore_window: int = Field(168, ge=2)
 
 
 class RegimeLabel(_Strict):
@@ -184,21 +184,30 @@ class RegimeLabel(_Strict):
 class RegimeConfig(_Strict):
     timeframe: Timeframe = "1h"
     context_timeframe: Timeframe = "1d"
-    training_days: int
-    context_training_days: int
+    training_days: int = Field(ge=30)
+    context_training_days: int = Field(ge=200)
+    min_training_samples: int = Field(300, ge=50)
+    inference_days: int = Field(45, ge=2)
+    context_inference_days: int = Field(400, ge=30)
+    display_days: int = Field(30, ge=1)
+    burn_in_bars: int = Field(50, ge=0)
     features: RegimeFeaturesConfig
     n_states_min: int = 3
     n_states_max: int = 7
     selection_criterion: Literal["bic"] = "bic"
     covariance_type: Literal["full", "diag", "spherical", "tied"] = "full"
-    n_restarts: int = 5
-    max_iter: int = 200
+    n_restarts: int = Field(5, ge=1)
+    max_iter: int = Field(200, ge=10)
+    tol: float = Field(1e-4, gt=0)
     random_seed: int = 42
-    retrain_every_days: int = 7
+    retrain_every_days: int = Field(7, ge=1)
+    auto_retrain: bool = True
     models_dir: str = "data/models"
-    confirmation_bars: int = 3
-    instability_window: int = 20
-    instability_max_changes: int = 4
+    synthetic_models_dir: str = "data/models/sintetico"
+    confirmation_bars: int = Field(3, ge=1)
+    instability_window: int = Field(20, ge=2)
+    instability_max_changes: int = Field(4, ge=0)
+    change_level: Literal["category", "state"] = "category"
     labels: dict[int, list[RegimeLabel]]
 
     @model_validator(mode="after")
