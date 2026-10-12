@@ -21,7 +21,9 @@ Opciones:
   cartel grande porque los números no son reales. ``--seed`` y ``--now``
   permiten repetir exactamente la misma corrida.
 - ``--json``: el mismo contenido en JSON (claves en inglés, números sin
-  formatear, ``null`` donde falta un dato).
+  formatear, ``null`` donde falta un dato). El régimen va en ``"regime"``
+  (``null`` con ``--no-regime``), sin el historial vela por vela.
+- ``--no-regime``: no calcula el régimen de mercado (más rápido).
 - ``--config``: otro ``config.yaml``. ``-v``: muestra los avisos de los logs.
 
 Qué imprime (en castellano, en tablas alineadas para fuente monoespaciada;
@@ -33,6 +35,17 @@ con colores ANSI solo si la salida es una terminal):
 2. precios: referencia (Binance, o Bybit si Binance falló; "no disponible"
    si no hubo ticker), Nexo (manual o "no disponible: se usa ..." con la fuente
    real del precio usado), diferencia y cambio 24 h;
+2b. régimen de mercado (Hito 3, ``app.regime.service``) de 1h (el que se usa
+   para operar) y de contexto diario: régimen actual y su tipo, confianza (la
+   probabilidad del estado más probable en la última vela; si ese estado no es
+   el régimen actual, dice cuál es), confirmado o en espera (candidato y velas
+   que lleva), "régimen inestable", hace cuánto empezó, fecha del modelo y
+   cantidad de estados, una tabla corta por régimen y los demás avisos (por
+   ejemplo, velas de Bybit porque Binance falló, o modelo entrenado con poca
+   historia). Si hay que entrenar un modelo avisa por stderr (así el JSON queda
+   limpio); en ``--offline`` usa modelos sintéticos
+   (``regime.synthetic_models_dir``). Si el régimen falla, muestra "Régimen no
+   disponible: <motivo>" y el resto sale igual;
 3. indicadores por timeframe (1d, 4h, 1h, 15m, 5m) con la última vela cerrada;
 4. soportes y resistencias de ``trade_plan.stop_timeframes`` y
    máximo/mínimo del día anterior;
@@ -52,11 +65,13 @@ con colores ANSI solo si la salida es una terminal):
    lado ganador de la entrada), lo dice así en vez de mostrar una distancia.
 
 Sale con código 1 y un mensaje claro si no se pueden conseguir los datos
-esenciales (por ejemplo, Binance y Bybit caídos, o un símbolo que no existe), y
+esenciales (por ejemplo, Binance y Bybit caídos, o un símbolo que no existe),
 con 2 si los argumentos o la configuración no son válidos (incluido un YAML mal
-escrito). Siempre cierra el cliente HTTP. Nunca muestra las keys de ``.env``.
-Los textos de terceros (titulares, fuentes, avisos) se imprimen sin caracteres
-de control, así no pueden meter secuencias de escape en la terminal.
+escrito) y con 130 si se cancela con Ctrl+C (sale enseguida, también durante el
+entrenamiento del régimen, que no se guarda). Siempre cierra el cliente HTTP.
+Nunca muestra las keys de ``.env``. Los textos de terceros (titulares, fuentes,
+avisos) se imprimen sin caracteres de control, así no pueden meter secuencias de
+escape en la terminal.
 """
 
 from __future__ import annotations
@@ -66,6 +81,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
 import sys
 from collections.abc import Callable, Sequence
@@ -88,12 +104,13 @@ from app.data.snapshot import (
     funding_summary,
     long_short_change_pct,
 )
-from app.data.synthetic import DEFAULT_SEED
+from app.data.synthetic import DEFAULT_SEED, SyntheticMarketData
 from app.exchanges.base import TIMEFRAME_MINUTES
 from app.exchanges.registry import build_market_data, build_nexo_price_source
 from app.http_client import make_client
 from app.indicators.levels import Level, SRResult
 from app.indicators.pipeline import MarketAnalysis, TimeframeSummary, analyze_all
+from app.regime.service import get_market_regimes, regime_history_days, regimes_to_dict
 from app.risk.fees import fee_rates_from_config, fees_pct_of
 from app.risk.liquidation import (
     check_liquidation_vs_stop,
@@ -109,6 +126,8 @@ from app.risk.stops import StopNotFound, structural_stop
 
 OFFLINE_BANNER = "DATOS SINTÉTICOS (sin red): los números no son reales"
 SIZING_TITLE = "Ejemplo didáctico de sizing (el plan real llega en el Hito 4)"
+REGIME_TITLE = "Régimen de mercado"
+REGIME_UNAVAILABLE = "Régimen no disponible"
 DASH = "—"
 SOURCE_LABELS = {
     "binance": "Binance",
@@ -121,6 +140,8 @@ TITLE_WIDTH = 90
 EXIT_OK = 0
 EXIT_DATA = 1
 EXIT_USAGE = 2
+EXIT_INTERRUPTED = 130
+CANCELLED = "Cancelado por el usuario."
 
 
 # --- formato de números (estilo argentino: 1.234,56) ---------------------------
@@ -567,8 +588,12 @@ def build_report(
     analysis: MarketAnalysis,
     settings: AppSettings,
     profile_name: str,
+    regime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Todo el contenido de la salida, en un dict serializable a JSON."""
+    """Todo el contenido de la salida, en un dict serializable a JSON.
+
+    ``regime``: lo que devuelve ``regimes_to_dict`` (o ``None`` si no se calculó).
+    """
     ex = snapshot.execution_price
     ticker = snapshot.ticker
     reference = ticker.price if ticker else (ex.binance_price if ex else None)
@@ -624,6 +649,7 @@ def build_report(
             "execution_price": snapshot.current_price,
             "execution_source": snapshot.price_source,
         },
+        "regime": regime,
         "timeframes": {tf: _summary_dict(ta.summary) for tf, ta in analysis.timeframes.items()},
         "levels": {tf: _levels_dict(analysis.timeframes[tf].summary.levels) for tf in stop_tfs},
         "daily_range": {
@@ -822,6 +848,170 @@ def _render_prices(r: dict[str, Any], style: Style) -> list[str]:
         ),
     ]
     return lines + _kv(rows, style)
+
+
+_CATEGORY_COLOR = {
+    "crash": "alert",
+    "bajista": "red",
+    "neutral": "yellow",
+    "alcista": "green",
+    "euforia": "green",
+}
+# Avisos del régimen que ya se muestran en sus propias filas. ``data_source``
+# solo se calla si las velas son sintéticas (ya lo dice el cartel); si vinieron
+# de Bybit porque Binance falló, se muestra.
+_REGIME_CODES_SHOWN = {"pending", "low_confidence", "unstable", "unconfirmed"}
+_SYNTHETIC_SOURCE = "sintetico"
+
+
+def fmt_duration(bars: Any, minutes: Any, decimals: int = 0) -> str:
+    """Duración de ``bars`` velas de ``minutes`` minutos: ``"14 h"`` o ``"3 días"``."""
+    b, m = _finite(bars), _finite(minutes)
+    if b is None or m is None:
+        return DASH
+    if m < 1440:
+        return f"{fmt_num(b * m / 60.0, decimals)} h"
+    days = b * m / 1440.0
+    text = fmt_num(days, decimals)
+    return f"{text} {'día' if text in ('1', '1,0') else 'días'}"
+
+
+def render_regime_states(
+    rows: Sequence[dict[str, Any]], minutes: Any, style: Style, *, indent: int = 4
+) -> list[str]:
+    """Tabla por régimen (de ``labels.regime_stats_table``), del más bajista al más alcista."""
+    table = []
+    for row in rows:
+        table.append(
+            [
+                Cell(printable(row["name"]), _CATEGORY_COLOR.get(row["category"])),
+                printable(row["category"]),
+                Cell(
+                    fmt_pct(row["mean_return_pct"], 3, sign=True),
+                    _signed_color(row["mean_return_pct"]),
+                ),
+                fmt_pct(row["mean_volatility_pct"], 2),
+                fmt_duration(row["expected_duration_bars"], minutes, 1),
+                fmt_pct(row["occupancy_pct"], 1),
+                Cell("← ahora", "bold") if row.get("is_current") else "",
+            ]
+        )
+    return render_table(
+        table,
+        style,
+        header=[
+            "Régimen",
+            "Tipo",
+            "Retorno medio por vela",
+            "Volatilidad media",
+            "Duración típica",
+            "% del tiempo",
+            "",
+        ],
+        aligns="<<>>>><",
+        indent=indent,
+    )
+
+
+def _render_one_regime(tf: str, g: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
+    role = "contexto diario" if g.get("is_context") else "el que se usa para operar"
+    lines = ["", style.paint(f"  {tf} · {role}", "bold")]
+    if not g.get("available"):
+        reason = printable(g.get("reason") or "motivo desconocido")
+        lines.append(style.paint(f"    {REGIME_UNAVAILABLE}: {reason}", "yellow"))
+        return lines
+    minutes = g["timeframe_minutes"]
+    state = "confirmado" if g["confirmed"] else "todavía sin confirmar"
+    current = Cell(
+        f"{printable(g['name'])} (tipo {printable(g['category'])}), {state}",
+        _CATEGORY_COLOR.get(g["category"]),
+    )
+    # Confianza = probabilidad del estado más probable en la última vela. Si ese
+    # estado no es el régimen actual (por ejemplo, hay un cambio en espera), se
+    # dice cuál es, así el número no se confunde con el del régimen actual.
+    top = g["top_state"]
+    notes = []
+    if top["name"] != g["name"]:
+        notes.append(f"lo más probable en la última vela es {printable(top['name'])}")
+    if g["low_confidence"]:
+        threshold = fmt_pct((_finite(g["low_confidence_threshold"]) or 0) * 100, 0)
+        notes.append(f"baja: menos de {threshold}")
+    conf_text = fmt_pct(g["confidence_pct"], 0)
+    if notes:
+        conf_text += f" ({'; '.join(notes)})"
+    confidence = Cell(conf_text, "yellow" if g["low_confidence"] else None)
+    ago = fmt_duration(g["age_bars"], minutes)
+    started = "hace más de " if g["age_is_lower_bound"] else "hace "
+    # Las velas diarias arrancan a las 00:00 UTC: se muestra la fecha UTC.
+    when = (
+        fmt_time(g["started_at"], ZoneInfo("UTC")).split()[0]
+        if (_finite(minutes) or 0) >= 1440
+        else fmt_time(g["started_at"], tz)
+    )
+    started += f"{ago} ({when})"
+    rows: list[tuple[str, Cell | str]] = [
+        ("Régimen actual", current),
+        ("Confianza", confidence),
+        ("Empezó", started),
+    ]
+    pending = g["pending"]
+    if pending is not None:
+        rows.append(
+            (
+                "Posible cambio",
+                Cell(
+                    f"a {printable(pending['name'])}: lleva {pending['bars']} de "
+                    f"{pending['needed']} velas seguidas para confirmarse",
+                    "yellow",
+                ),
+            )
+        )
+    window, limit = g["instability_window"], g["instability_max_changes"]
+    changes = g["changes_in_window"]
+    if g["unstable"]:
+        stability = Cell(
+            f"RÉGIMEN INESTABLE: {changes} cambios en las últimas {window} velas (más de "
+            f"{limit}); conviene operar más chico",
+            "alert",
+        )
+    else:
+        stability = Cell(
+            f"estable: {changes} cambios en las últimas {window} velas (inestable si son más "
+            f"de {limit})"
+        )
+    rows.append(("Estabilidad", stability))
+    m = g["model"]
+    model_text = (
+        f"del {fmt_time(m['trained_at'], tz)}, {m['n_states']} estados (elegidos por BIC), "
+        f"{fmt_num(m['n_samples'], 0)} velas"
+    )
+    if m["synthetic"]:
+        model_text += ", datos sintéticos"
+    rows.append(("Modelo", model_text))
+    lines += _kv(rows, style, indent=4)
+    lines.append("")
+    lines += render_regime_states(g["states"], minutes, style, indent=4)
+    synthetic = g.get("data_source") == _SYNTHETIC_SOURCE
+    others = [
+        w
+        for w, code in zip(g["warnings"], g["warning_codes"], strict=False)
+        if code not in _REGIME_CODES_SHOWN and not (code == "data_source" and synthetic)
+    ]
+    for w in others:
+        lines.append(style.paint(f"    · {printable(w)}", "yellow"))
+    return lines
+
+
+def _render_regime(r: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
+    regimes = r.get("regime")
+    if regimes is None:
+        return []
+    lines = _section(REGIME_TITLE, style)
+    note = "  Qué tipo de mercado hay según un modelo estadístico (HMM). No predice el precio."
+    lines.append(style.paint(note, "dim"))
+    for tf, g in regimes.items():
+        lines += _render_one_regime(tf, g, style, tz)
+    return lines
 
 
 def _render_timeframes(r: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
@@ -1197,6 +1387,7 @@ def render_text(report: dict[str, Any], *, color: bool = False) -> str:
     lines: list[str] = []
     lines += _render_header(report, style, tz)
     lines += _render_prices(report, style)
+    lines += _render_regime(report, style, tz)
     lines += _render_timeframes(report, style, tz)
     lines += _render_levels(report, style, tz)
     lines += _render_derivatives(report, style, tz)
@@ -1286,6 +1477,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--offline", action="store_true", help="datos sintéticos, sin red")
     parser.add_argument("--json", action="store_true", help="salida en JSON")
+    parser.add_argument(
+        "--no-regime", action="store_true", help="no calcula el régimen de mercado (más rápido)"
+    )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="semilla del modo --offline")
     parser.add_argument(
         "--now",
@@ -1300,13 +1494,55 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _fetch_snapshot(
-    symbol: str, settings: AppSettings, args: argparse.Namespace
-) -> MarketSnapshot:
+async def _regime_report(
+    symbol: str,
+    settings: AppSettings,
+    market_data: Any,
+    *,
+    synthetic: bool,
+    clock: Callable[[], datetime] | None,
+    err: TextIO,
+) -> dict[str, Any]:
+    """Régimen de 1h y diario para el reporte; nunca lanza (un error queda como motivo)."""
+
+    def notify(message: str) -> None:
+        print(message, file=err, flush=True)
+
+    kwargs: dict[str, Any] = {"synthetic": synthetic, "notify": notify}
+    if clock is not None:
+        kwargs["clock"] = clock
+    try:
+        results = await get_market_regimes(symbol, settings, market_data, **kwargs)
+        return regimes_to_dict(results, include_history=False)
+    except Exception as exc:  # el régimen nunca tira abajo la consola
+        logging.getLogger(__name__).exception("Falló el régimen de %s", symbol)
+        reason = f"error inesperado ({type(exc).__name__}: {exc})"
+        tfs = dict.fromkeys([settings.regime.timeframe, settings.regime.context_timeframe])
+        return {tf: {"available": False, "timeframe": tf, "reason": reason} for tf in tfs}
+
+
+async def _fetch_data(
+    symbol: str, settings: AppSettings, args: argparse.Namespace, err: TextIO
+) -> tuple[MarketSnapshot, dict[str, Any] | None]:
+    """Snapshot de mercado y, si no se pidió ``--no-regime``, el régimen."""
+    want_regime = not args.no_regime
     if args.offline:
-        return await build_offline_snapshot(
-            symbol, settings, args.nexo_price, seed=args.seed, now=args.now
+        market = SyntheticMarketData(
+            seed=args.seed,
+            now=args.now,
+            funding_interval_hours=settings.fees.funding_interval_hours,
+            # Historia larga para entrenar el régimen; las velas recientes no cambian.
+            min_history_days=regime_history_days(settings.regime) if want_regime else None,
         )
+        snapshot = await build_offline_snapshot(
+            symbol, settings, args.nexo_price, seed=args.seed, now=args.now, market=market
+        )
+        regime = None
+        if want_regime:
+            regime = await _regime_report(
+                snapshot.symbol, settings, market, synthetic=True, clock=lambda: market.now, err=err
+            )
+        return snapshot, regime
     secrets = get_secrets()
     async with AsyncExitStack() as stack:
         client = make_client(settings.exchanges.request_timeout_s)
@@ -1316,9 +1552,15 @@ async def _fetch_snapshot(
         stack.push_async_callback(market_data.aclose)
         nexo = build_nexo_price_source(settings)
         stack.push_async_callback(nexo.aclose)
-        return await build_snapshot(
+        snapshot = await build_snapshot(
             symbol, settings, market_data, nexo, client, cache, secrets, args.nexo_price
         )
+        regime = None
+        if want_regime:
+            regime = await _regime_report(
+                snapshot.symbol, settings, market_data, synthetic=False, clock=None, err=err
+            )
+        return snapshot, regime
 
 
 def main(
@@ -1349,7 +1591,10 @@ def main(
         return EXIT_USAGE
 
     try:
-        snapshot = asyncio.run(_fetch_snapshot(symbol, settings, args))
+        snapshot, regime = asyncio.run(_fetch_data(symbol, settings, args, err))
+    except KeyboardInterrupt:
+        print(f"\n{CANCELLED}", file=err)
+        return EXIT_INTERRUPTED
     except EssentialDataError as exc:
         print(f"No se pudieron conseguir los datos esenciales. {exc}", file=err)
         return EXIT_DATA
@@ -1360,7 +1605,7 @@ def main(
     analysis = analyze_all(
         snapshot.candles, settings, snapshot.current_price, now=snapshot.created_at
     )
-    report = build_report(snapshot, analysis, settings, profile)
+    report = build_report(snapshot, analysis, settings, profile, regime)
     if args.json:
         out.write(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
     else:
@@ -1369,5 +1614,20 @@ def main(
     return EXIT_OK
 
 
+def exit_process(code: int) -> None:
+    """Termina el proceso con ``code``.
+
+    Después de un Ctrl+C puede seguir corriendo, en su hilo, un entrenamiento
+    del régimen que ya se descartó. Para no esperarlo (puede tardar minutos),
+    se vacían las salidas y se sale con ``os._exit``, sin la finalización
+    normal de Python.
+    """
+    if code == EXIT_INTERRUPTED:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
+    sys.exit(code)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    exit_process(main())

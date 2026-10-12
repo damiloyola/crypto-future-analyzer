@@ -12,6 +12,12 @@ Velas
     del día, etc. La serie arranca a las 00:00 UTC de ``history_days`` días
     atrás y termina en la vela de 5m que se está formando (``closed=False``).
 
+    Con ``min_history_days`` (o ``prehistory_days``) se agregan velas más
+    viejas antes de ese inicio, con otra semilla y el mismo generador, para
+    entrenar el detector de régimen (1,5 años de 1h, 4 años de 1d) sin cambiar
+    ni una vela de la serie reciente. Generar 1.600 días de velas de 5m tarda
+    menos de medio segundo.
+
     La serie base cambia de régimen por tramos de entre 6 horas y 5 días:
 
     - ``up`` / ``down``: tendencia con deriva diaria de 0,4 a 1,2 veces la
@@ -190,28 +196,15 @@ def _timeframe_minutes(timeframe: str) -> int:
 # --- serie base y agregación ---------------------------------------------------
 
 
-def generate_base_candles(
-    symbol: str,
-    *,
-    now: datetime,
-    seed: int = DEFAULT_SEED,
-    history_days: int = DEFAULT_HISTORY_DAYS,
-) -> pd.DataFrame:
-    """Velas de 5m desde las 00:00 UTC de ``history_days`` días atrás hasta ``now``.
+def _simulate_returns(
+    rng: np.random.Generator, n: int, profile: CoinProfile
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Retornos logarítmicos de ``n`` velas de 5m que arrancan a las 00:00 UTC.
 
-    Devuelve el DataFrame con las convenciones de ``exchanges.base`` (índice
-    ``open_time`` UTC, OHLCV y ``closed``). La última vela es la que se forma.
+    Devuelve ``(log_ret, vol_mult, z, vol_season, volume_season)``: los
+    retornos por tramos de régimen, el multiplicador de volatilidad de cada
+    vela, el shock estandarizado y los ciclos diarios de volatilidad y volumen.
     """
-    if history_days < 1:
-        raise ValueError("history_days tiene que ser >= 1")
-    now = _to_utc(now)
-    s = _norm_symbol(symbol)
-    profile = coin_profile(s)
-    start = _floor(now, 24 * 60) - timedelta(days=history_days)
-    last_open = _floor(now, BASE_MINUTES)
-    n = int((last_open - start).total_seconds() // (BASE_MINUTES * 60)) + 1
-    rng = _rng("candles", seed, s)
-
     # Ciclo diario: más movimiento y volumen cerca de las 14:30 UTC.
     minute_of_day = (np.arange(n) * BASE_MINUTES) % (24 * 60)
     phase = np.cos(2 * np.pi * (minute_of_day / 60.0 - 14.5) / 24.0)
@@ -258,9 +251,23 @@ def generate_base_candles(
         vol_mult[seg] = mult
         level += float(r.sum())
         i = j
+    return log_ret, vol_mult, z, vol_season, volume_season
 
+
+def _ohlcv_from_returns(
+    rng: np.random.Generator,
+    simulated: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    profile: CoinProfile,
+    end_price: float,
+) -> dict[str, np.ndarray]:
+    """Arma open/high/low/close/volume a partir de los retornos simulados.
+
+    La serie se escala para que el último cierre sea ``end_price``.
+    """
+    log_ret, vol_mult, z, vol_season, volume_season = simulated
+    n = len(log_ret)
+    bar_vol = profile.daily_vol / math.sqrt(BARS_PER_DAY)
     log_close = np.cumsum(log_ret)
-    end_price = profile.base_price * math.exp(float(rng.uniform(-0.04, 0.04)))
     close = np.exp(log_close - log_close[-1]) * end_price
     open_ = np.empty(n)
     open_[0] = close[0] / math.exp(log_ret[0])
@@ -275,20 +282,57 @@ def generate_base_candles(
         * np.exp(rng.normal(0, 0.3, n) - 0.045)
         * (0.6 + 0.4 * np.abs(z))
     )
+    return {"open": open_, "high": high, "low": low, "close": close, "volume": volume}
+
+
+def generate_base_candles(
+    symbol: str,
+    *,
+    now: datetime,
+    seed: int = DEFAULT_SEED,
+    history_days: int = DEFAULT_HISTORY_DAYS,
+    prehistory_days: int = 0,
+) -> pd.DataFrame:
+    """Velas de 5m desde las 00:00 UTC de ``history_days`` días atrás hasta ``now``.
+
+    Devuelve el DataFrame con las convenciones de ``exchanges.base`` (índice
+    ``open_time`` UTC, OHLCV y ``closed``). La última vela es la que se forma.
+
+    ``prehistory_days`` agrega velas **más viejas** antes de ese inicio (para
+    entrenar el detector de régimen con años de historia). Salen de otra
+    semilla, con el mismo generador de tramos, y empalman con la primera vela
+    de la serie: las velas de los últimos ``history_days`` días quedan
+    exactamente iguales que sin prehistoria.
+    """
+    if history_days < 1:
+        raise ValueError("history_days tiene que ser >= 1")
+    if prehistory_days < 0:
+        raise ValueError("prehistory_days tiene que ser >= 0")
+    now = _to_utc(now)
+    s = _norm_symbol(symbol)
+    profile = coin_profile(s)
+    start = _floor(now, 24 * 60) - timedelta(days=history_days)
+    last_open = _floor(now, BASE_MINUTES)
+    n = int((last_open - start).total_seconds() // (BASE_MINUTES * 60)) + 1
+    rng = _rng("candles", seed, s)
+
+    simulated = _simulate_returns(rng, n, profile)
+    end_price = profile.base_price * math.exp(float(rng.uniform(-0.04, 0.04)))
+    columns = _ohlcv_from_returns(rng, simulated, profile, end_price)
+
+    if prehistory_days:
+        n_pre = prehistory_days * BARS_PER_DAY
+        rng_pre = _rng("candles-prehistory", seed, s, prehistory_days)
+        simulated_pre = _simulate_returns(rng_pre, n_pre, profile)
+        # El último cierre de la prehistoria es la apertura de la primera vela.
+        pre = _ohlcv_from_returns(rng_pre, simulated_pre, profile, float(columns["open"][0]))
+        columns = {k: np.concatenate([pre[k], columns[k]]) for k in columns}
+        start -= timedelta(days=prehistory_days)
+        n += n_pre
 
     index = pd.date_range(start, periods=n, freq=f"{BASE_MINUTES}min", tz="UTC", name="open_time")
     closed = (index + pd.Timedelta(minutes=BASE_MINUTES)) <= pd.Timestamp(now)
-    df = pd.DataFrame(
-        {
-            "open": open_,
-            "high": high,
-            "low": low,
-            "close": close,
-            "volume": volume,
-            "closed": closed,
-        },
-        index=index,
-    )
+    df = pd.DataFrame({**columns, "closed": closed}, index=index)
     return validate_candles_frame(df)
 
 
@@ -331,6 +375,12 @@ class SyntheticMarketData:
     ``now`` queda fijo al crear la instancia (por defecto, la hora actual), así
     todas las consultas ven el mismo mercado. Las series se generan la primera
     vez que se piden y se guardan en la instancia.
+
+    ``min_history_days``: días de historia que tienen que estar disponibles
+    (por ejemplo ``regime.context_training_days`` para entrenar el régimen
+    diario). Si es mayor que ``history_days``, la diferencia se agrega como
+    prehistoria (ver ``generate_base_candles``): las velas recientes, el
+    ticker y los derivados quedan idénticos a los de una instancia sin ella.
     """
 
     name = SYNTHETIC_SOURCE
@@ -342,12 +392,16 @@ class SyntheticMarketData:
         now: datetime | None = None,
         history_days: int = DEFAULT_HISTORY_DAYS,
         funding_interval_hours: float = 8.0,
+        min_history_days: int | None = None,
     ) -> None:
         if funding_interval_hours <= 0:
             raise ValueError("funding_interval_hours tiene que ser > 0")
+        if min_history_days is not None and min_history_days < 1:
+            raise ValueError("min_history_days tiene que ser >= 1")
         self.seed = seed
         self.now = _to_utc(now) if now is not None else datetime.now(UTC)
         self.history_days = history_days
+        self.prehistory_days = max(0, (min_history_days or 0) - history_days)
         self.funding_interval_hours = float(funding_interval_hours)
         self._base: dict[str, pd.DataFrame] = {}
         self._frames: dict[tuple[str, str], pd.DataFrame] = {}
@@ -365,7 +419,11 @@ class SyntheticMarketData:
         s = _norm_symbol(symbol)
         if s not in self._base:
             self._base[s] = generate_base_candles(
-                s, now=self.now, seed=self.seed, history_days=self.history_days
+                s,
+                now=self.now,
+                seed=self.seed,
+                history_days=self.history_days,
+                prehistory_days=self.prehistory_days,
             )
         return self._base[s]
 

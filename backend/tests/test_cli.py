@@ -1,4 +1,9 @@
-"""Script de consola: salida de texto y JSON en modo sin red, errores y cierre del cliente."""
+"""Script de consola: salida de texto y JSON en modo sin red, errores y cierre del cliente.
+
+El régimen de mercado se calcula con una config chica (entrena en menos de un
+segundo) y con las carpetas de modelos en un directorio temporal: los tests
+nunca escriben en ``data/models``.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,7 @@ from pathlib import Path
 import httpx
 import pytest
 import respx
+import yaml
 
 from app.config import DEFAULT_CONFIG_PATH, Secrets
 from app.data.synthetic import DEFAULT_SEED, SyntheticMarketData
@@ -18,9 +24,12 @@ from scripts import analyze_cli
 from scripts.analyze_cli import (
     DASH,
     OFFLINE_BANNER,
+    REGIME_TITLE,
+    REGIME_UNAVAILABLE,
     SIZING_TITLE,
     build_report,
     fmt_compact_usd,
+    fmt_duration,
     fmt_num,
     fmt_pct,
     main,
@@ -34,6 +43,7 @@ from tests.fakes import FIXED_NOW, FIXED_NOW_ISO, FakeMarketData
 SECTIONS = [
     "Fuentes de datos",
     "Precios",
+    REGIME_TITLE,
     "Indicadores por timeframe",
     "Soportes y resistencias",
     "Rango diario típico",
@@ -44,9 +54,46 @@ SECTIONS = [
 LEAKS = re.compile(r"\b(nan|none|inf|null)\b", re.IGNORECASE)
 
 
+def write_small_config(root: Path, **regime_changes) -> Path:
+    """``config.yaml`` real con un régimen chico y rápido, y modelos dentro de ``root``."""
+    data = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    data["regime"].update(
+        {
+            "n_states_min": 3,
+            "n_states_max": 4,
+            "n_restarts": 1,
+            "max_iter": 25,
+            "training_days": 60,
+            "context_training_days": 400,
+            "min_training_samples": 100,
+            "models_dir": str(root / "reales"),
+            "synthetic_models_dir": str(root / "sinteticos"),
+            **regime_changes,
+        }
+    )
+    path = root / "config.yaml"
+    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return path
+
+
+_CONFIG: dict[str, Path] = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def small_config(tmp_path_factory) -> Path:
+    path = write_small_config(tmp_path_factory.mktemp("cli"))
+    _CONFIG["path"] = path
+    yield path
+    _CONFIG.clear()
+
+
 def run(*argv: str) -> tuple[int, str, str]:
+    """Corre la consola; sin ``--config`` usa la config chica del módulo."""
+    args = list(argv)
+    if "--config" not in args and "path" in _CONFIG:
+        args += ["--config", str(_CONFIG["path"])]
     out, err = io.StringIO(), io.StringIO()
-    code = main(list(argv), out=out, err=err)
+    code = main(args, out=out, err=err)
     return code, out.getvalue(), err.getvalue()
 
 
@@ -56,14 +103,14 @@ def synthetic_price(symbol: str) -> float:
 
 
 @pytest.fixture(scope="module")
-def btc_text() -> str:
+def btc_text(small_config) -> str:
     code, out, err = run("BTC", "--offline", "--now", FIXED_NOW_ISO)
     assert code == 0, err
     return out
 
 
 @pytest.fixture(scope="module")
-def btc_json() -> dict:
+def btc_json(small_config) -> dict:
     code, out, err = run("BTC", "--offline", "--json", "--now", FIXED_NOW_ISO)
     assert code == 0, err
     return json.loads(out)
@@ -147,6 +194,7 @@ def test_json_output_structure(btc_json):
     assert r["prices"]["execution_source"] == "binance"
     assert r["prices"]["nexo_price"] is None
     assert len(r["sentiment"]["headlines"]) > 0
+    assert list(r["regime"]) == ["1h", "1d"]
 
 
 def test_json_numbers_are_plausible(btc_json):
@@ -320,7 +368,15 @@ def test_short_born_liquidated_is_said_plainly(tmp_path):
         original.replace("min_stop_distance_atr: 1.0", "min_stop_distance_atr: 0"),
         encoding="utf-8",
     )
-    argv = ("BTC", "--offline", "--now", "2026-10-12T04:36:39Z", "--config", str(cfg))
+    argv = (
+        "BTC",
+        "--offline",
+        "--now",
+        "2026-10-12T04:36:39Z",
+        "--config",
+        str(cfg),
+        "--no-regime",
+    )
     code, out, err = run(*argv, "--json")
     assert code == 0, err
     short = json.loads(out)["sizing_example"]["short"]
@@ -423,6 +479,7 @@ def test_live_mode_prints_with_fake_market_and_closes_everything(
     assert "No se pudo obtener el índice de miedo y codicia (HTTP 451)" in out
     assert "No pudimos leer ningún feed de noticias" in out
     assert "Sin titulares por ahora." in out
+    assert REGIME_TITLE in out and "datos sintéticos" not in out  # modelo "real" (en tmp)
     assert LEAKS.search(out) is None
     assert fake.closed
     assert len(tracked_clients) == 1 and tracked_clients[0].is_closed
@@ -543,3 +600,171 @@ def test_number_formatting():
     assert fmt_compact_usd(512e6) == "512,00 millones USD"
     assert fmt_compact_usd(1234.0) == "1.234,00 USD"
     assert fmt_compact_usd(None) == DASH
+
+
+# --- régimen de mercado -------------------------------------------------------------
+
+
+def _regime_block(text: str) -> str:
+    return text[text.index(f"━━ {REGIME_TITLE}") : text.index("━━ Indicadores por timeframe")]
+
+
+def test_regime_section_comes_after_prices(btc_text):
+    assert btc_text.index("━━ Precios") < btc_text.index(f"━━ {REGIME_TITLE}")
+    assert btc_text.index(f"━━ {REGIME_TITLE}") < btc_text.index("━━ Indicadores por timeframe")
+
+
+def test_regime_section_shows_both_timeframes(btc_text, btc_json):
+    block = _regime_block(btc_text)
+    assert "1h · el que se usa para operar" in block
+    assert "1d · contexto diario" in block
+    for label in ("Régimen actual", "Confianza", "Empezó", "Estabilidad", "Modelo"):
+        assert block.count(label) == 2, label
+    assert "Retorno medio por vela" in block and "% del tiempo" in block
+    assert block.count("← ahora") == 2
+    assert "elegidos por BIC" in block and "datos sintéticos" in block
+    for tf in ("1h", "1d"):
+        g = btc_json["regime"][tf]
+        assert g["name"] in block
+        assert f"{fmt_num(g['confidence_pct'], 0)} %" in block
+        span = fmt_duration(g["age_bars"], g["timeframe_minutes"])
+        assert span in block
+        assert ("RÉGIMEN INESTABLE" in block) or not g["unstable"]
+        if g["pending"]:
+            assert f"lleva {g['pending']['bars']} de {g['pending']['needed']} velas" in block
+    assert " h (" in block and " días (" in block  # 1h en horas, 1d en días
+    assert LEAKS.search(block) is None
+
+
+def test_regime_json_structure(btc_json):
+    for tf, minutes in (("1h", 60), ("1d", 1440)):
+        g = btc_json["regime"][tf]
+        assert g["available"] is True and g["timeframe"] == tf
+        assert g["timeframe_minutes"] == minutes
+        assert g["symbol"] == "BTC" and g["model"]["synthetic"] is True
+        assert 0 <= g["confidence_pct"] <= 100
+        assert g["category"] in {"crash", "bajista", "neutral", "alcista", "euforia"}
+        assert "history" not in g and g["history_bars"] > 0
+        assert set(g["model"]["bic_by_n"]) == {"3", "4"}
+        assert len(g["states"]) == g["model"]["n_states"]
+        assert isinstance(g["confirmed"], bool) and isinstance(g["unstable"], bool)
+    assert btc_json["regime"]["1h"]["role"] == "main"
+    assert btc_json["regime"]["1d"]["role"] == "context"
+
+
+def test_no_regime_hides_the_section():
+    code, out, err = run("BTC", "--offline", "--now", FIXED_NOW_ISO, "--no-regime")
+    assert code == 0, err
+    assert REGIME_TITLE not in out and "Entrenando" not in err
+    code, out, _ = run("BTC", "--offline", "--now", FIXED_NOW_ISO, "--no-regime", "--json")
+    assert code == 0 and json.loads(out)["regime"] is None
+
+
+def test_training_note_goes_to_stderr_and_json_stays_clean(tmp_path):
+    cfg = write_small_config(tmp_path)
+    argv = ("ETH", "--offline", "--json", "--now", FIXED_NOW_ISO, "--config", str(cfg))
+    code, out, err = run(*argv)
+    assert code == 0, err
+    assert "Entrenando el modelo de régimen de ETH 1h" in err
+    assert "Entrenando el modelo de régimen de ETH 1d" in err
+    report = json.loads(out)  # stdout es solo el JSON
+    assert report["regime"]["1h"]["model"]["retrained_now"] is True
+    assert (tmp_path / "sinteticos" / "ETH_1h.joblib").is_file()
+    assert (tmp_path / "sinteticos" / "ETH_1d.joblib").is_file()
+    assert not (tmp_path / "reales").exists()  # --offline nunca toca los modelos reales
+    code, out, err = run(*argv)
+    assert code == 0 and "Entrenando" not in err
+    assert json.loads(out)["regime"]["1h"]["model"]["retrained_now"] is False
+
+
+def test_regime_unavailable_does_not_break_the_cli(tmp_path):
+    cfg = write_small_config(tmp_path, min_training_samples=50_000)
+    code, out, err = run("BTC", "--offline", "--now", FIXED_NOW_ISO, "--config", str(cfg))
+    assert code == 0, err
+    block = _regime_block(out)
+    assert block.count(f"{REGIME_UNAVAILABLE}: no hay suficiente historia") == 2
+    assert SIZING_TITLE in out
+    assert LEAKS.search(out) is None
+    code, out, _ = run("BTC", "--offline", "--json", "--now", FIXED_NOW_ISO, "--config", str(cfg))
+    regime = json.loads(out)["regime"]
+    assert regime["1h"]["available"] is False and "suficiente historia" in regime["1h"]["reason"]
+
+
+def test_offline_regime_does_not_change_market_numbers(tmp_path):
+    # context_training_days=900 obliga a agregar ~380 días de prehistoria sintética.
+    cfg = write_small_config(tmp_path, context_training_days=900)
+    argv = ("BTC", "--offline", "--json", "--now", FIXED_NOW_ISO, "--config", str(cfg))
+    code, out, err = run(*argv)
+    assert code == 0, err
+    with_regime = json.loads(out)
+    assert with_regime["regime"]["1d"]["model"]["n_samples"] > 700
+    code, out, _ = run(*argv, "--no-regime")
+    without = json.loads(out)
+    # La historia larga para el régimen agrega velas viejas pero no cambia las recientes.
+    for key in ("prices", "timeframes", "levels", "daily_range", "derivatives", "sizing_example"):
+        assert without[key] == with_regime[key], key
+
+
+def test_fmt_duration():
+    assert fmt_duration(14, 60) == "14 h"
+    assert fmt_duration(1.94, 60, 1) == "1,9 h"
+    assert fmt_duration(3, 1440) == "3 días"
+    assert fmt_duration(1, 1440) == "1 día"
+    assert fmt_duration(2.25, 1440, 1) == "2,2 días" or fmt_duration(2.25, 1440, 1) == "2,3 días"
+    assert fmt_duration(None, 60) == DASH
+
+
+def test_confidence_row_names_the_top_state_when_it_is_not_the_regime(btc_json):
+    # Regresión: decía "Confianza 0 %" (la del régimen confirmado) y escondía que
+    # el modelo veía otro estado al 97 %. Ahora la confianza es la del estado más
+    # probable y, si no es el régimen actual, se dice cuál es.
+    g = dict(btc_json["regime"]["1h"])
+    style = analyze_cli.Style(enabled=False)
+    tz = analyze_cli._tz("UTC")
+    other = next(s["name"] for s in g["states"] if s["name"] != g["name"])
+    g.update(
+        confidence=0.97,
+        confidence_pct=97.0,
+        low_confidence=False,
+        top_state={"name": other, "category": "euforia", "prob": 0.97},
+    )
+    text = "\n".join(analyze_cli._render_one_regime("1h", g, style, tz))
+    assert f"97 % (lo más probable en la última vela es {other})" in text
+    assert "baja" not in text.split("Confianza", 1)[1].splitlines()[0]
+    g.update(
+        confidence=0.4,
+        confidence_pct=40.0,
+        low_confidence=True,
+        top_state={"name": g["name"], "category": g["category"], "prob": 0.4},
+    )
+    text = "\n".join(analyze_cli._render_one_regime("1h", g, style, tz))
+    line = next(x for x in text.splitlines() if "Confianza" in x)
+    assert line.rstrip().endswith("40 % (baja: menos de 60 %)")
+
+
+def test_regime_candles_from_bybit_are_warned(monkeypatch, no_secrets, tracked_clients):
+    # Regresión: el aviso de que las velas del régimen vinieron de Bybit (porque
+    # Binance falló) no aparecía en ningún lado del texto.
+    warning = "Binance no respondió (HTTP 451); se usó Bybit"
+    fake = FakeMarketData(name="bybit", meta_overrides={"warning": warning})
+    monkeypatch.setattr(analyze_cli, "build_market_data", lambda settings, client, cache: fake)
+    with respx.mock(assert_all_called=False) as router:
+        router.route().mock(return_value=httpx.Response(451))
+        code, out, err = run("SOL")
+    assert code == 0, err
+    block = _regime_block(out)
+    assert block.count(f"· {warning}") == 2  # 1h y 1d
+
+
+def test_offline_regime_block_does_not_repeat_the_synthetic_warning(btc_text):
+    assert "Datos sintéticos: no son reales" not in _regime_block(btc_text)
+
+
+def test_ctrl_c_exits_130_without_traceback(monkeypatch):
+    async def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(analyze_cli, "_fetch_data", interrupted)
+    code, out, err = run("BTC", "--offline", "--now", FIXED_NOW_ISO)
+    assert code == 130 and out == ""
+    assert err.strip() == "Cancelado por el usuario." and "Traceback" not in err

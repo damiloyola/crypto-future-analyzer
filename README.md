@@ -37,7 +37,7 @@ celular en la misma red wifi.
 | 0 | Esqueleto del proyecto | ✅ |
 | 1 | Investigación de la Nexo Pro API ([informe](docs/nexo-api-research.md)) | ✅ |
 | 2 | Datos e indicadores + script de consola ([fuentes](docs/data-sources.md)) | ✅ (falta correrlo en vivo en la Mac) |
-| 3 | Detector de régimen (HMM) | ⏳ |
+| 3 | Detector de régimen (HMM) + `make train-regime` | ✅ (falta entrenarlo con datos reales en la Mac; hay preguntas de diseño abiertas) |
 | 4 | Score, plan de riesgo, ajustes por régimen y perfiles | ⏳ |
 | 5 | Circuit breakers y correlación | ⏳ |
 | 6 | API FastAPI | ⏳ |
@@ -91,6 +91,44 @@ make cli SYMBOL=BTC ARGS="--json"            # salida en JSON
 
 Si Binance y Bybit no responden, termina con un mensaje claro (código 1). Si
 falla una fuente secundaria (noticias, Fear & Greed), sigue y lo avisa.
+
+### Detector de régimen (Hito 3)
+
+Antes de cualquier señal, la app clasifica qué tipo de mercado hay (crash,
+bajista, neutral, alcista, euforia) con un modelo estadístico (Gaussian HMM),
+uno por moneda. **No predice el precio**: detecta el entorno. Usa velas de 1
+hora (el régimen para operar) y velas diarias (el de contexto), siempre
+cerradas y sin mirar el futuro: el régimen de cada vela se calcula solo con
+las velas hasta ella (algoritmo forward; hay tests que lo verifican).
+
+```bash
+make train-regime                              # todas las favoritas, 1 hora y diario
+make train-regime SYMBOL=SOL                   # una sola moneda
+make train-regime SYMBOL=SOL ARGS="--force"    # reentrena aunque esté al día
+make train-regime SYMBOL=BTC ARGS="--offline"  # datos sintéticos, sin red (para probar)
+make cli SYMBOL=BTC                            # la consola ya muestra el régimen
+make cli SYMBOL=BTC ARGS="--no-regime"         # sin régimen (más rápido)
+```
+
+- La cantidad de estados (de 3 a 7) la elige sola el BIC. Los modelos se
+  guardan en `data/models/` (los de prueba, en `data/models/sintetico/`, y
+  nunca se mezclan) y se reentrenan solos cuando tienen 7 días
+  (`regime.auto_retrain`). Entrenar una moneda tarda unos 2 minutos (casi
+  todo es el modelo de 1 hora); si hace falta, la consola avisa antes.
+- Qué muestra: régimen actual y si está confirmado (se mantuvo 3 velas
+  seguidas) o hay un cambio en espera; confianza (la probabilidad del estado
+  más probable en la última vela, "baja" si es menos de 60 %); "régimen
+  inestable" si hubo más de 4 cambios en las últimas 20 velas; hace cuánto
+  empezó; y una tabla por régimen con retorno medio por vela, volatilidad,
+  duración típica y % del tiempo. Avisa si el modelo es viejo, si se entrenó
+  con poca historia o si las velas vinieron de Bybit.
+- `make train-regime` termina con código 1 si alguna moneda no se pudo
+  entrenar o reentrenar (en ese caso queda el modelo anterior y lo dice), y
+  con 130 si lo cortás con Ctrl+C (sale enseguida y no guarda nada a medias).
+- Pendiente de tu decisión: cómo ordenar y nombrar los estados (hoy solo por
+  retorno medio; con datos de prueba "Crash" y "Euforia" duran unas 2 horas y
+  el régimen de 1 hora sale "inestable" seguido), el máximo de estados y qué
+  cuenta como cambio para la inestabilidad.
 
 ## Configuración
 

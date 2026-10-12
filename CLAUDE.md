@@ -32,6 +32,7 @@ make setup         # dependencias
 make dev           # backend :8000 + frontend :5173 (red local)
 make test          # pytest + typecheck + vitest
 make lint          # ruff check + format --check
+make train-regime SYMBOL=BTC ARGS="--offline"   # modelos de régimen (sin SYMBOL: todas)
 ```
 
 ## Arquitectura
@@ -69,3 +70,8 @@ El frontend solo muestra lo que devuelve la API; no calcula riesgo.
 El contenedor de desarrollo no llega a las APIs. `make cli SYMBOL=BTC
 ARGS="--offline"` usa datos sintéticos (`app/data/synthetic.py`) por el mismo
 camino de código; los tests usan fixtures (`backend/tests/fixtures/README.md`).
+En `--offline` los modelos de régimen van a `regime.synthetic_models_dir` y
+nunca pisan a los reales; la primera corrida entrena (unos 2 minutos por
+moneda con la config real). Los tests del régimen usan configs chicas
+(`settings.regime.model_copy(update=...)`) para entrenar en menos de un
+segundo.

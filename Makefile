@@ -51,8 +51,10 @@ format: ## Formatea el backend
 cli: ## Datos e indicadores de una moneda (Hito 2). Ej: make cli SYMBOL=ETH ARGS="--offline"
 	cd $(BACKEND) && .venv/bin/python -m scripts.analyze_cli $(SYMBOL) $(ARGS)
 
-train-regime: ## Entrena los modelos de régimen (Hito 3)
-	cd $(BACKEND) && .venv/bin/python -m scripts.train_regime $(SYMBOL)
+# Sin SYMBOL (ni en la línea de comandos ni en el entorno) entrena todas las
+# favoritas: el BTC por omisión de arriba no cuenta (origin "file").
+train-regime: ## Entrena los modelos de régimen (HMM). Ej: make train-regime SYMBOL=BTC ARGS="--offline"
+	cd $(BACKEND) && .venv/bin/python -m scripts.train_regime $(if $(filter file,$(origin SYMBOL)),all,$(SYMBOL)) $(ARGS)
 
 walk-forward: ## Validación histórica (Hito 10)
 	cd $(BACKEND) && .venv/bin/python -m scripts.walk_forward $(SYMBOL)
