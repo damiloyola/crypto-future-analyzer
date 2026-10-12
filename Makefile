@@ -48,7 +48,7 @@ lint: ## Lint del backend
 format: ## Formatea el backend
 	cd $(BACKEND) && .venv/bin/ruff format . && .venv/bin/ruff check --fix .
 
-cli: ## Datos e indicadores de una moneda (Hito 2). Ej: make cli SYMBOL=ETH ARGS="--offline"
+cli: ## Datos, régimen, score y plan de una moneda. Ej: make cli SYMBOL=ETH ARGS="--offline"
 	cd $(BACKEND) && .venv/bin/python -m scripts.analyze_cli $(SYMBOL) $(ARGS)
 
 # Sin SYMBOL (ni en la línea de comandos ni en el entorno) entrena todas las

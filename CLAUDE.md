@@ -84,6 +84,12 @@ El frontend solo muestra lo que devuelve la API; no calcula riesgo.
   `funding_low_pct`). El perfil agresivo queda con margen 100 / riesgo 50 y la
   app sube el margen unos dólares cuando la regla de liquidación lo pide. Si la
   posición es más chica que el margen (< 1x), el margen baja solo a 1x.
+- **Plan, reglas extra (Hito 4):** el riesgo se achica a lo que queda del
+  límite de pérdida del día (`cap_risk_to_daily_remaining`); precio de Nexo
+  sospechoso (> `manual_price_max_diff_pct`) = "No operar" hasta corregirlo;
+  sin rango típico del día = "No operar"; Euforia long sin funding = × 0,5;
+  TP1 más allá del TP2 = sin TP1; la entrada alternativa saltea niveles a menos
+  de 1 ATR; el funding estimado se muestra aparte (no entra en el riesgo).
 - Al usuario hay que explicarle todo en palabras simples (hace mucho que no
   opera futuros) y hacerle las preguntas con opciones (AskUserQuestion).
 

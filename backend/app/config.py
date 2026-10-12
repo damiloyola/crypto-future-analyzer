@@ -252,6 +252,8 @@ class MomentumScoringConfig(_Strict):
     rsi_neutral: float = 50
     rsi_overbought: float = 70
     rsi_oversold: float = 30
+    macd_signal_weight: float = Field(0.5, ge=0, le=1)
+    macd_zero_weight: float = Field(0.5, ge=0, le=1)
 
     @model_validator(mode="after")
     def _ordered(self) -> MomentumScoringConfig:
@@ -270,6 +272,11 @@ class DerivativesScoringConfig(_Strict):
     oi_rising_pct: float = Field(gt=0)
     long_short_crowded_long: float = Field(gt=0)
     long_short_crowded_short: float = Field(gt=0)
+    funding_very_high_part: float = Field(1.0, ge=0, le=1)
+    funding_high_part: float = Field(0.5, ge=0, le=1)
+    funding_low_part: float = Field(0.5, ge=0, le=1)
+    oi_part: float = Field(0.5, ge=0, le=1)
+    long_short_part: float = Field(0.5, ge=0, le=1)
 
     @model_validator(mode="after")
     def _ordered(self) -> DerivativesScoringConfig:
@@ -322,6 +329,7 @@ class TakeProfitConfig(_Strict):
     tp3_r: float = Field(2.5, gt=0)
     tp2_ensure_min_rr: bool = True
     block_if_tp2_beyond_daily_range: bool = True
+    drop_tp1_beyond_tp2: bool = True
 
     @model_validator(mode="after")
     def _ordered(self) -> TakeProfitConfig:
@@ -343,6 +351,10 @@ class TradePlanConfig(_Strict):
     flag_tp_beyond_daily_range: bool = True
     time_stop_hours: float = 24
     fees_included_in_risk: bool = True
+    alt_entry_min_distance_atr: float = Field(1.0, ge=0)
+    cap_risk_to_daily_remaining: bool = True
+    block_if_price_suspect: bool = True
+    block_if_daily_range_missing: bool = True
     liquidation: PlanLiquidationConfig
 
 
@@ -374,7 +386,7 @@ class RiskProfile(_Strict):
     margin_per_trade_usd: float = Field(gt=0)
     risk_per_trade_usd: float = Field(gt=0)
     min_rr: float = Field(gt=0)
-    max_leverage: float = Field(gt=0)
+    max_leverage: float = Field(ge=1)
     max_trades_per_day: int = Field(ge=0)
     max_daily_loss_usd: float = Field(gt=0)
     min_operable_risk_usd: float = Field(gt=0)
@@ -437,6 +449,7 @@ class RegimeAdjustmentsConfig(_Strict):
     low_confidence: LowConfidenceAdjustment
     unstable: UnstableAdjustment
     apply_context_regime: bool = False
+    assume_funding_very_high_if_missing: bool = True
 
 
 # --- seguridad ---------------------------------------------------------------

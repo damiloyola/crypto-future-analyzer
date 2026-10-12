@@ -263,6 +263,10 @@ scoring:
     rsi_neutral: 50
     rsi_overbought: 70  # arriba de esto el aporte alcista se recorta
     rsi_oversold: 30    # abajo de esto el aporte bajista se recorta
+    # MACD: suma/resta macd_signal_weight según esté arriba/abajo de su señal y
+    # macd_zero_weight según esté arriba/abajo de cero (máximo ±1 en total).
+    macd_signal_weight: 0.5
+    macd_zero_weight: 0.5
   derivatives:
     # Funding por período de 8 h, en % (0.05 = 0,05 %).
     funding_high_pct: 0.05       # funding "muy positivo": longs sobrecargados
@@ -275,6 +279,12 @@ scoring:
     oi_rising_pct: 3.0
     long_short_crowded_long: 2.0 # ratio de cuentas long/short que indica exceso de longs
     long_short_crowded_short: 0.7
+    # Cuánto suma o resta cada parte (el componente se recorta a ±1).
+    funding_very_high_part: 1.0  # funding muy alto: resta esto
+    funding_high_part: 0.5       # funding alto: resta esto
+    funding_low_part: 0.5        # funding negativo: suma esto
+    oi_part: 0.5                 # OI subiendo con funding alto/negativo
+    long_short_part: 0.5         # ratio long/short muy cargado de un lado
   sentiment:
     fear_greed_extreme_fear: 25
     fear_greed_extreme_greed: 75
@@ -314,6 +324,9 @@ trade_plan:
     # true = si ese TP2 queda más lejos que el rango típico del día (ATR
     # diario), no se opera: el objetivo no es realista para una operación del día.
     block_if_tp2_beyond_daily_range: true
+    # Decisión del usuario: si el próximo nivel (TP1) queda más lejos que el TP2,
+    # no hay TP1 (quedan TP2 y TP3) y el stop por tiempo mira el TP2.
+    drop_tp1_beyond_tp2: true
   flag_tp_beyond_daily_range: true  # TP más lejos que el ATR diario = "poco probable intradía"
   time_stop_hours: 24
   # true = el riesgo por operación (ej. 50 USD) ya incluye las comisiones de
@@ -322,6 +335,19 @@ trade_plan:
   # false = fórmula pura (riesgo / distancia al stop) y las comisiones se suman
   # aparte: si toca el stop perdés 50 + comisiones.
   fees_included_in_risk: true
+  # Decisiones del usuario (Hito 4):
+  # - la entrada alternativa (orden límite) saltea los niveles a menos de
+  #   esta cantidad de ATR(15m), como el stop y el TP1;
+  alt_entry_min_distance_atr: 1.0
+  # - el riesgo se achica a lo que queda del límite de pérdida del día; si
+  #   queda debajo del mínimo operable, "No operar";
+  cap_risk_to_daily_remaining: true
+  # - si el precio de Nexo pegado a mano difiere de Binance más que
+  #   exchanges.nexo.manual_price_max_diff_pct, "No operar" hasta corregirlo;
+  block_if_price_suspect: true
+  # - sin rango típico del día no se puede saber si el TP2 es alcanzable hoy:
+  #   "No operar".
+  block_if_daily_range_missing: true
   liquidation:
     min_distance_ratio: 2.0       # distancia a liquidación >= 2 × distancia al stop
     # Cuando no se cumple, la app prueba subir el margen manteniendo el riesgo
@@ -427,6 +453,9 @@ regime_adjustments:
     risk_multiplier: 0.5
   # El régimen diario se muestra como contexto; por defecto no ajusta el plan.
   apply_context_regime: false
+  # Decisión del usuario: en Euforia, si no hay dato de funding, se toma como
+  # "muy alto" (lado prudente: riesgo × 0,5 para los longs).
+  assume_funding_very_high_if_missing: true
 
 # -----------------------------------------------------------------------------
 # Circuit breakers (backend/app/safety): tienen poder de veto
