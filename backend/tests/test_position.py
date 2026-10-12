@@ -7,8 +7,10 @@ Casos borde de la especificación, uno por bloque:
   mínimo operable, "No operar";
 - apalancamiento por encima del tope: lo mismo (margen, después tamaño, después
   bloqueo);
-- stop muy lejos: posición chica, apalancamiento bajo, todo ok; y el caso en que
-  los multiplicadores del régimen dejan el riesgo debajo del mínimo operable.
+- stop muy lejos: posición chica, apalancamiento bajo, todo ok; si la posición
+  queda más chica que el margen (menos de 1x), el margen baja solo a 1x
+  (decisión del usuario); y el caso en que los multiplicadores del régimen dejan
+  el riesgo debajo del mínimo operable.
 
 (Los otros dos casos borde están en test_rules.py, timeframes en conflicto, y en
 test_regime_adjustments.py, Crash con long.)
@@ -33,6 +35,7 @@ from app.risk.position import (
     LIMIT_LEVERAGE,
     LIMIT_LIQUIDATION,
     MARGIN_LIMITED,
+    MARGIN_LOWERED_TO_1X,
     MARGIN_RAISED,
     SIZE_REDUCED,
     PositionFit,
@@ -42,6 +45,7 @@ from app.risk.position import (
 )
 from app.risk.profiles import get_profile
 from app.risk.regime_adjustments import apply_regime_adjustments
+from app.risk.rules import check_liquidation
 from app.risk.sizing import position_size_usd
 
 ENTRY = 60000.0
@@ -75,6 +79,8 @@ def codes(fit: PositionFit) -> list[str]:
 def assert_safe(fit: PositionFit) -> None:
     """Invariantes de cualquier posición ajustada."""
     assert fit.leverage <= fit.max_leverage * (1 + 1e-9)
+    assert fit.leverage >= 1.0  # el exchange no deja operar a menos de 1x
+    assert fit.margin_usd <= fit.size_usd
     assert fit.liquidation_ok is True
     assert fit.liq_before_stop is False
     assert fit.margin_usd <= fit.max_margin_usd * (1 + 1e-9)
@@ -235,16 +241,117 @@ def test_edge_case_stop_far_small_size_low_leverage_all_ok(settings):
     assert_safe(fit)
 
 
-def test_edge_case_stop_very_far_below_1x_warns_and_cannot_be_liquidated(settings, agresivo):
+def test_edge_case_stop_very_far_below_1x_lowers_margin_to_1x(settings, agresivo):
     fit = fit_position("long", ENTRY, 30000, 50, agresivo, settings)  # stop a 50 %
     assert fit.ok
-    assert fit.leverage < 1
-    assert fit.liquidation_price is None  # margen > posición: no se puede liquidar
-    assert fit.liquidation_distance_pct is None
-    assert fit.warnings == (
-        "La posición (99,82 USD) es más chica que el margen (100 USD): alcanza con poner "
-        "99,83 USD de margen (1x).",
+    assert fit.initial_leverage < 1  # con 100 USD de margen quedaba en 0,998x
+    assert fit.margin_lowered_to_1x is True
+    assert fit.margin_raised is False and fit.size_reduced is False
+    assert fit.size_usd == pytest.approx(99.82, abs=0.01)
+    assert fit.margin_usd == fit.size_usd  # sin redondear: 1x justo
+    assert fit.leverage == 1.0
+    assert fit.risk_usd == pytest.approx(50)  # el riesgo no cambia
+    assert codes(fit) == [MARGIN_LOWERED_TO_1X]
+    assert fit.adjustments[0].message == (
+        "Margen bajado de 100 a 99,82 USD: la posición es más chica que el margen y no se "
+        "puede operar a menos de 1x."
     )
+    assert fit.adjustments[0].risk_multiplier == 1.0
+    assert fit.warnings == ()
+    assert fit.liquidation_price is None  # long a 1x: no se puede liquidar
+    assert fit.liquidation_distance_pct is None
+    assert fit.limited_by == ()
+    assert all(c.ok for c in fit.checks())
+    assert_safe(fit)
+
+
+def test_below_1x_message_with_round_numbers(settings, agresivo):
+    # Stop a 50 %: con 40,072 USD de riesgo la posición es de 80 USD justos.
+    fit = fit_position("long", ENTRY, 30000, 40.072, agresivo, settings)
+    assert fit.size_usd == pytest.approx(80.0)
+    assert fit.margin_usd == fit.size_usd and fit.leverage == 1.0
+    assert fit.adjustments[0].message == (
+        "Margen bajado de 100 a 80 USD: la posición es más chica que el margen y no se puede "
+        "operar a menos de 1x."
+    )
+
+
+def test_below_1x_after_available_margin_limit_lowers_from_the_available(settings, agresivo):
+    fit = fit_position("long", ENTRY, 30000, 40.072, agresivo, settings, available_margin_usd=90)
+    assert codes(fit) == [MARGIN_LIMITED, MARGIN_LOWERED_TO_1X]
+    assert fit.adjustments[1].message.startswith("Margen bajado de 90 a 80 USD:")
+    assert fit.margin_usd == fit.size_usd and fit.leverage == 1.0
+    assert_safe(fit)
+
+
+def test_below_1x_short_still_checks_liquidation_and_passes(settings):
+    moderado = get_profile("moderado", settings)  # margen 75, riesgo 30
+    fit = fit_position("short", ENTRY, 87000, 30, moderado, settings)  # stop a 45 %
+    assert fit.ok
+    assert codes(fit) == [MARGIN_LOWERED_TO_1X]
+    assert fit.adjustments[0].message.startswith("Margen bajado de 75 a 66,45 USD:")
+    assert fit.leverage == 1.0
+    # Un short a 1x sí se liquida, con una suba de casi el 100 %: 2,2 veces la
+    # distancia al stop, más que el mínimo de 2.
+    assert fit.liquidation_price == pytest.approx(119331.74, abs=0.01)
+    assert fit.liquidation_ratio == pytest.approx(2.197, abs=0.001)
+    assert_safe(fit)
+
+
+def test_below_1x_short_with_absurd_stop_is_blocked_by_liquidation(settings, agresivo):
+    # Stop a 60 % arriba: la regla de liquidación pedía más margen que la
+    # posición, pero menos de 1x no se puede; a 1x la liquidación queda a 1,65
+    # veces la distancia al stop (menos de 2): "No operar".
+    fit = fit_position("short", ENTRY, 96000, 50, agresivo, settings)
+    assert fit.ok is False
+    assert codes(fit) == [MARGIN_RAISED, MARGIN_LOWERED_TO_1X]
+    assert fit.adjustments[1].message.startswith("Margen bajado de 100,77 a 83,12 USD:")
+    assert fit.leverage == 1.0 and fit.margin_usd == fit.size_usd
+    assert fit.liquidation_ok is False
+    assert fit.block_reason == check_liquidation(fit.liquidation_check).message
+    assert fit.block_reason.startswith("No operar: la liquidación")
+    assert [c.code for c in fit.checks() if not c.ok] == ["liquidation"]
+
+
+def test_far_stops_never_end_below_1x(settings):
+    """Con stops lejanos (hasta absurdos) el apalancamiento final nunca baja de 1x."""
+    rng = np.random.default_rng(11)
+    profiles = [get_profile(n, settings) for n in ("conservador", "moderado", "agresivo")]
+    for _ in range(300):
+        p = profiles[int(rng.integers(len(profiles)))]
+        side = "long" if rng.random() < 0.5 else "short"
+        entry = float(10 ** rng.uniform(-1, 5))
+        dist = float(rng.uniform(0.2, 0.95))
+        stop = entry * (1 - dist) if side == "long" else entry * (1 + dist)
+        risk = float(rng.uniform(1, p.risk_per_trade_usd))
+        avail = None if rng.random() < 0.7 else float(rng.uniform(5, 150))
+        fit = fit_position(side, entry, stop, risk, p, settings, available_margin_usd=avail)
+        assert fit.leverage >= 1.0
+        assert fit.margin_usd <= fit.size_usd
+        if fit.margin_lowered_to_1x:
+            assert fit.leverage == 1.0
+            assert codes(fit)[-1] == MARGIN_LOWERED_TO_1X
+        if side == "long" and fit.leverage == 1.0:
+            assert fit.liquidation_price is None  # un long a 1x no se puede liquidar
+
+
+def test_raised_margin_rounding_never_goes_below_1x(settings, agresivo):
+    # Long con el stop a 50 % y 60 USD de riesgo: la regla de liquidación pide
+    # margen = posición (119,7844 USD). Redondeado hacia arriba serían 119,79
+    # (0,9999x): el margen queda en la posición justa.
+    fit = fit_position("long", ENTRY, 30000, 60, agresivo, settings)
+    assert fit.ok
+    assert codes(fit) == [MARGIN_RAISED]
+    assert fit.margin_raised is True and fit.margin_lowered_to_1x is False
+    assert fit.size_usd == pytest.approx(119.7844, abs=1e-4)
+    assert fit.margin_usd == fit.size_usd
+    assert fit.leverage == 1.0
+    assert fit.adjustments[0].message == (
+        "Margen subido de 100 a 119,78 USD para que la liquidación quede al menos a 2 veces "
+        "la distancia al stop; el riesgo sigue en 60 USD."
+    )
+    assert fit.liquidation_price is None
+    assert_safe(fit)
 
 
 def test_edge_case_stop_far_but_regime_multipliers_hit_the_risk_floor(settings, agresivo):
@@ -253,7 +360,7 @@ def test_edge_case_stop_far_but_regime_multipliers_hit_the_risk_floor(settings, 
     adj = apply_regime_adjustments("long", 70, regime, None, agresivo, settings)
     assert adj.blocked and adj.risk_usd == pytest.approx(9.375)
     fit = fit_position("long", ENTRY, 48000, adj.risk_usd, agresivo, settings)  # stop a 20 %
-    assert fit.leverage < 1
+    assert fit.margin_lowered_to_1x and fit.leverage == 1.0
     assert fit.ok is False
     assert fit.block_reason == (
         "No operar: el riesgo (9,38 USD) queda debajo del mínimo operable de 15 USD."
@@ -392,7 +499,15 @@ def test_to_dict_is_json_safe(settings, agresivo):
     for stop in (59400, 59700, 59910, 30000):
         d = fit_position("long", ENTRY, stop, 50, agresivo, settings).to_dict()
         json.dumps(d, allow_nan=False)
-        assert {"margin_usd", "size_usd", "leverage", "risk_usd", "ok", "adjustments"} <= set(d)
+        assert {
+            "margin_usd",
+            "size_usd",
+            "leverage",
+            "risk_usd",
+            "ok",
+            "adjustments",
+            "margin_lowered_to_1x",
+        } <= set(d)
         assert d["profile"] == "agresivo"
         assert all(set(a) == {"code", "message", "risk_multiplier"} for a in d["adjustments"])
 
@@ -410,7 +525,12 @@ def test_random_positions_respect_the_rules(settings):
         risk = float(rng.uniform(1, p.risk_per_trade_usd))
         fit = fit_position(side, entry, stop, risk, p, settings)
         assert_safe(fit)
-        assert fit.margin_usd >= min(p.margin_per_trade_usd, fit.max_margin_usd) - 1e-9
+        if fit.margin_lowered_to_1x:
+            assert fit.leverage == 1.0 and fit.margin_usd == fit.size_usd
+            assert fit.size_usd < p.margin_per_trade_usd
+            assert codes(fit)[-1] == MARGIN_LOWERED_TO_1X
+        else:
+            assert fit.margin_usd >= min(p.margin_per_trade_usd, fit.max_margin_usd) - 1e-9
         assert fit.ok == (fit.risk_usd >= p.min_operable_risk_usd * (1 - 1e-9))
         if not fit.size_reduced:
             assert fit.risk_usd == pytest.approx(risk)

@@ -243,16 +243,29 @@ def test_funding_part_thresholds(f, expected):
 @pytest.mark.parametrize(
     ("oi", "f", "expected"),
     [
-        (3.0, 0.01, -0.5),  # OI subiendo justo en el umbral + funding positivo
-        (10.0, 0.2, -0.5),
-        (3.0, -0.01, 0.5),  # OI subiendo + funding negativo: shorts sobrecargados
+        (3.0, 0.05, -0.5),  # OI subiendo justo en el umbral + funding justo en "alto"
+        (10.0, 0.2, -0.5),  # funding muy alto: también -0,5 (el funding ya restó aparte)
+        (3.0, 0.0499, 0.0),  # funding positivo pero normal: la suba del OI no cuenta
+        (3.0, 0.01, 0.0),  # el funding normal de siempre (+0,01 %): no cuenta
         (3.0, 0.0, 0.0),
+        (3.0, -0.01, 0.0),  # negativo pero sin llegar a "shorts sobrecargados"
+        (3.0, -0.0299, 0.0),
+        (3.0, -0.03, 0.5),  # justo en funding_low_pct: shorts sobrecargados
+        (10.0, -0.2, 0.5),
         (2.99, 0.2, 0.0),  # no llega a "subiendo"
+        (2.99, -0.2, 0.0),
         (-5.0, -0.2, 0.0),
     ],
 )
 def test_open_interest_part(oi, f, expected):
     assert open_interest_part(oi, f, DER) == expected
+
+
+def test_open_interest_part_thresholds_come_from_the_config():
+    custom = DER.model_copy(update={"oi_rising_pct": 10.0, "funding_high_pct": 0.02})
+    assert open_interest_part(5.0, 0.03, DER) == 0.0  # 0,03 % es normal con la config
+    assert open_interest_part(5.0, 0.03, custom) == 0.0  # +5 % ya no es "OI subiendo"
+    assert open_interest_part(10.0, 0.03, custom) == -0.5  # 0,03 % ya es "alto"
 
 
 @pytest.mark.parametrize(
@@ -284,7 +297,7 @@ def test_derivatives_overloaded_longs_is_clipped_to_minus_one():
         "riesgo de caída (-1)."
     )
     assert r.details[1] == (
-        "Interés abierto +5 % en 24 h con funding positivo: longs sobrecargados con el OI "
+        "Interés abierto +5 % en 24 h con funding alto: longs sobrecargados con el OI "
         "subiendo, riesgo de caída (-0,5)."
     )
     assert "demasiadas cuentas en long, riesgo de caída (-0,5)" in r.details[2]
@@ -297,7 +310,36 @@ def test_derivatives_oi_rising_with_negative_funding_adds():
     )
     # +0,5 (funding -0,04 %) + 0,5 (shorts sobrecargados con OI subiendo) + 0,5 → +1
     assert r.value == 1.0
-    assert "shorts sobrecargados con el OI subiendo, riesgo de suba (+0,5)" in r.details[1]
+    assert r.details[1] == (
+        "Interés abierto +4 % en 24 h con funding negativo: shorts sobrecargados con el OI "
+        "subiendo, riesgo de suba (+0,5)."
+    )
+
+
+def test_derivatives_oi_rising_with_normal_funding_does_not_count():
+    # Decisión del usuario: +0,01 % cada 8 h es el funding normal; con el OI
+    # subiendo no indica que los longs estén sobrecargados.
+    r = _der(funding_rate=0.0001, funding_interval_hours=8, oi_change_pct=5.0)
+    assert r.value == 0.0
+    assert r.available
+    assert r.details[0] == "Funding 0,01 % cada 8 h: normal (0)."
+    assert r.details[1] == (
+        "Interés abierto +5 % en 24 h con funding normal: ningún lado está sobrecargado, así "
+        "que la suba del OI no cuenta (0)."
+    )
+
+
+def test_derivatives_oi_rising_with_high_funding_subtracts_on_top_of_the_funding():
+    r = _der(funding_rate=0.0005, funding_interval_hours=8, oi_change_pct=3.0)
+    # -0,5 (funding 0,05 %, "alto") - 0,5 (longs sobrecargados con el OI subiendo) = -1
+    assert r.value == -1.0
+    assert "con funding alto: longs sobrecargados con el OI subiendo" in r.details[1]
+
+
+def test_derivatives_oi_not_rising_says_it_does_not_count():
+    r = _der(funding_rate=0.0012, funding_interval_hours=8, oi_change_pct=2.0)
+    assert r.value == -1.0  # solo el funding muy alto
+    assert r.details[1] == ("Interés abierto +2 % en 24 h: no sube 3 % o más, no indica nada (0).")
 
 
 def test_derivatives_normalizes_a_4h_funding_interval():

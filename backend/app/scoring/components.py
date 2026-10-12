@@ -26,10 +26,13 @@ Componentes
 
       * Funding (``funding_part``): ``f >= funding_very_high_pct`` -1;
         ``f >= funding_high_pct`` -0,5; ``f <= funding_low_pct`` +0,5; si no, 0.
-      * Interés abierto (``open_interest_part``): con el OI subiendo
-        (``>= oi_rising_pct``), funding positivo = longs sobrecargados con el OI
-        subiendo, riesgo de caída (-0,5); funding negativo = shorts
-        sobrecargados (+0,5). Sin funding no se puede interpretar.
+      * Interés abierto (``open_interest_part``, decisión del usuario): solo
+        cuenta con el OI subiendo (``>= oi_rising_pct``) y un funding que ya
+        marca un lado sobrecargado. ``f >= funding_high_pct``: longs
+        sobrecargados con el OI subiendo, riesgo de caída (-0,5);
+        ``f <= funding_low_pct``: shorts sobrecargados con el OI subiendo
+        (+0,5). Con el funding normal (por ejemplo +0,01 %) la suba del OI no
+        cuenta (0). Sin funding no se puede interpretar.
       * Ratio long/short de cuentas (``long_short_part``):
         ``>= long_short_crowded_long`` -0,5; ``<= long_short_crowded_short``
         +0,5.
@@ -285,10 +288,20 @@ def funding_part(f_pct_8h: float, cfg: DerivativesScoringConfig) -> float:
 def open_interest_part(
     oi_change_pct: float, f_pct_8h: float, cfg: DerivativesScoringConfig
 ) -> float:
-    """OI subiendo con funding positivo -0,5; con funding negativo +0,5; si no, 0."""
+    """Aporte del OI: solo cuenta si sube y el funding ya marca un lado sobrecargado.
+
+    Con ``oi_change_pct >= oi_rising_pct``: -0,5 si ``f_pct_8h >=
+    funding_high_pct`` (longs sobrecargados), +0,5 si ``f_pct_8h <=
+    funding_low_pct`` (shorts sobrecargados) y 0 con el funding normal. Con el
+    OI quieto o bajando, 0. ``f_pct_8h`` es el funding en % por 8 h.
+    """
     if oi_change_pct < cfg.oi_rising_pct:
         return 0.0
-    return -0.5 if f_pct_8h > 0 else 0.5 if f_pct_8h < 0 else 0.0
+    if f_pct_8h >= cfg.funding_high_pct:
+        return -0.5
+    if f_pct_8h <= cfg.funding_low_pct:
+        return 0.5
+    return 0.0
 
 
 def long_short_part(ratio: float, cfg: DerivativesScoringConfig) -> float:
@@ -317,19 +330,19 @@ def _funding_text(rate: float, interval: float, f: float, part: float) -> str:
     return f"{head}: {why} {_contrib(part)}."
 
 
-def _oi_text(oi: float, f: float, part: float, cfg: DerivativesScoringConfig) -> str:
+def _oi_text(oi: float, part: float, cfg: DerivativesScoringConfig) -> str:
     head = f"Interés abierto {fmt_num(oi, 1, signed=True)} % en {cfg.oi_lookback_hours} h"
     if oi < cfg.oi_rising_pct:
         return (
             f"{head}: no sube {fmt_num(cfg.oi_rising_pct, 1)} % o más, no indica nada "
             f"{_contrib(part)}."
         )
-    if f > 0:
-        text = "con funding positivo: longs sobrecargados con el OI subiendo, riesgo de caída"
-    elif f < 0:
+    if part < 0:
+        text = "con funding alto: longs sobrecargados con el OI subiendo, riesgo de caída"
+    elif part > 0:
         text = "con funding negativo: shorts sobrecargados con el OI subiendo, riesgo de suba"
     else:
-        text = "con funding en 0: no indica nada"
+        text = "con funding normal: ningún lado está sobrecargado, así que la suba del OI no cuenta"
     return f"{head} {text} {_contrib(part)}."
 
 
@@ -359,8 +372,9 @@ def derivatives_component(
     exchange) y ``funding_interval_hours`` el intervalo que informa el exchange;
     si no viene (o no es positivo) se usa ``default_interval_hours``
     (``fees.funding_interval_hours``). La parte del OI necesita el funding para
-    saber quién está sobrecargado. Un ratio long/short que no es positivo se
-    toma como dato faltante.
+    saber quién está sobrecargado, y con el funding normal no cuenta
+    (``open_interest_part``). Un ratio long/short que no es positivo se toma
+    como dato faltante.
     """
     rate = clean_number(funding_rate)
     interval = clean_number(funding_interval_hours)
@@ -393,7 +407,7 @@ def derivatives_component(
     else:
         p = open_interest_part(oi, f, cfg)
         parts.append(p)
-        details.append(_oi_text(oi, f, p, cfg))
+        details.append(_oi_text(oi, p, cfg))
     if ratio is None:
         missing.append("ratio long/short")
     else:

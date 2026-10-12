@@ -100,7 +100,7 @@ def test_mixed_case_by_hand(settings):
         macd_signal={"15m": 0.5, "1h": 2.0},
         funding_rate=0.0001,  # 0,01 % cada 8 h: normal
         funding_interval_hours=8,
-        oi_change_24h_pct=5.0,  # OI subiendo con funding positivo: -0,5
+        oi_change_24h_pct=5.0,  # OI subiendo, pero con funding normal no cuenta
         long_short_ratio=1.0,
         fear_greed=37.5,  # contrarian: +0,5
     )
@@ -110,11 +110,11 @@ def test_mixed_case_by_hand(settings):
     assert pts["trend_1h"] == pytest.approx(0.0)
     assert pts["trend_15m"] == pytest.approx(-15.0)
     assert pts["momentum"] == pytest.approx(5.0)  # (0,5 + 1 - 0,5 + 0) / 4 × 20
-    assert pts["derivatives"] == pytest.approx(-7.5)
+    assert pts["derivatives"] == pytest.approx(0.0)
     assert pts["sentiment"] == pytest.approx(5.0)
-    assert score.total == pytest.approx(7.5)
+    assert score.total == pytest.approx(15.0)
     assert score.direction_hint is None
-    assert score.summary == "Score +7,5: no llega a long (+30 o más) ni a short (-30 o menos)."
+    assert score.summary == "Score +15: no llega a long (+30 o más) ni a short (-30 o menos)."
     _assert_consistent(score)
 
 

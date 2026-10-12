@@ -21,18 +21,25 @@ del tope del perfil") con la matemática de ``sizing``, ``fees`` y
    posición** (redondeada hacia abajo a centavos) hasta lo que entra sin pasar
    el tope de apalancamiento y cumpliendo la regla de liquidación. El riesgo
    baja: se recalcula la pérdida real al tocar el stop (comisiones incluidas).
-6. Si la pérdida real al tocar el stop queda debajo de
+6. Si la posición queda más chica que el margen (apalancamiento menor a 1x,
+   pasa con stops muy lejanos; el exchange no lo permite), el margen **baja**
+   solo hasta igualar la posición: queda en 1x justo (decisión del usuario).
+   El tamaño y el riesgo no cambian. Este margen no se redondea: hacia arriba
+   a centavos quedaría otra vez debajo de 1x. Por lo mismo, en el paso 4 el
+   redondeo hacia arriba nunca pasa del tamaño. Con 1x un long no se puede
+   liquidar; un short sí (con una suba de casi el 100 %), y si eso queda a
+   menos de ``min_distance_ratio`` veces la distancia al stop (con 2 veces,
+   stops a más del 49 % de la entrada) la regla de liquidación da "No operar".
+7. Si la pérdida real al tocar el stop queda debajo de
    ``profile.min_operable_risk_usd``, ``ok=False``: "No operar".
 
-Cada ajuste queda en ``adjustments`` con su motivo, por ejemplo "Margen subido de
-100 a 178,67 USD para no pasar de 25x; el riesgo sigue en 50 USD".
+Cada ajuste queda en ``adjustments`` con su motivo, en el orden en que se
+hizo, por ejemplo "Margen subido de 100 a 178,67 USD para no pasar de 25x; el
+riesgo sigue en 50 USD" o "Margen bajado de 100 a 80 USD: la posición es más
+chica que el margen y no se puede operar a menos de 1x".
 
 Si ``available_margin_usd`` es menor que el margen del perfil, se usa lo
 disponible como margen base (con su ajuste explicado).
-
-Si la posición queda más chica que el margen (apalancamiento menor a 1x, pasa
-con stops muy lejanos), se mantiene el margen del perfil y se agrega un aviso:
-alcanza con poner de margen el tamaño de la posición.
 
 La liquidación de las reglas es la de **margen aislado** (conservadora). La del
 "modelo billetera" de Nexo (``liquidation.wallet_liquidation_price``, con toda la
@@ -90,6 +97,11 @@ if TYPE_CHECKING:
 MARGIN_LIMITED = "margin_limited"
 MARGIN_RAISED = "margin_raised"
 SIZE_REDUCED = "size_reduced"
+MARGIN_LOWERED_TO_1X = "margin_lowered_to_1x"
+
+# Apalancamiento mínimo que acepta un exchange (no es un umbral de riesgo: con
+# menos de 1x el margen sería más grande que la posición).
+MIN_EXCHANGE_LEVERAGE = 1.0
 
 # Qué limitó la posición (``PositionFit.limited_by``).
 LIMIT_LEVERAGE = "leverage"
@@ -128,6 +140,9 @@ class PositionFit:
       liquidación).
     - ``red_warning``: el apalancamiento pasa de
       ``risk_profiles.leverage_red_warning_above``.
+    - ``margin_raised``: hubo un paso que subió el margen (4 o 5).
+    - ``margin_lowered_to_1x``: el margen bajó hasta igualar la posición
+      (paso 6); ``leverage`` queda en 1 justo.
     - ``limited_by``: qué obligó a ajustar (``"leverage"``, ``"liquidation"``,
       ``"available_margin"``).
     - ``ok`` / ``block_reason``: ``False`` = "No operar" (el riesgo quedó debajo
@@ -168,6 +183,7 @@ class PositionFit:
     red_warning: bool
     margin_raised: bool
     size_reduced: bool
+    margin_lowered_to_1x: bool
     limited_by: tuple[str, ...]
     adjustments: tuple[Adjustment, ...]
     warnings: tuple[str, ...]
@@ -228,6 +244,7 @@ class PositionFit:
                 "red_warning": self.red_warning,
                 "margin_raised": self.margin_raised,
                 "size_reduced": self.size_reduced,
+                "margin_lowered_to_1x": self.margin_lowered_to_1x,
                 "limited_by": list(self.limited_by),
                 "adjustments": [a.to_dict() for a in self.adjustments],
                 "warnings": list(self.warnings),
@@ -346,8 +363,11 @@ def fit_position(
         # 3) Alcanza el margen base.
         margin = base_margin
     elif needed <= max_margin * (1.0 + REL_TOL):
-        # 4) Se sube el margen; tamaño y riesgo no cambian.
+        # 4) Se sube el margen; tamaño y riesgo no cambian. El redondeo a
+        # centavos no puede dejarlo más grande que la posición (menos de 1x).
         margin = min(ceil_cents(needed), max_margin)
+        if needed <= size:
+            margin = min(margin, size)
         margin_raised = True
         if m_lev > base_margin * (1.0 + REL_TOL):
             limited_by.append(LIMIT_LEVERAGE)
@@ -412,6 +432,22 @@ def fit_position(
             )
         size = new_size
 
+    # 6) Menos de 1x no se puede operar: el margen baja hasta igualar la posición
+    # (sin redondear, así el apalancamiento queda en 1x justo y nunca debajo).
+    margin_lowered_to_1x = False
+    if size < margin * MIN_EXCHANGE_LEVERAGE:
+        lowered = size / MIN_EXCHANGE_LEVERAGE
+        adjustments.append(
+            Adjustment(
+                MARGIN_LOWERED_TO_1X,
+                f"Margen bajado de {fmt_usd(margin, unit=False)} a {fmt_usd(lowered)}: la "
+                "posición es más chica que el margen y no se puede operar a menos de "
+                f"{fmt_leverage(MIN_EXCHANGE_LEVERAGE)}.",
+            )
+        )
+        margin = lowered
+        margin_lowered_to_1x = True
+
     # Resultado final: pérdida real al tocar el stop, apalancamiento y liquidación.
     quantity = size / entry
     price_loss = quantity * abs(entry - stop)
@@ -441,11 +477,6 @@ def fit_position(
         warnings.append(
             f"Advertencia: el apalancamiento queda en {fmt_leverage(leverage)}, más de "
             f"{fmt_leverage(red_above)}. Un movimiento chico en contra te puede liquidar."
-        )
-    if leverage < 1.0:
-        warnings.append(
-            f"La posición ({fmt_usd(size)}) es más chica que el margen ({fmt_usd(margin)}): "
-            f"alcanza con poner {fmt_usd(ceil_cents(size))} de margen (1x)."
         )
 
     # Bloqueos: piso de riesgo y, como red de seguridad, las reglas de la posición.
@@ -503,6 +534,7 @@ def fit_position(
         red_warning=red,
         margin_raised=margin_raised,
         size_reduced=size_reduced,
+        margin_lowered_to_1x=margin_lowered_to_1x,
         limited_by=tuple(dict.fromkeys(limited_by)),
         adjustments=tuple(adjustments),
         warnings=tuple(warnings),
