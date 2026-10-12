@@ -79,6 +79,11 @@ El frontend solo muestra lo que devuelve la API; no calcula riesgo.
   diario no se opera (`block_if_tp2_beyond_daily_range`); el R:R literal "a
   TP2 con comisiones >= 1,5" bloqueaba siempre. Las noticias **no** entran al
   score (`scoring.sentiment.news_share: 0`): solo Fear & Greed; la IA las comenta.
+- **Score y margen (Hito 4):** con el OI subiendo, derivados resta solo si el
+  funding es alto (>= `funding_high_pct`) y suma si es negativo (<=
+  `funding_low_pct`). El perfil agresivo queda con margen 100 / riesgo 50 y la
+  app sube el margen unos dólares cuando la regla de liquidación lo pide. Si la
+  posición es más chica que el margen (< 1x), el margen baja solo a 1x.
 - Al usuario hay que explicarle todo en palabras simples (hace mucho que no
   opera futuros) y hacerle las preguntas con opciones (AskUserQuestion).
 

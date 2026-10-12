@@ -266,15 +266,29 @@ class DerivativesScoringConfig(_Strict):
     funding_high_pct: float
     funding_very_high_pct: float
     funding_low_pct: float
-    oi_lookback_hours: int = 24
-    oi_rising_pct: float
-    long_short_crowded_long: float
-    long_short_crowded_short: float
+    oi_lookback_hours: int = Field(24, ge=1)
+    oi_rising_pct: float = Field(gt=0)
+    long_short_crowded_long: float = Field(gt=0)
+    long_short_crowded_short: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> DerivativesScoringConfig:
+        if not self.funding_low_pct < self.funding_high_pct <= self.funding_very_high_pct:
+            raise ValueError(
+                "scoring.derivatives: tiene que cumplirse funding_low_pct < funding_high_pct "
+                "<= funding_very_high_pct"
+            )
+        if self.long_short_crowded_short >= self.long_short_crowded_long:
+            raise ValueError(
+                "scoring.derivatives: long_short_crowded_short tiene que ser menor que "
+                "long_short_crowded_long"
+            )
+        return self
 
 
 class SentimentScoringConfig(_Strict):
-    fear_greed_extreme_fear: float = 25
-    fear_greed_extreme_greed: float = 75
+    fear_greed_extreme_fear: float = Field(25, ge=0, lt=50)
+    fear_greed_extreme_greed: float = Field(75, gt=50, le=100)
     fear_greed_mode: Literal["contrarian", "trend"] = "contrarian"
     news_share: float = Field(0.5, ge=0, le=1)
 

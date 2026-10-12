@@ -257,7 +257,7 @@ scoring:
     trend_15m: 0.15
     momentum: 0.20    # RSI y MACD en 15m y 1h
     derivatives: 0.15 # funding, OI y ratio long/short
-    sentiment: 0.10   # Fear & Greed y noticias
+    sentiment: 0.10   # Fear & Greed (las noticias no entran: news_share 0)
   momentum:
     timeframes: ["15m", "1h"]
     rsi_neutral: 50
@@ -269,7 +269,10 @@ scoring:
     funding_very_high_pct: 0.10
     funding_low_pct: -0.03       # funding negativo: shorts sobrecargados
     oi_lookback_hours: 24
-    oi_rising_pct: 3.0           # OI +3 % en 24 h = "OI subiendo"
+    # OI +3 % en 24 h = "OI subiendo". Decisión del usuario: con el OI subiendo,
+    # resta solo si además el funding es alto (>= funding_high_pct) y suma si es
+    # negativo (<= funding_low_pct); el funding normal (+0,01 %) no cuenta.
+    oi_rising_pct: 3.0
     long_short_crowded_long: 2.0 # ratio de cuentas long/short que indica exceso de longs
     long_short_crowded_short: 0.7
   sentiment:
@@ -325,6 +328,10 @@ trade_plan:
     # en USD. Tope: margen del perfil × este multiplicador (y nunca más que el
     # saldo de la billetera cargado a mano).
     max_margin_multiplier: 2.0
+    # Si la posición sale más chica que el margen (menos de 1x, el exchange no
+    # lo permite), el margen baja solo hasta igualar la posición (decisión del
+    # usuario). En el perfil agresivo (margen 100 = 2 × riesgo) la regla de
+    # liquidación suele pedir subir el margen unos dólares: se hace solo y se avisa.
 
 fees:
   # Nexo: 0,06 % taker publicado como tarifa estándar de futuros. El maker no
