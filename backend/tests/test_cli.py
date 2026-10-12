@@ -12,7 +12,7 @@ import httpx
 import pytest
 import respx
 
-from app.config import Secrets
+from app.config import DEFAULT_CONFIG_PATH, Secrets
 from app.data.synthetic import DEFAULT_SEED, SyntheticMarketData
 from scripts import analyze_cli
 from scripts.analyze_cli import (
@@ -184,6 +184,24 @@ def test_json_sizing_example_is_consistent(btc_json):
             assert side["suggested_margin_usd"] > side["margin_usd"]
         if side["leverage"] > 50:
             assert any("tope duro" in f for f in side["leverage_flags"])
+        # Decisión del usuario: el nivel del stop está a 1 ATR(15m) o más de la entrada
+        # y los más cercanos aparecen como salteados.
+        min_atr = side["min_stop_distance_atr"]
+        assert min_atr == 1.0
+        assert side["level_distance_atr"] >= min_atr
+        for sk in side["skipped_levels"]:
+            assert sk["distance_atr"] < min_atr
+            if key == "long":
+                assert side["level_price"] < sk["price"] < entry
+            else:
+                assert entry < sk["price"] < side["level_price"]
+
+
+def test_text_explains_skipped_levels(btc_json, btc_text):
+    sides = [btc_json["sizing_example"][k] for k in ("long", "short")]
+    if any(side["skipped_levels"] for side in sides):
+        assert "Nivel salteado" in btc_text
+        assert "demasiado cerca del precio" in btc_text
 
 
 def test_json_never_contains_nan():
@@ -290,10 +308,19 @@ def test_ambiguous_nexo_price_exits_2(capsys):
     assert "ambiguo" in err and "96000" in err
 
 
-def test_short_born_liquidated_is_said_plainly():
-    # Regresión: con esta hora el SHORT tiene la liquidación del lado ganador de la
-    # entrada; se mostraba "a 0,05 % de la entrada" y "-0,39 veces la distancia".
-    argv = ("BTC", "--offline", "--now", "2026-10-12T04:36:39Z")
+def test_short_born_liquidated_is_said_plainly(tmp_path):
+    # Regresión: con esta hora y SIN saltear niveles pegados al precio
+    # (min_stop_distance_atr: 0), el SHORT tiene la liquidación del lado ganador
+    # de la entrada; se mostraba "a 0,05 % de la entrada" y "-0,39 veces la
+    # distancia". Con la regla del usuario (1 ATR) ese stop ya no se elige.
+    cfg = tmp_path / "config.yaml"
+    original = DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+    assert "min_stop_distance_atr: 1.0" in original
+    cfg.write_text(
+        original.replace("min_stop_distance_atr: 1.0", "min_stop_distance_atr: 0"),
+        encoding="utf-8",
+    )
+    argv = ("BTC", "--offline", "--now", "2026-10-12T04:36:39Z", "--config", str(cfg))
     code, out, err = run(*argv, "--json")
     assert code == 0, err
     short = json.loads(out)["sizing_example"]["short"]

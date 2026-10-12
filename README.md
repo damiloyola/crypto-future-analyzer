@@ -36,7 +36,7 @@ celular en la misma red wifi.
 |---|---|---|
 | 0 | Esqueleto del proyecto | ✅ |
 | 1 | Investigación de la Nexo Pro API ([informe](docs/nexo-api-research.md)) | ✅ |
-| 2 | Datos e indicadores + script de consola | ⏳ |
+| 2 | Datos e indicadores + script de consola ([fuentes](docs/data-sources.md)) | ✅ (falta correrlo en vivo en la Mac) |
 | 3 | Detector de régimen (HMM) | ⏳ |
 | 4 | Score, plan de riesgo, ajustes por régimen y perfiles | ⏳ |
 | 5 | Circuit breakers y correlación | ⏳ |
@@ -73,8 +73,24 @@ Otros comandos: `make help`.
 ```bash
 make test    # tests del backend (pytest) y del frontend (typecheck + vitest)
 make lint    # ruff
-make cli SYMBOL=BTC   # (Hito 2) imprime datos e indicadores por consola
 ```
+
+### Script de consola (Hito 2)
+
+Imprime todo lo que la app sabe de una moneda: precios, indicadores por
+timeframe, soportes y resistencias, derivados, sentimiento, noticias y un
+ejemplo didáctico de tamaño de posición, comisiones y liquidación.
+
+```bash
+make cli SYMBOL=BTC                          # datos reales (Binance, o Bybit si falla)
+make cli SYMBOL=SOL ARGS="--nexo-price 187,45"   # con el precio que ves en Nexo
+make cli SYMBOL=ETH ARGS="--profile moderado"
+make cli SYMBOL=BTC ARGS="--offline"         # datos sintéticos, sin red (para probar)
+make cli SYMBOL=BTC ARGS="--json"            # salida en JSON
+```
+
+Si Binance y Bybit no responden, termina con un mensaje claro (código 1). Si
+falla una fuente secundaria (noticias, Fear & Greed), sigue y lo avisa.
 
 ## Configuración
 

@@ -42,7 +42,9 @@ exchanges:
   data_fallback: "bybit"    # se usa si Binance falla
   execution_venue: "nexo"   # precio sobre el que se calculan los niveles finales
   request_timeout_s: 10
-  max_retries: 2
+  max_retries: 2              # reintentos ante cortes de red o errores 5xx
+  request_backoff_s: 0.5      # espera inicial entre reintentos (se duplica)
+  max_history_requests: 200   # tope de páginas al bajar historia larga (evita baneos)
   binance:
     spot_base_url: "https://api.binance.com"
     futures_base_url: "https://fapi.binance.com"
@@ -90,11 +92,20 @@ data_sources:
   fear_greed_url: "https://api.alternative.me/fng/"
   coingecko_base_url: "https://api.coingecko.com/api/v3"
   # Solo si CRYPTOPANIC_API_KEY está en .env. Si no, se usan los RSS.
+  # El tramo "developer" depende del plan de tu key (developer, growth o
+  # enterprise): tiene que coincidir con el plan que tengas en CryptoPanic.
   cryptopanic_base_url: "https://cryptopanic.com/api/developer/v2"
   rss_feeds:
     - "https://www.coindesk.com/arc/outboundfeeds/rss/"
     - "https://cointelegraph.com/rss"
   news_max_headlines: 15
+  # Noticias más viejas que esto se descartan (para operar en el día, lo viejo
+  # ya suele estar en el precio). null = sin límite.
+  news_max_age_hours: 48
+  # Al analizar ETH, SOL, XRP o AVAX se suman también las noticias de esta
+  # moneda (Bitcoin suele arrastrar al resto del mercado).
+  leader_symbol: "BTC"
+  include_leader_news: true
   # Palabras para filtrar titulares por moneda (sin distinguir mayúsculas).
   news_keywords:
     BTC: ["bitcoin", "btc"]
@@ -103,7 +114,16 @@ data_sources:
     XRP: ["xrp", "ripple"]
     AVAX: ["avalanche", "avax"]
   # Titulares que no nombran ninguna moneda pero mueven todo el mercado.
-  macro_keywords: ["fed", "fomc", "cpi", "inflation", "sec", "etf", "rate", "powell", "tariff"]
+  # Se buscan como palabra completa: "etf" no encuentra "ETFs", por eso van las dos.
+  macro_keywords: ["fed", "federal reserve", "fomc", "cpi", "inflation", "sec", "etf", "etfs",
+                   "rate", "rates", "powell", "tariff", "tariffs"]
+
+# Historial de derivados que se muestra (funding, open interest, long/short).
+# Ojo: Binance guarda solo ~30 días de open interest y de long/short.
+derivatives_history:
+  funding_days: 7
+  oi_hours: 168
+  period: "1h"
 
 # -----------------------------------------------------------------------------
 # Timeframes (estilo intradiario)
@@ -242,6 +262,10 @@ scoring:
 trade_plan:
   stop_timeframes: ["15m", "1h"]  # dónde buscar el soporte/resistencia del stop
   stop_atr_buffer: 0.5            # stop = nivel - 0,5 × ATR(15m) (espejado en short)
+  # Los soportes/resistencias más cerca del precio que esta cantidad de ATR(15m)
+  # (lo que se mueve una vela normal) se saltean para el stop: se usa el
+  # siguiente. Así el ruido normal no te saca y el apalancamiento no se dispara.
+  min_stop_distance_atr: 1.0
   take_profit:
     tp1: "next_level"   # siguiente S/R
     tp2_r: 1.5
@@ -272,6 +296,8 @@ fees:
   exit_order: "taker"
   # Estimar el costo de funding por mantener la posición hasta el stop por tiempo.
   include_funding_estimate: true
+  # Solo de respaldo: cada exchange informa el intervalo real de cada moneda
+  # (algunas cobran cada 4 h o cada 1 h).
   funding_interval_hours: 8
 
 liquidation:

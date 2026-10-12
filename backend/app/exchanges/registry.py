@@ -354,6 +354,8 @@ def make_market_data_source(
         quote=settings.symbols.quote,
         clock=clock,
         default_funding_interval_hours=settings.fees.funding_interval_hours,
+        backoff_s=settings.exchanges.request_backoff_s,
+        max_history_requests=settings.exchanges.max_history_requests,
     )
 
 

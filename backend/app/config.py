@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -81,8 +81,10 @@ class ExchangesConfig(_Strict):
     data_primary: str
     data_fallback: str | None = None
     execution_venue: str
-    request_timeout_s: float = 10
-    max_retries: int = 2
+    request_timeout_s: float = Field(10, gt=0)
+    max_retries: int = Field(2, ge=0)
+    request_backoff_s: float = Field(0.5, ge=0)
+    max_history_requests: int = Field(200, ge=1)
     binance: BinanceConfig
     bybit: BybitConfig
     nexo: NexoConfig
@@ -93,9 +95,18 @@ class DataSourcesConfig(_Strict):
     coingecko_base_url: str
     cryptopanic_base_url: str
     rss_feeds: list[str]
-    news_max_headlines: int = 15
+    news_max_headlines: int = Field(15, ge=0)
+    news_max_age_hours: float | None = Field(48, gt=0)
+    leader_symbol: str = "BTC"
+    include_leader_news: bool = True
     news_keywords: dict[str, list[str]]
     macro_keywords: list[str] = Field(default_factory=list)
+
+
+class DerivativesHistoryConfig(_Strict):
+    funding_days: float = Field(7, gt=0)
+    oi_hours: int = Field(168, ge=1)
+    period: Timeframe = "1h"
 
 
 class TimeframesConfig(_Strict):
@@ -103,43 +114,58 @@ class TimeframesConfig(_Strict):
     structure: Timeframe
     entry: Timeframe
     fine_tune: Timeframe | None = None
-    candles_per_request: int = 500
+    candles_per_request: int = Field(500, ge=1, le=1000)
     closed_candles_only: bool = True
 
 
 # --- indicadores -------------------------------------------------------------
 
 
+PositiveInt = Annotated[int, Field(ge=1)]
+
+
 class MacdConfig(_Strict):
-    fast: int = 12
-    slow: int = 26
-    signal: int = 9
+    fast: PositiveInt = 12
+    slow: PositiveInt = 26
+    signal: PositiveInt = 9
+
+    @model_validator(mode="after")
+    def _fast_below_slow(self) -> MacdConfig:
+        if self.fast >= self.slow:
+            raise ValueError("indicators.macd: fast tiene que ser menor que slow")
+        return self
 
 
 class BollingerConfig(_Strict):
-    period: int = 20
-    std: float = 2.0
+    period: PositiveInt = 20
+    std: float = Field(2.0, gt=0)
 
 
 class LevelsConfig(_Strict):
-    pivot_left: int = 3
-    pivot_right: int = 3
-    cluster_atr_mult: float = 0.5
-    max_levels_each_side: int = 3
+    pivot_left: PositiveInt = 3
+    pivot_right: PositiveInt = 3
+    cluster_atr_mult: float = Field(0.5, ge=0)
+    max_levels_each_side: PositiveInt = 3
     include_previous_day: bool = True
 
 
 class IndicatorsConfig(_Strict):
-    ema_periods: list[int]
+    ema_periods: list[PositiveInt] = Field(min_length=2)
     vwap_timeframes: list[Timeframe]
-    rsi_period: int = 14
-    rsi_overbought: float = 70
-    rsi_oversold: float = 30
+    rsi_period: PositiveInt = 14
+    rsi_overbought: float = Field(70, gt=0, lt=100)
+    rsi_oversold: float = Field(30, gt=0, lt=100)
     macd: MacdConfig
-    atr_period: int = 14
+    atr_period: PositiveInt = 14
     bollinger: BollingerConfig
-    relative_volume_period: int = 20
+    relative_volume_period: PositiveInt = 20
     levels: LevelsConfig
+
+    @model_validator(mode="after")
+    def _rsi_zones(self) -> IndicatorsConfig:
+        if self.rsi_oversold >= self.rsi_overbought:
+            raise ValueError("indicators: rsi_oversold tiene que ser menor que rsi_overbought")
+        return self
 
 
 # --- régimen -----------------------------------------------------------------
@@ -217,6 +243,14 @@ class MomentumScoringConfig(_Strict):
     rsi_overbought: float = 70
     rsi_oversold: float = 30
 
+    @model_validator(mode="after")
+    def _ordered(self) -> MomentumScoringConfig:
+        if not self.rsi_oversold < self.rsi_neutral < self.rsi_overbought:
+            raise ValueError(
+                "scoring.momentum: tiene que cumplirse rsi_oversold < rsi_neutral < rsi_overbought"
+            )
+        return self
+
 
 class DerivativesScoringConfig(_Strict):
     funding_high_pct: float
@@ -264,13 +298,14 @@ class TakeProfitConfig(_Strict):
 
 
 class PlanLiquidationConfig(_Strict):
-    min_distance_ratio: float = 2.0
-    max_margin_multiplier: float = 2.0
+    min_distance_ratio: float = Field(2.0, gt=1)
+    max_margin_multiplier: float = Field(2.0, ge=1)
 
 
 class TradePlanConfig(_Strict):
     stop_timeframes: list[Timeframe]
-    stop_atr_buffer: float = 0.5
+    stop_atr_buffer: float = Field(0.5, ge=0)
+    min_stop_distance_atr: float = Field(1.0, ge=0)
     take_profit: TakeProfitConfig
     flag_tp_beyond_daily_range: bool = True
     time_stop_hours: float = 24
@@ -279,8 +314,8 @@ class TradePlanConfig(_Strict):
 
 
 class VenueFees(_Strict):
-    taker_pct: float = Field(ge=0)
-    maker_pct: float = Field(ge=0)
+    taker_pct: float = Field(ge=0, lt=100)
+    maker_pct: float = Field(ge=0, lt=100)
 
 
 class FeesConfig(_Strict):
@@ -288,7 +323,8 @@ class FeesConfig(_Strict):
     entry_order: Literal["taker", "maker"] = "taker"
     exit_order: Literal["taker", "maker"] = "taker"
     include_funding_estimate: bool = True
-    funding_interval_hours: float = 8
+    # Solo de respaldo: el intervalo real lo informa cada exchange.
+    funding_interval_hours: float = Field(8, gt=0)
 
 
 class LiquidationConfig(_Strict):
@@ -482,6 +518,7 @@ class AppSettings(_Strict):
     exchanges: ExchangesConfig
     cache_ttl_seconds: dict[str, float]
     data_sources: DataSourcesConfig
+    derivatives_history: DerivativesHistoryConfig = Field(default_factory=DerivativesHistoryConfig)
     timeframes: TimeframesConfig
     indicators: IndicatorsConfig
     regime: RegimeConfig
@@ -501,7 +538,8 @@ class AppSettings(_Strict):
 
     @model_validator(mode="after")
     def _cross_checks(self) -> AppSettings:
-        missing = [s for s in self.symbols.favorites if s not in self.data_sources.news_keywords]
+        needed = [*self.symbols.favorites, self.data_sources.leader_symbol]
+        missing = [s for s in needed if s not in self.data_sources.news_keywords]
         if missing:
             raise ValueError(f"data_sources.news_keywords: faltan palabras para {missing}")
         if self.exchanges.nexo.allow_orders:

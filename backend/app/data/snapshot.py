@@ -6,7 +6,8 @@ pide todo en paralelo (``asyncio.gather`` con ``return_exceptions=True``):
 - velas de cada timeframe (``timeframes.context`` + ``structure`` + ``entry`` +
   ``fine_tune``), ``timeframes.candles_per_request`` velas por timeframe;
 - ticker de los datos de mercado (Binance, o Bybit si Binance falla);
-- funding actual e historial de ``funding_history_days`` días (con
+- funding actual e historial de ``funding_history_days`` días (por defecto
+  ``derivatives_history.funding_days`` de config.yaml; con
   ``fees.funding_interval_hours`` se calcula cuántos puntos pedir: 7 días de a
   8 h son 21);
 - interés abierto actual e historial horario de ``oi_history_hours`` horas;
@@ -444,13 +445,18 @@ async def _assemble(
     manual_nexo_price: float | None,
     timeframes: Sequence[str] | None,
     clock: Callable[[], datetime],
-    funding_history_days: float,
-    oi_history_hours: int,
+    funding_history_days: float | None,
+    oi_history_hours: int | None,
     offline: bool,
 ) -> MarketSnapshot:
     sym = symbol.strip().upper()
     if not sym or not sym.isalnum():
         raise ValueError(f"Símbolo inválido: {symbol!r}")
+    history = settings.derivatives_history
+    if funding_history_days is None:
+        funding_history_days = history.funding_days
+    if oi_history_hours is None:
+        oi_history_hours = history.oi_hours
     if funding_history_days <= 0 or oi_history_hours < 1:
         raise ValueError("funding_history_days y oi_history_hours tienen que ser positivos")
     tfs: list[str] = (
@@ -464,7 +470,7 @@ async def _assemble(
     funding_limit = max(
         1, math.ceil(funding_history_days * 24 / settings.fees.funding_interval_hours)
     )
-    period: Timeframe = "1h"
+    period: Timeframe = history.period
 
     tasks: list[Awaitable[Any]] = [
         market_data.get_klines(sym, tf, limit)  # type: ignore[arg-type]
@@ -616,8 +622,8 @@ async def build_snapshot(
     *,
     extras: ExtraSources | None = None,
     clock: Callable[[], datetime] = _utcnow,
-    funding_history_days: float = 7.0,
-    oi_history_hours: int = 168,
+    funding_history_days: float | None = None,
+    oi_history_hours: int | None = None,
     offline: bool = False,
 ) -> MarketSnapshot:
     """Foto del mercado de ``symbol`` (ver el docstring del módulo).
@@ -656,8 +662,8 @@ async def build_offline_snapshot(
     seed: int = DEFAULT_SEED,
     now: datetime | None = None,
     market: SyntheticMarketData | None = None,
-    funding_history_days: float = 7.0,
-    oi_history_hours: int = 168,
+    funding_history_days: float | None = None,
+    oi_history_hours: int | None = None,
 ) -> MarketSnapshot:
     """Como ``build_snapshot`` pero con datos sintéticos (sin red). Todo sale marcado."""
     md = market or SyntheticMarketData(

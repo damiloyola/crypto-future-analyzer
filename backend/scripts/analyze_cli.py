@@ -105,6 +105,7 @@ from app.risk.liquidation import (
     wallet_liquidation_price,
 )
 from app.risk.sizing import fraction_to_pct, size_position
+from app.risk.stops import StopNotFound, structural_stop
 
 OFFLINE_BANNER = "DATOS SINTÉTICOS (sin red): los números no son reales"
 SIZING_TITLE = "Ejemplo didáctico de sizing (el plan real llega en el Hito 4)"
@@ -383,29 +384,6 @@ def _summary_dict(s: TimeframeSummary) -> dict[str, Any]:
     }
 
 
-def _nearest_level(
-    analysis: MarketAnalysis, timeframes: Sequence[str], side: str
-) -> tuple[Level, str] | None:
-    """Soporte (long) o resistencia (short) más cercano entre ``timeframes``."""
-    best: tuple[Level, str] | None = None
-    for tf in timeframes:
-        ta = analysis.timeframes.get(tf)
-        levels = ta.summary.levels if ta else None
-        if levels is None:
-            continue
-        group = levels.supports if side == "long" else levels.resistances
-        if not group:
-            continue
-        lv = group[0]
-        if (
-            best is None
-            or (side == "long" and lv.price > best[0].price)
-            or (side == "short" and lv.price < best[0].price)
-        ):
-            best = (lv, tf)
-    return best
-
-
 def _leverage_flags(leverage: float, settings: AppSettings, profile_name: str) -> list[str]:
     rp = settings.risk_profiles
     profile = rp.profiles[profile_name]
@@ -433,18 +411,7 @@ def _sizing_side(
     plan = settings.trade_plan
     profile = settings.risk_profiles.profiles[profile_name]
     entry_tf = settings.timeframes.entry
-    stop_tfs = list(plan.stop_timeframes)
     entry = snapshot.current_price
-    word = "soporte" if side == "long" else "resistencia"
-
-    nearest = _nearest_level(analysis, stop_tfs, side)
-    if nearest is None:
-        return {
-            "available": False,
-            "side": side,
-            "reason": f"No hay {word}s detectados en {'/'.join(stop_tfs)}: no se arma el ejemplo.",
-        }
-    level, level_tf = nearest
     entry_ta = analysis.timeframes.get(entry_tf)
     atr = entry_ta.summary.atr if entry_ta else None
     if atr is None:
@@ -453,15 +420,30 @@ def _sizing_side(
             "side": side,
             "reason": f"Sin ATR de {entry_tf}: no se puede poner el colchón del stop.",
         }
-    buffer = plan.stop_atr_buffer * atr
-    stop = level.price - buffer if side == "long" else level.price + buffer
-    if stop <= 0 or (side == "long" and stop >= entry) or (side == "short" and stop <= entry):
+    levels_by_tf = {
+        tf: (ta.summary.levels if (ta := analysis.timeframes.get(tf)) else None)
+        for tf in plan.stop_timeframes
+    }
+    found = structural_stop(
+        side,  # type: ignore[arg-type]
+        entry,
+        levels_by_tf,
+        atr,
+        plan.stop_atr_buffer,
+        plan.min_stop_distance_atr,
+    )
+    skipped = [
+        {"price": sk.price, "timeframe": sk.timeframe, "distance_atr": sk.distance_atr}
+        for sk in found.skipped
+    ]
+    if isinstance(found, StopNotFound):
         return {
             "available": False,
             "side": side,
-            "reason": f"El stop calculado ({fmt_num(stop, price_decimals(entry))}) no queda del "
-            "lado correcto del precio.",
+            "reason": f"{found.reason} No se arma el ejemplo.",
+            "skipped_levels": skipped,
         }
+    stop = found.stop
 
     entry_rate, exit_rate = fee_rates_from_config(settings.fees)
     mmr = mmr_from_config(settings.liquidation)
@@ -484,9 +466,12 @@ def _sizing_side(
         "available": True,
         "side": side,
         "entry": entry,
-        "level_price": level.price,
-        "level_kind": level.kind,
-        "level_timeframe": level_tf,
+        "level_price": found.level_price,
+        "level_kind": found.level_kind,
+        "level_timeframe": found.level_timeframe,
+        "level_distance_atr": found.level_distance_atr,
+        "min_stop_distance_atr": found.min_distance_atr,
+        "skipped_levels": skipped,
         "atr_timeframe": entry_tf,
         "atr": atr,
         "stop": stop,
@@ -1095,8 +1080,17 @@ def _render_sizing_side(
     qty = f"{fmt_num(side['quantity'], max(4, d))} {r['symbol']}"
     lev_color = "alert" if side["leverage_flags"] else None
     leverage = Cell(f"{fmt_num(side['leverage'], 1)}x (tamaño / margen)", lev_color)
-    rows: list[tuple[str, Cell | str]] = [
-        ("Entrada", fmt_num(side["entry"], d)),
+    rows: list[tuple[str, Cell | str]] = [("Entrada", fmt_num(side["entry"], d))]
+    for sk in side.get("skipped_levels", []):
+        rows.append(
+            (
+                "Nivel salteado",
+                f"{level_word} {fmt_num(sk['price'], d)} ({sk['timeframe']}): a "
+                f"{fmt_num(sk['distance_atr'], 2)} ATR, menos de "
+                f"{fmt_num(side['min_stop_distance_atr'], 1)} (demasiado cerca del precio)",
+            )
+        )
+    rows += [
         ("Stop", stop),
         ("Distancia al stop", fmt_pct(side["stop_distance_pct"])),
         ("Riesgo", f"{fmt_usd(side['risk_usd'])} ({fees_mode})"),

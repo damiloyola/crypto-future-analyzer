@@ -43,3 +43,24 @@ Capas en `backend/app/`, cada una depende solo de las de abajo:
 `risk.plan.build_trade_plan` que usa la app).
 
 El frontend solo muestra lo que devuelve la API; no calcula riesgo.
+
+## Decisiones del usuario (no cambiarlas sin preguntar)
+
+- **Precio de ejecución:** Binance, salvo que el usuario pegue a mano el precio
+  de Nexo (`registry.get_execution_price`). Nexo no tiene endpoints públicos.
+- **Liquidación:** las reglas usan margen aislado (conservador); el "modelo
+  billetera" de Nexo se muestra solo como dato.
+- **Velas:** indicadores solo con velas cerradas (`timeframes.closed_candles_only`).
+- **Riesgo con comisiones:** los 50 USD de riesgo incluyen las comisiones de
+  entrada y salida (`trade_plan.fees_included_in_risk`).
+- **Stop:** se saltean los soportes/resistencias a menos de 1 ATR(15m) de la
+  entrada (`trade_plan.min_stop_distance_atr`, `risk.stops.structural_stop`).
+- **Noticias:** a las altcoins se les suman las de BTC; corte de 48 h.
+- Al usuario hay que explicarle todo en palabras simples (hace mucho que no
+  opera futuros) y hacerle las preguntas con opciones (AskUserQuestion).
+
+## Cómo probar sin red
+
+El contenedor de desarrollo no llega a las APIs. `make cli SYMBOL=BTC
+ARGS="--offline"` usa datos sintéticos (`app/data/synthetic.py`) por el mismo
+camino de código; los tests usan fixtures (`backend/tests/fixtures/README.md`).

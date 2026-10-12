@@ -61,6 +61,15 @@ def _raw_config() -> dict:
         (lambda c: c["exchanges"]["nexo"].update(allow_orders=True), "fase 1"),
         (lambda c: c["regime"]["labels"].pop(7), "7 estados"),
         (lambda c: c["indicators"].update(rsi_peroid=14), "Extra inputs"),
+        (lambda c: c["indicators"]["macd"].update(fast=30), "fast tiene que ser menor"),
+        (lambda c: c["indicators"].update(rsi_oversold=80), "rsi_oversold"),
+        (lambda c: c["indicators"].update(rsi_period=0), "greater than or equal to 1"),
+        (lambda c: c["scoring"]["momentum"].update(rsi_neutral=90), "rsi_neutral"),
+        (lambda c: c["trade_plan"]["liquidation"].update(min_distance_ratio=1), "greater than 1"),
+        (lambda c: c["trade_plan"].update(min_stop_distance_atr=-1), "greater than or equal"),
+        (lambda c: c["fees"]["nexo"].update(taker_pct=100), "less than 100"),
+        (lambda c: c["data_sources"].update(leader_symbol="DOGE"), "DOGE"),
+        (lambda c: c["timeframes"].update(candles_per_request=5000), "less than or equal"),
     ],
 )
 def test_invalid_config_is_rejected(mutate, message):

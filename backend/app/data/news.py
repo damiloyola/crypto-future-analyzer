@@ -38,9 +38,14 @@ Filtrado (función pura ``select_headlines``):
    CryptoPanic se suman las monedas de ``instruments``.
 3. Macro: misma regex con ``data_sources.macro_keywords`` pero **solo sobre el
    título** (en los resúmenes palabras como "rate" aparecen en cualquier nota).
-4. Primero los titulares de la moneda pedida, del más nuevo al más viejo. Si
-   sobra lugar, se completa con titulares macro que no nombran ninguna moneda.
-   Los que no tienen fecha van al final de su grupo.
+4. Primero los titulares de la moneda pedida, del más nuevo al más viejo.
+   Después, si la moneda no es la "líder" (``data_sources.leader_symbol``,
+   Bitcoin) y ``include_leader_news`` está activo, los de Bitcoin, que suele
+   arrastrar al resto. Si sobra lugar, se completa con titulares macro que no
+   nombran ninguna moneda. Los que no tienen fecha van al final de su grupo.
+5. Antigüedad: se descartan las notas más viejas que
+   ``data_sources.news_max_age_hours`` (48 h por defecto; las sin fecha se
+   quedan, al final).
 
 Caché (TTL ``cache_ttl_seconds.news``): cada feed RSS se guarda una sola vez
 (``"rss:<url>"``) y se reutiliza para todas las monedas; CryptoPanic se guarda
@@ -173,19 +178,27 @@ def select_headlines(
     *,
     now: datetime | None = None,
     max_age_hours: float | None = None,
+    leader: str | None = None,
 ) -> list[Headline]:
-    """Elige los titulares para ``symbol``: primero los de la moneda, después los macro.
+    """Elige los titulares para ``symbol``: la moneda, después ``leader`` y después macro.
 
     ``news_keywords`` mapea cada moneda a sus palabras. Si ``symbol`` no está, se
-    usa el símbolo mismo como palabra. Con ``max_age_hours`` se descartan las
+    usa el símbolo mismo como palabra. ``leader`` (``"BTC"``) suma, después de
+    los de la moneda, los titulares de esa moneda; no hace nada si ``leader`` es
+    ``None`` o es la misma moneda pedida. Con ``max_age_hours`` se descartan las
     notas publicadas antes de ``now - max_age_hours`` (las sin fecha se quedan,
     al final).
     """
     if limit <= 0:
         return []
     symbol = symbol.strip().upper()
+    leader = (leader or "").strip().upper() or None
+    if leader == symbol:
+        leader = None
     keywords = {code.upper(): list(words) for code, words in news_keywords.items()}
     keywords.setdefault(symbol, [symbol.lower()])
+    if leader:
+        keywords.setdefault(leader, [leader.lower()])
     coin_patterns = {
         code: pattern
         for code, words in keywords.items()
@@ -198,6 +211,7 @@ def select_headlines(
         cutoff = (now or utcnow()) - timedelta(hours=max_age_hours)
 
     coin: list[Headline] = []
+    leader_news: list[Headline] = []
     macro: list[Headline] = []
     seen: set[str] = set()
     for item in sorted(items, key=_newest_first):
@@ -221,9 +235,11 @@ def select_headlines(
         )
         if symbol in currencies:
             coin.append(headline)
+        elif leader and leader in currencies:
+            leader_news.append(headline)
         elif is_macro and not currencies:
             macro.append(headline)
-    return (coin + macro)[:limit]
+    return (coin + leader_news + macro)[:limit]
 
 
 def _newest_first(item: RawNewsItem) -> tuple[bool, float]:
@@ -376,13 +392,14 @@ async def get_headlines(
     cryptopanic_token: str | None,
     limit: int | None = None,
     *,
-    max_age_hours: float | None = None,
+    max_age_hours: float | None | Literal["config"] = "config",
     now: datetime | None = None,
 ) -> NewsResult:
     """Titulares para ``symbol`` (``"BTC"``). Nunca lanza por errores de red.
 
-    ``max_age_hours`` (opcional) descarta notas más viejas que eso respecto de
-    ``now`` (por defecto, la hora actual).
+    ``max_age_hours`` descarta notas más viejas que eso respecto de ``now`` (por
+    defecto, la hora actual). Por defecto sale de
+    ``data_sources.news_max_age_hours``; ``None`` = sin límite.
     """
     symbol = symbol.strip().upper()
     if limit is None:
@@ -390,6 +407,8 @@ async def get_headlines(
     if limit < 0:
         raise ValueError("limit no puede ser negativo")
     ds = settings.data_sources
+    max_age = ds.news_max_age_hours if max_age_hours == "config" else max_age_hours
+    leader = leader_for(symbol, settings)
 
     def select(items: Sequence[RawNewsItem]) -> list[Headline]:
         return select_headlines(
@@ -399,7 +418,8 @@ async def get_headlines(
             ds.macro_keywords,
             limit,
             now=now,
-            max_age_hours=max_age_hours,
+            max_age_hours=max_age,
+            leader=leader,
         )
 
     token = (cryptopanic_token or "").strip() or None
@@ -458,6 +478,15 @@ async def get_headlines(
     return NewsResult(symbol, [], "rss", meta, warnings)
 
 
+def leader_for(symbol: str, settings: AppSettings) -> str | None:
+    """Moneda líder cuyas noticias se suman a ``symbol`` (``None`` si no corresponde)."""
+    ds = settings.data_sources
+    leader = ds.leader_symbol.strip().upper()
+    if not ds.include_leader_news or not leader or leader == symbol.strip().upper():
+        return None
+    return leader
+
+
 async def _fetch_cryptopanic(
     symbol: str,
     client: httpx.AsyncClient,
@@ -466,7 +495,9 @@ async def _fetch_cryptopanic(
     token: str,
 ) -> CacheResult[list[RawNewsItem]]:
     url = f"{settings.data_sources.cryptopanic_base_url.rstrip('/')}/posts/"
-    params = {"auth_token": token, "currencies": symbol, "public": "true", "kind": "news"}
+    leader = leader_for(symbol, settings)
+    currencies = f"{symbol},{leader}" if leader else symbol
+    params = {"auth_token": token, "currencies": currencies, "public": "true", "kind": "news"}
 
     async def fetch() -> list[RawNewsItem]:
         with _redacting_http_logs(token):
@@ -480,7 +511,7 @@ async def _fetch_cryptopanic(
         return parse_cryptopanic(payload, token)
 
     return await cache.get_or_fetch(
-        f"cryptopanic:posts:{symbol}", ttl_for(settings.cache_ttl_seconds, "news"), fetch
+        f"cryptopanic:posts:{currencies}", ttl_for(settings.cache_ttl_seconds, "news"), fetch
     )
 
 

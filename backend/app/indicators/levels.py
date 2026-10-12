@@ -154,6 +154,9 @@ class SRResult:
     prev_day: date | None  # qué día se tomó como "día anterior"
     reference_price: float
     cluster_tolerance: float  # mult × ATR usado al agrupar (0 = solo precios idénticos)
+    # Todos los grupos de niveles (no solo los más cercanos), de menor a mayor
+    # precio: el stop puede necesitar saltear los que están pegados al precio.
+    clusters: tuple[LevelCluster, ...] = ()
 
 
 # --- pivotes -----------------------------------------------------------------
@@ -420,6 +423,7 @@ def support_resistance(
         prev_day=None if prev is None else prev.day,
         reference_price=reference,
         cluster_tolerance=tolerance,
+        clusters=tuple(sorted(clusters, key=lambda c: c.price)),
     )
 
 

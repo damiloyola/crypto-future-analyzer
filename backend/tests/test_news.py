@@ -18,6 +18,7 @@ from app.data.news import (
     RawNewsItem,
     get_headlines,
     keyword_pattern,
+    leader_for,
     normalize_title,
     parse_cryptopanic,
     parse_rss,
@@ -98,6 +99,10 @@ def news_settings(settings):
             "rss_feeds": [COINDESK, COINTELEGRAPH],
             "cryptopanic_base_url": CP_BASE,
             "news_max_headlines": 15,
+            # Los tests de abajo no dependen de la hora real: el corte por
+            # antigüedad y las noticias de BTC se prueban aparte, con hora fija.
+            "news_max_age_hours": None,
+            "include_leader_news": False,
         }
     )
     ex = settings.exchanges.model_copy(update={"max_retries": 0})
@@ -654,3 +659,98 @@ async def test_negative_limit_rejected(news_settings):
     async with make_client() as client:
         with pytest.raises(ValueError):
             await get_headlines("BTC", client, TTLCache(), news_settings, None, limit=-1)
+
+
+# --- noticias de BTC para altcoins y antigüedad (decisiones del usuario) ------
+
+
+def _item(title: str, hours_ago: float | None) -> RawNewsItem:
+    when = None if hours_ago is None else FIXTURE_NOW - timedelta(hours=hours_ago)
+    return RawNewsItem(title=title, source="test", url="", published_at=when)
+
+
+LEADER_ITEMS = [
+    _item("Bitcoin rallies past resistance", 1),
+    _item("Solana validators upgrade client", 2),
+    _item("Fed holds rates steady", 3),
+    _item("Ethereum gas fees drop", 4),
+    _item("Solana DEX volume hits record", 5),
+]
+
+
+def test_altcoin_gets_leader_news_after_its_own_and_before_macro():
+    got = select(LEADER_ITEMS, "SOL", leader="BTC")
+    assert [h.title for h in got] == [
+        "Solana validators upgrade client",
+        "Solana DEX volume hits record",
+        "Bitcoin rallies past resistance",
+        "Fed holds rates steady",
+    ]
+
+
+def test_leader_is_ignored_for_the_leader_itself_and_when_disabled():
+    btc = select(LEADER_ITEMS, "BTC", leader="BTC")
+    assert [h.title for h in btc] == ["Bitcoin rallies past resistance", "Fed holds rates steady"]
+    sol = select(LEADER_ITEMS, "SOL", leader=None)
+    assert "Bitcoin rallies past resistance" not in [h.title for h in sol]
+
+
+def test_max_age_drops_old_news_but_keeps_undated_ones():
+    items = [
+        _item("Bitcoin news from today", 2),
+        _item("Bitcoin news from three days ago", 72),
+        _item("Bitcoin undated news", None),
+    ]
+    got = select(items, "BTC", now=FIXTURE_NOW, max_age_hours=48)
+    assert [h.title for h in got] == ["Bitcoin news from today", "Bitcoin undated news"]
+
+
+def test_leader_for_respects_config(news_settings):
+    on = news_settings.model_copy(
+        update={
+            "data_sources": news_settings.data_sources.model_copy(
+                update={"include_leader_news": True, "leader_symbol": "BTC"}
+            )
+        }
+    )
+    assert leader_for("SOL", on) == "BTC"
+    assert leader_for("btc", on) is None
+    assert leader_for("SOL", news_settings) is None  # desactivado en el fixture
+
+
+@respx.mock
+async def test_get_headlines_uses_config_age_and_leader(news_settings):
+    """Con la config por defecto (48 h y BTC para altcoins), usando la hora del fixture."""
+    cfg = news_settings.model_copy(
+        update={
+            "data_sources": news_settings.data_sources.model_copy(
+                update={"news_max_age_hours": 48, "include_leader_news": True}
+            )
+        }
+    )
+    mock_feeds()
+    async with make_client() as client:
+        far_future = FIXTURE_NOW + timedelta(days=30)
+        stale = await get_headlines("SOL", client, TTLCache(), cfg, None, now=far_future)
+        fresh = await get_headlines("SOL", client, TTLCache(), cfg, None, now=FIXTURE_NOW)
+    assert [h for h in stale.headlines if h.published_at is not None] == []
+    sol = [h for h in fresh.headlines if "SOL" in h.currencies]
+    btc_only = [h for h in fresh.headlines if "BTC" in h.currencies and "SOL" not in h.currencies]
+    assert sol and btc_only
+    order = [h.title for h in fresh.headlines]
+    assert max(order.index(h.title) for h in sol) < min(order.index(h.title) for h in btc_only)
+
+
+@respx.mock
+async def test_cryptopanic_asks_for_leader_too(news_settings):
+    cfg = news_settings.model_copy(
+        update={
+            "data_sources": news_settings.data_sources.model_copy(
+                update={"include_leader_news": True}
+            )
+        }
+    )
+    route = respx.get(f"{CP_BASE}/posts/").mock(return_value=httpx.Response(200, json=cp_payload()))
+    async with make_client() as client:
+        await get_headlines("SOL", client, TTLCache(), cfg, TOKEN, now=FIXTURE_NOW)
+    assert route.calls.last.request.url.params["currencies"] == "SOL,BTC"
