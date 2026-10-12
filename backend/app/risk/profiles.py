@@ -11,7 +11,9 @@ Reglas del tope de apalancamiento (especificación del usuario):
 - por encima de ``risk_profiles.leverage_red_warning_above`` (25x) el perfil
   queda con ``red_warning=True`` y un texto de advertencia roja permanente
   (``red_warning_text``) para la UI;
-- también se puede bajar (cualquier valor mayor que cero).
+- también se puede bajar, hasta 1x (``position.MIN_EXCHANGE_LEVERAGE``: con
+  menos de 1x el margen sería más grande que la posición y ningún exchange lo
+  permite; un tope así haría que todo plan diera "No operar").
 
 ``get_profile(name, settings, max_leverage_override=None)``:
 
@@ -31,7 +33,8 @@ import numbers
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from app.risk.rules import fmt_leverage, json_safe
+from app.risk.position import MIN_EXCHANGE_LEVERAGE
+from app.risk.rules import fmt_leverage, fmt_num, json_safe
 
 if TYPE_CHECKING:
     from app.config import AppSettings
@@ -103,16 +106,27 @@ def red_warning_text(max_leverage: float, threshold: float) -> str:
     )
 
 
+def _fmt_requested(value: float) -> str:
+    """Tope pedido con hasta 4 decimales (``50.04`` -> ``"50,04x"``, no ``"50x"``)."""
+    return f"{fmt_num(value, 4)}x"
+
+
 def _validate_override(value: Any, hard_cap: float) -> float:
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise ValueError(f"El apalancamiento máximo tiene que ser un número (vino {value!r}).")
     v = float(value)
     if not math.isfinite(v) or v <= 0:
         raise ValueError(f"El apalancamiento máximo tiene que ser mayor que cero (vino {value}).")
+    if v < MIN_EXCHANGE_LEVERAGE:
+        raise ValueError(
+            f"El apalancamiento máximo tiene que ser {fmt_leverage(MIN_EXCHANGE_LEVERAGE)} o más "
+            f"({fmt_leverage(MIN_EXCHANGE_LEVERAGE)} = sin apalancamiento; pediste "
+            f"{_fmt_requested(v)})."
+        )
     if v > hard_cap:
         raise ValueError(
             f"No se permite más de {fmt_leverage(hard_cap)} de apalancamiento "
-            f"(pediste {fmt_leverage(v)})."
+            f"(pediste {_fmt_requested(v)})."
         )
     return v
 
@@ -126,7 +140,7 @@ def get_profile(
 
     - ``name=None`` usa ``risk_profiles.default``; un nombre desconocido levanta
       ``ValueError`` con las opciones.
-    - ``max_leverage_override`` tiene que ser > 0 y <= ``leverage_hard_cap``
+    - ``max_leverage_override`` tiene que ser >= 1 (1x) y <= ``leverage_hard_cap``
       (si no, ``ValueError``).
     - ``red_warning`` = tope efectivo > ``leverage_red_warning_above``.
     """

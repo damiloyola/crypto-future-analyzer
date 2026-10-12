@@ -10,8 +10,9 @@ import pytest
 from app.config import AppSettings, DirectionThresholds, ScoringWeights
 from app.data.snapshot import build_offline_snapshot
 from app.indicators.pipeline import analyze_all
+from app.risk.rules import check_direction, direction_from_score
 from app.scoring import ConfluenceScore, ScoreInputs, compute_score, inputs_from_analysis
-from app.scoring.confluence import COMPONENT_LABELS, direction_from_total
+from app.scoring.confluence import COMPONENT_LABELS, direction_from_total, reliable_trend
 from tests.fakes import FIXED_NOW
 
 KEYS = ("trend_4h", "trend_1h", "trend_15m", "momentum", "derivatives", "sentiment")
@@ -164,7 +165,9 @@ def test_direction_hint_at_exactly_plus_and_minus_30(settings):
 
 def test_direction_from_total_edges():
     assert direction_from_total(30.0, 30, -30) == "long"
-    assert direction_from_total(30.0 - 1e-12, 30, -30) == "long"  # error de redondeo
+    # Comparación exacta (igual que el score mínimo de las reglas): el ruido de
+    # float ya lo limpia compute_score, que redondea el total a 9 decimales.
+    assert direction_from_total(30.0 - 1e-12, 30, -30) is None
     assert direction_from_total(29.99, 30, -30) is None
     assert direction_from_total(-30.0, 30, -30) == "short"
     assert direction_from_total(-29.99, 30, -30) is None
@@ -370,3 +373,52 @@ def test_to_dict_has_no_negative_zero(settings):
     text = json.dumps(score.to_dict(), allow_nan=False)
     assert "-0.0" not in text
     assert score.total == 0.0
+
+
+# --- revisión final del Hito 4 ------------------------------------------------------
+
+
+def _almost_long(rsi_15m: float) -> ScoreInputs:
+    # 4h y 1h alcistas (+40), 15m lateral (0), RSI 15m (rsi - 50 puntos), F&G neutral.
+    return ScoreInputs(
+        trends={"4h": "alcista", "1h": "alcista", "15m": "lateral"},
+        rsi={"15m": rsi_15m},
+        fear_greed=50,
+    )
+
+
+def test_summary_does_not_round_the_score_to_the_threshold(settings):
+    # RSI 15m 39,97 (dato continuo, pasa con datos reales): total 29,97.
+    score = compute_score(_almost_long(39.97), settings)
+    assert score.total == pytest.approx(29.97)
+    assert score.direction_hint is None
+    assert score.summary.startswith("Score +29,97: no llega a long (+30 o más)")
+    rule = check_direction(score.total, settings.scoring.direction_thresholds)
+    assert "el score (+29,97) está entre -30 y +30" in rule.message
+
+
+def test_score_hint_matches_the_plan_direction_just_below_the_threshold(settings):
+    # 29,999999999 (a 1e-9 del umbral): antes la pista decía long y el plan no.
+    score = compute_score(_almost_long(39.999999999), settings)
+    assert score.total == pytest.approx(30.0 - 1e-9, abs=1e-12)
+    th = settings.scoring.direction_thresholds
+    assert score.direction_hint is None
+    assert direction_from_score(score.total, th) is None
+    assert score.direction_hint == direction_from_score(score.total, th)
+    assert "candidato" not in score.summary
+    for total in (30.0, -30.0, 29.99, 0.0, -45.0):
+        hint = direction_from_total(total, th.long, th.short)
+        assert hint == direction_from_score(total, th)
+
+
+def test_reliable_trend_needs_candles_and_emas():
+    def summary(**kw):
+        base = {"candles_used": 50, "trend_emas": (50, 200), "ema": {50: 1.0, 200: 2.0}}
+        base.update(kw)
+        return type("S", (), {"trend": "bajista", **base})()
+
+    assert reliable_trend(summary()) == "bajista"
+    assert reliable_trend(None) is None
+    assert reliable_trend(summary(candles_used=0)) is None
+    assert reliable_trend(summary(trend_emas=None)) is None
+    assert reliable_trend(summary(ema={50: 1.0, 200: math.nan})) is None

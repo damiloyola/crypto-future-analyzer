@@ -22,6 +22,7 @@ from app.scoring.components import (
     momentum_component,
     open_interest_part,
     rsi_score,
+    score_beside_threshold,
     sentiment_component,
     trend_component,
     trend_value,
@@ -475,3 +476,25 @@ def test_sentiment_without_fear_greed():
 def test_sentiment_rejects_news_out_of_range():
     with pytest.raises(ValueError, match="news_balance"):
         sentiment_component(50, 1.5, SEN)
+
+
+# --- score al lado de un umbral (revisión final del Hito 4) ---------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "threshold", "expected"),
+    [
+        (49.96, 50.0, (49.96, 3)),  # se vería "+50": va con más decimales, hacia abajo
+        (29.999999999, 30.0, (29.999, 3)),  # truncado, nunca redondeado al umbral
+        (-29.97, -30.0, (-29.97, 3)),  # del lado de los shorts, hacia el cero
+        (50.04, 50.0, (50.04, 3)),  # arriba del umbral: hacia arriba
+        (12.34, 30.0, (12.34, 1)),  # lejos del umbral: igual que siempre
+        (30.0, 30.0, (30.0, 1)),  # justo en el umbral: no hay confusión
+    ],
+)
+def test_score_beside_threshold(value, threshold, expected):
+    shown, decimals = score_beside_threshold(value, threshold)
+    assert decimals == expected[1]
+    assert shown == pytest.approx(expected[0], abs=1e-12)
+    if value != threshold:  # nunca se ve igual que el umbral
+        assert fmt_num(shown, decimals) != fmt_num(threshold, decimals)

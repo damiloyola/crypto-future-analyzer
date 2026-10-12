@@ -1,4 +1,4 @@
-"""Script de consola: todos los datos e indicadores de una moneda.
+"""Script de consola: datos, indicadores, score y plan de operación de una moneda.
 
 Uso::
 
@@ -15,15 +15,29 @@ Opciones:
   ``96,000.50`` (formato de EE. UU.). Un solo separador seguido de exactamente
   tres cifras (``96.000``, ``2,615``) es ambiguo (¿miles o decimales?) y se
   rechaza con un mensaje que explica cómo escribirlo.
-- ``--profile agresivo``: perfil de riesgo para el ejemplo de sizing (por
-  defecto ``risk_profiles.default``).
+- ``--profile agresivo``: perfil de riesgo del plan (por defecto
+  ``risk_profiles.default``).
+- ``--max-leverage 30``: tope de apalancamiento elegido a mano (override del
+  perfil), de 1x para arriba (1x = sin apalancamiento; menos no existe en un
+  exchange y se rechaza con código 2). Por encima de
+  ``risk_profiles.leverage_red_warning_above`` muestra una advertencia roja; por
+  encima de ``risk_profiles.leverage_hard_cap`` se rechaza (código 2).
+- ``--high-vol-event ["CPI de EE. UU."]``: marca un evento de alta volatilidad
+  (la descripción es opcional; poné la moneda antes): el plan da "No operar".
+- ``--trades-today 2`` y ``--pnl-today -30``: operaciones y resultado (USD) de
+  hoy, para el límite diario del perfil (hasta el Hito 5 no se llevan solos).
+  Si se pasan, el plan muestra cómo va el día; el JSON los trae en
+  ``plan.day_state``.
 - ``--offline``: datos sintéticos, sin red (``data.synthetic``). Muestra un
   cartel grande porque los números no son reales. ``--seed`` y ``--now``
   permiten repetir exactamente la misma corrida.
 - ``--json``: el mismo contenido en JSON (claves en inglés, números sin
   formatear, ``null`` donde falta un dato). El régimen va en ``"regime"``
-  (``null`` con ``--no-regime``), sin el historial vela por vela.
-- ``--no-regime``: no calcula el régimen de mercado (más rápido).
+  (``null`` con ``--no-regime``), sin el historial vela por vela; el score en
+  ``"score"`` y el plan en ``"plan"`` (``TradePlan.to_dict``).
+- ``--no-regime``: no calcula el régimen de mercado (más rápido). El plan lo
+  toma como "régimen no disponible" (riesgo × el multiplicador de confianza
+  baja).
 - ``--config``: otro ``config.yaml``. ``-v``: muestra los avisos de los logs.
 
 Qué imprime (en castellano, en tablas alineadas para fuente monoespaciada;
@@ -52,17 +66,22 @@ con colores ANSI solo si la salida es una terminal):
 5. rango diario típico (ATR diario en % del precio);
 6. derivados: funding, interés abierto y ratio long/short;
 7. sentimiento: Fear & Greed, dominancia de BTC y titulares;
-8. un ejemplo didáctico de sizing LONG y SHORT con el perfil elegido (el
-   plan real llega en el Hito 4): stop = soporte/resistencia más cercano de
-   ``trade_plan.stop_timeframes`` ∓ ``trade_plan.stop_atr_buffer`` × ATR de
-   ``timeframes.entry``; tamaño, apalancamiento (con avisos si pasa el máximo
-   del perfil, ``risk_profiles.leverage_red_warning_above`` o el tope duro),
-   comisiones, liquidación aislada contra el stop
-   (``trade_plan.liquidation.min_distance_ratio``) con el margen sugerido si
-   no alcanza (y los mismos avisos de apalancamiento para ese margen y para el
-   tamaño reducido), y la liquidación "modelo Nexo" informativa. Si con el
-   margen del perfil la posición nacería liquidada (la liquidación cae del
-   lado ganador de la entrada), lo dice así en vez de mostrar una distancia.
+8. score de confluencia (``app.scoring``): total, pista de dirección, una
+   barra de -100 a +100 con los umbrales, y los puntos de cada componente con
+   su peso y el porqué;
+9. plan de operación (``app.risk.plan.build_trade_plan``, el mismo que va a
+   usar la app): cartel grande LONG / SHORT / NO OPERAR, una oración que lo
+   resume, la tabla de niveles (entrada a mercado y alternativa con orden
+   límite, stop, TP1/TP2/TP3 con distancia, R, ganancia neta y R:R con
+   comisiones), margen, tamaño, apalancamiento resultante, liquidación contra
+   el stop, pérdida máxima, comisiones (en USD y como % del riesgo y del
+   objetivo), funding estimado y stop por tiempo en ``app.user_timezone``; de
+   dónde sale cada nivel (con una línea que explica R, R:R y ATR); los
+   ajustes con su motivo; las reglas que no se cumplen (✗) con la sugerencia;
+   los avisos y un resumen de la entrada alternativa (con sus propios ajustes,
+   liquidación, comisiones y stop por tiempo). Usa el régimen de 1h si está
+   disponible. Si no se opera pero los niveles se pudieron calcular, se
+   muestran como "referencia, no operar".
 
 Sale con código 1 y un mensaje claro si no se pueden conseguir los datos
 esenciales (por ejemplo, Binance y Bybit caídos, o un símbolo que no existe),
@@ -110,22 +129,23 @@ from app.exchanges.registry import build_market_data, build_nexo_price_source
 from app.http_client import make_client
 from app.indicators.levels import Level, SRResult
 from app.indicators.pipeline import MarketAnalysis, TimeframeSummary, analyze_all
-from app.regime.service import get_market_regimes, regime_history_days, regimes_to_dict
-from app.risk.fees import fee_rates_from_config, fees_pct_of
-from app.risk.liquidation import (
-    check_liquidation_vs_stop,
-    liquidation_distance_pct,
-    liquidation_price,
-    max_size_for_safe_liquidation,
-    min_margin_for_safe_liquidation,
-    mmr_from_config,
-    wallet_liquidation_price,
+from app.regime.service import (
+    RegimeReport,
+    get_market_regimes,
+    regime_history_days,
+    regimes_to_dict,
 )
-from app.risk.sizing import fraction_to_pct, size_position
-from app.risk.stops import StopNotFound, structural_stop
+from app.risk.plan import build_trade_plan, plan_inputs_from_analysis
+from app.risk.position import MIN_EXCHANGE_LEVERAGE
+from app.risk.profiles import EffectiveProfile, get_profile
+from app.risk.rules import fmt_leverage
+from app.risk.rules import price_decimals as _plan_price_decimals
+from app.risk.sizing import fraction_to_pct
+from app.scoring import compute_score, inputs_from_analysis
 
 OFFLINE_BANNER = "DATOS SINTÉTICOS (sin red): los números no son reales"
-SIZING_TITLE = "Ejemplo didáctico de sizing (el plan real llega en el Hito 4)"
+SCORE_TITLE = "Score de confluencia"
+PLAN_TITLE = "Plan de operación"
 REGIME_TITLE = "Régimen de mercado"
 REGIME_UNAVAILABLE = "Régimen no disponible"
 DASH = "—"
@@ -171,11 +191,13 @@ def fmt_num(x: Any, decimals: int = 2, *, sign: bool = False) -> str:
 
 
 def price_decimals(reference: Any) -> int:
-    """Decimales para mostrar un precio según su tamaño (BTC 2, XRP 4)."""
+    """Decimales para mostrar un precio según su tamaño (BTC 2, XRP 4).
+
+    Es la misma regla que usa el plan (``risk.rules.price_decimals``), así el
+    titular y la tabla muestran los precios con la misma precisión.
+    """
     v = _finite(reference)
-    if v is None or v <= 0:
-        return 2
-    return int(min(8, max(2, 4 - math.floor(math.log10(v)))))
+    return 2 if v is None else _plan_price_decimals(v)
 
 
 def fmt_pct(x: Any, decimals: int = 2, *, sign: bool = False) -> str:
@@ -405,195 +427,48 @@ def _summary_dict(s: TimeframeSummary) -> dict[str, Any]:
     }
 
 
-def _leverage_flags(leverage: float, settings: AppSettings, profile_name: str) -> list[str]:
-    rp = settings.risk_profiles
-    profile = rp.profiles[profile_name]
-    flags = []
-    if leverage > profile.max_leverage:
-        flags.append(
-            f"supera el máximo del perfil {profile_name} ({fmt_num(profile.max_leverage, 0)}x)"
-        )
-    if leverage > rp.leverage_red_warning_above:
-        flags.append(f"más de {fmt_num(rp.leverage_red_warning_above, 0)}x: advertencia roja")
-    if leverage > rp.leverage_hard_cap:
-        flags.append(
-            f"supera el tope duro de {fmt_num(rp.leverage_hard_cap, 0)}x: la app no lo permitiría"
-        )
-    return flags
-
-
-def _sizing_side(
-    side: str,
-    snapshot: MarketSnapshot,
-    analysis: MarketAnalysis,
-    settings: AppSettings,
-    profile_name: str,
-) -> dict[str, Any]:
-    plan = settings.trade_plan
-    profile = settings.risk_profiles.profiles[profile_name]
-    entry_tf = settings.timeframes.entry
-    entry = snapshot.current_price
-    entry_ta = analysis.timeframes.get(entry_tf)
-    atr = entry_ta.summary.atr if entry_ta else None
-    if atr is None:
-        return {
-            "available": False,
-            "side": side,
-            "reason": f"Sin ATR de {entry_tf}: no se puede poner el colchón del stop.",
-        }
-    levels_by_tf = {
-        tf: (ta.summary.levels if (ta := analysis.timeframes.get(tf)) else None)
-        for tf in plan.stop_timeframes
-    }
-    found = structural_stop(
-        side,  # type: ignore[arg-type]
-        entry,
-        levels_by_tf,
-        atr,
-        plan.stop_atr_buffer,
-        plan.min_stop_distance_atr,
-    )
-    skipped = [
-        {"price": sk.price, "timeframe": sk.timeframe, "distance_atr": sk.distance_atr}
-        for sk in found.skipped
-    ]
-    if isinstance(found, StopNotFound):
-        return {
-            "available": False,
-            "side": side,
-            "reason": f"{found.reason} No se arma el ejemplo.",
-            "skipped_levels": skipped,
-        }
-    stop = found.stop
-
-    entry_rate, exit_rate = fee_rates_from_config(settings.fees)
-    mmr = mmr_from_config(settings.liquidation)
-    min_ratio = plan.liquidation.min_distance_ratio
-    sizing = size_position(
-        entry,
-        stop,
-        side,
-        profile.risk_per_trade_usd,
-        profile.margin_per_trade_usd,
-        entry_rate,
-        exit_rate,
-        plan.fees_included_in_risk,
-    )
-    liq = liquidation_price(side, entry, sizing.size_usd, sizing.margin_usd, mmr, exit_rate)
-    check = check_liquidation_vs_stop(side, entry, stop, liq, min_ratio)
-    max_margin = profile.margin_per_trade_usd * plan.liquidation.max_margin_multiplier
-
-    out: dict[str, Any] = {
-        "available": True,
-        "side": side,
-        "entry": entry,
-        "level_price": found.level_price,
-        "level_kind": found.level_kind,
-        "level_timeframe": found.level_timeframe,
-        "level_distance_atr": found.level_distance_atr,
-        "min_stop_distance_atr": found.min_distance_atr,
-        "skipped_levels": skipped,
-        "atr_timeframe": entry_tf,
-        "atr": atr,
-        "stop": stop,
-        "stop_distance_pct": fraction_to_pct(sizing.stop_distance_pct),
-        "risk_usd": sizing.risk_usd,
-        "fees_included_in_risk": sizing.fees_included_in_risk,
-        "size_usd": sizing.size_usd,
-        "quantity": sizing.quantity,
-        "margin_usd": sizing.margin_usd,
-        "leverage": sizing.leverage,
-        "leverage_flags": _leverage_flags(sizing.leverage, settings, profile_name),
-        "fees_usd": sizing.fees_at_stop_usd,
-        "fees_pct_of_risk": fees_pct_of(sizing.fees_at_stop_usd, sizing.risk_usd),
-        "loss_at_stop_usd": sizing.loss_at_stop_usd,
-        "liquidation_price": liq,
-        "liquidation_distance_pct": None
-        if liq is None
-        else fraction_to_pct(liquidation_distance_pct(entry, liq) or 0.0),
-        "liquidation_ratio": check.ratio,
-        "liquidation_min_ratio": min_ratio,
-        "liquidation_before_stop": check.liq_before_stop,
-        # La liquidación cae del lado ganador de la entrada: nacería liquidada.
-        "liquidation_at_open": check.liquidation_distance is not None
-        and check.liquidation_distance <= 0,
-        "liquidation_ok": check.ok,
-        "max_margin_usd": max_margin,
-        "suggested_margin_usd": None,
-        "suggested_margin_fits": None,
-        "suggested_leverage": None,
-        "suggested_leverage_flags": [],
-        "safe_size_usd": None,
-        "safe_size_risk_usd": None,
-        "safe_size_leverage": None,
-        "safe_size_leverage_flags": [],
-        "wallet_equity_usd": None,
-        "wallet_liquidation_price": None,
-        "wallet_liquidation_distance_pct": None,
-    }
-    if not check.ok:
-        margin = min_margin_for_safe_liquidation(
-            side, entry, stop, sizing.size_usd, mmr, exit_rate, min_ratio
-        )
-        safe_size = max_size_for_safe_liquidation(
-            side, entry, stop, sizing.margin_usd, mmr, exit_rate, min_ratio
-        )
-        suggested_leverage = sizing.size_usd / margin
-        safe_leverage = safe_size / sizing.margin_usd
-        out["suggested_margin_usd"] = margin
-        out["suggested_margin_fits"] = margin <= max_margin
-        out["suggested_leverage"] = suggested_leverage
-        out["suggested_leverage_flags"] = _leverage_flags(
-            suggested_leverage, settings, profile_name
-        )
-        out["safe_size_usd"] = safe_size
-        out["safe_size_risk_usd"] = sizing.loss_at_stop_usd * safe_size / sizing.size_usd
-        out["safe_size_leverage"] = safe_leverage
-        out["safe_size_leverage_flags"] = _leverage_flags(safe_leverage, settings, profile_name)
-    if settings.liquidation.show_wallet_model:
-        wallet = profile.monthly_wallet_usd
-        wliq = wallet_liquidation_price(side, entry, sizing.size_usd, wallet, mmr, exit_rate)
-        out["wallet_equity_usd"] = wallet
-        out["wallet_liquidation_price"] = wliq
-        out["wallet_liquidation_distance_pct"] = (
-            None if wliq is None else fraction_to_pct(liquidation_distance_pct(entry, wliq) or 0.0)
-        )
-    return out
-
-
-def sizing_example(
-    snapshot: MarketSnapshot, analysis: MarketAnalysis, settings: AppSettings, profile_name: str
-) -> dict[str, Any]:
-    """Ejemplo LONG y SHORT hipotético con el perfil (no es el plan del Hito 4)."""
-    profile = settings.risk_profiles.profiles[profile_name]
-    entry_rate, exit_rate = fee_rates_from_config(settings.fees)
-    return {
-        "title": SIZING_TITLE,
-        "profile": profile_name,
-        "risk_usd": profile.risk_per_trade_usd,
-        "margin_usd": profile.margin_per_trade_usd,
-        "max_leverage": profile.max_leverage,
-        "fees_included_in_risk": settings.trade_plan.fees_included_in_risk,
-        "entry_fee_pct": fraction_to_pct(entry_rate),
-        "exit_fee_pct": fraction_to_pct(exit_rate),
-        "maintenance_margin_pct": settings.liquidation.maintenance_margin_pct,
-        "stop_atr_buffer": settings.trade_plan.stop_atr_buffer,
-        "long": _sizing_side("long", snapshot, analysis, settings, profile_name),
-        "short": _sizing_side("short", snapshot, analysis, settings, profile_name),
-    }
-
-
 def build_report(
     snapshot: MarketSnapshot,
     analysis: MarketAnalysis,
     settings: AppSettings,
-    profile_name: str,
+    profile: str | EffectiveProfile | None,
     regime: dict[str, Any] | None = None,
+    *,
+    regime_report: RegimeReport | None = None,
+    trades_today: int = 0,
+    pnl_today_usd: float = 0.0,
+    high_volatility_event: bool = False,
+    event_description: str | None = None,
 ) -> dict[str, Any]:
     """Todo el contenido de la salida, en un dict serializable a JSON.
 
-    ``regime``: lo que devuelve ``regimes_to_dict`` (o ``None`` si no se calculó).
+    - ``profile``: nombre del perfil (``None`` = el de config) o el
+      ``EffectiveProfile`` ya armado (con el tope de ``--max-leverage``).
+    - ``regime``: lo que devuelve ``regimes_to_dict`` (o ``None`` si no se calculó).
+    - ``regime_report``: el ``RegimeReport`` de 1h que usa el plan (``None`` si
+      no está disponible: el plan lo toma como confianza baja).
+    - ``trades_today``, ``pnl_today_usd``, ``high_volatility_event`` y
+      ``event_description``: estado del día para las reglas del plan.
+
+    El score (``"score"``) y el plan (``"plan"``) se calculan acá con
+    ``scoring.compute_score`` y ``risk.plan.build_trade_plan``, con la hora de
+    la foto del mercado como "ahora".
     """
+    eff = profile if isinstance(profile, EffectiveProfile) else get_profile(profile, settings)
+    score = compute_score(inputs_from_analysis(analysis, snapshot, settings), settings)
+    plan_inputs = plan_inputs_from_analysis(
+        analysis,
+        snapshot,
+        score,
+        regime_report,
+        eff,
+        settings,
+        trades_today=trades_today,
+        pnl_today_usd=pnl_today_usd,
+        high_volatility_event=high_volatility_event,
+        event_description=event_description,
+    )
+    plan = build_trade_plan(plan_inputs, settings, now=snapshot.created_at)
     ex = snapshot.execution_price
     ticker = snapshot.ticker
     reference = ticker.price if ticker else (ex.binance_price if ex else None)
@@ -621,7 +496,7 @@ def build_report(
         "banner": OFFLINE_BANNER if snapshot.offline else None,
         "generated_at": _iso(snapshot.created_at),
         "user_timezone": settings.app.user_timezone,
-        "profile": profile_name,
+        "profile": eff.name,
         "closed_candles_only": settings.timeframes.closed_candles_only,
         "sources": [
             {
@@ -727,7 +602,8 @@ def build_report(
                 for h in news.headlines[: settings.data_sources.news_max_headlines]
             ],
         },
-        "sizing_example": sizing_example(snapshot, analysis, settings, profile_name),
+        "score": score.to_dict(),
+        "plan": plan.to_dict(),
     }
     return _clean(report)
 
@@ -759,10 +635,19 @@ def _render_header(r: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
         lines += _banner(OFFLINE_BANNER, style)
     title = f"Crypto Future Analyzer · {r['symbol']}/{r['quote']}"
     lines.append(style.paint(title, "bold"))
+    prof = (r.get("plan") or {}).get("profile") or {}
+    profile_text = printable(r["profile"])
+    if prof:
+        profile_text += f" (tope de apalancamiento {fmt_leverage(prof['max_leverage'])}"
+        if prof.get("leverage_overridden"):
+            profile_text += (
+                f", cambiado a mano; el perfil trae {fmt_leverage(prof['profile_max_leverage'])}"
+            )
+        profile_text += ")"
     lines += _kv(
         [
             ("Hora", f"{fmt_time(r['generated_at'], tz, seconds=True)} ({r['user_timezone']})"),
-            ("Perfil de riesgo", r["profile"]),
+            ("Perfil de riesgo", profile_text),
             (
                 "Velas",
                 "indicadores con la última vela cerrada"
@@ -773,6 +658,8 @@ def _render_header(r: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
         style,
         indent=0,
     )
+    if prof.get("red_warning_text"):
+        lines.append(style.paint(printable(prof["red_warning_text"]), "alert"))
 
     lines += _section("Fuentes de datos", style)
     rows = []
@@ -1288,136 +1175,459 @@ def _render_sentiment(r: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str
     return lines
 
 
-def _render_sizing_side(
-    side: dict[str, Any], ex: dict[str, Any], r: dict[str, Any], style: Style
-) -> list[str]:
-    name = "LONG" if side["side"] == "long" else "SHORT"
-    if not side["available"]:
-        return [style.paint(f"  {name} hipotético", "bold"), f"    {side['reason']}"]
-    d = price_decimals(side["entry"])
-    is_long = side["side"] == "long"
-    level_word = "soporte" if is_long else "resistencia"
-    where = "debajo del soporte" if is_long else "arriba de la resistencia"
-    op = "−" if is_long else "+"
-    lines = [style.paint(f"  {name} hipotético: stop {where} de {side['level_timeframe']}", "bold")]
+_STATUS_TEXT = {"LONG": "LONG", "SHORT": "SHORT", "NO_OPERAR": "NO OPERAR"}
+_STATUS_COLOR = {"LONG": "green", "SHORT": "red", "NO_OPERAR": "yellow"}
+# Barra del score: una celda cada SCORE_BAR_STEP puntos de -100 a +100 (es dibujo, no regla).
+SCORE_BAR_STEP = 5
+SCORE_MIN, SCORE_MAX = -100.0, 100.0
 
-    def entry_dist(pct: Any) -> str:
-        return f"a {fmt_pct(pct)} de la entrada"
 
-    level = f"{level_word} {fmt_num(side['level_price'], d)}"
-    buffer = f"{fmt_num(ex['stop_atr_buffer'], 2)} × ATR {side['atr_timeframe']}"
-    stop = f"{fmt_num(side['stop'], d)} = {level} {op} {buffer} ({fmt_num(side['atr'], d)})"
-    fees_mode = "con comisiones incluidas" if side["fees_included_in_risk"] else "comisiones aparte"
-    qty = f"{fmt_num(side['quantity'], max(4, d))} {r['symbol']}"
-    lev_color = "alert" if side["leverage_flags"] else None
-    leverage = Cell(f"{fmt_num(side['leverage'], 1)}x (tamaño / margen)", lev_color)
-    rows: list[tuple[str, Cell | str]] = [("Entrada", fmt_num(side["entry"], d))]
-    for sk in side.get("skipped_levels", []):
+def _badge(text: str, color: str, style: Style) -> list[str]:
+    """Cartel grande del estado del plan (LONG, SHORT o NO OPERAR)."""
+    inner = f"      {text}      "
+    top = "  ╔" + "═" * len(inner) + "╗"
+    bottom = "  ╚" + "═" * len(inner) + "╝"
+    return [
+        style.paint(top, color),
+        style.paint(f"  ║{inner}║", color),
+        style.paint(bottom, color),
+    ]
+
+
+def score_bar(total: Any, long_t: Any, short_t: Any) -> str:
+    """Barra de texto de -100 a +100: ``┊`` en los umbrales, ``┼`` en 0 y ``●`` en el score."""
+    cells = int((SCORE_MAX - SCORE_MIN) / SCORE_BAR_STEP) + 1
+
+    def index(value: Any) -> int | None:
+        v = _finite(value)
+        if v is None:
+            return None
+        v = max(SCORE_MIN, min(SCORE_MAX, v))
+        return int(round((v - SCORE_MIN) / SCORE_BAR_STEP))
+
+    bar = ["─"] * cells
+    for mark, char in ((0.0, "┼"), (short_t, "┊"), (long_t, "┊")):
+        i = index(mark)
+        if i is not None:
+            bar[i] = char
+    i = index(total)
+    if i is not None:
+        bar[i] = "●"
+    return f"-100 ├{''.join(bar)}┤ +100"
+
+
+def _signed_points(x: Any) -> str:
+    """Puntos con signo y un decimal; el cero va sin signo (``"0,0"``)."""
+    v = _finite(x)
+    if v is not None and round(v, 1) == 0:
+        return fmt_num(0.0, 1)
+    return fmt_num(x, 1, sign=True)
+
+
+def _render_score(r: dict[str, Any], style: Style) -> list[str]:
+    sc = r.get("score")
+    lines = _section(SCORE_TITLE, style)
+    if not sc:
+        return [*lines, "  No disponible."]
+    th = sc["thresholds"]
+    hint = sc["direction_hint"]
+    color = {"long": "green", "short": "red"}.get(hint or "", "yellow")
+    lines.append(style.paint(f"  {sc['summary']}", color))
+    lines.append(f"  {score_bar(sc['total'], th['long'], th['short'])}")
+    legend = (
+        f"  ● = score actual · ┊ = umbrales: {fmt_num(th['short'], 0, sign=True)} o menos para "
+        f"short, {fmt_num(th['long'], 0, sign=True)} o más para long"
+    )
+    lines.append(style.paint(legend, "dim"))
+    lines.append("")
+    rows: list[list[Cell | str]] = []
+    for c in sc["components"]:
+        details = [printable(d) for d in c["details"]] or [DASH]
+        points = Cell(_signed_points(c["points"]), _signed_color(c["points"]))
+        if not c["available"]:
+            points = Cell("0 (sin datos)", "yellow")
+        rows.append([c["label"], fmt_pct(c["weight_pct"], 0), points, Cell(details[0], None)])
+        rows += [["", "", "", d] for d in details[1:]]
+    rows.append(
+        [
+            Cell("Total", "bold"),
+            "",
+            Cell(_signed_points(sc["total"]), _signed_color(sc["total"])),
+            "",
+        ]
+    )
+    lines += render_table(
+        rows, style, header=["Componente", "Peso", "Puntos", "Detalle"], aligns="<>><"
+    )
+    for w in sc["warnings"]:
+        lines.append(style.paint(f"  · {printable(w)}", "yellow"))
+    return lines
+
+
+def _with_article(level_kind: str) -> str:
+    """``"soporte"`` → ``"el soporte"``; ``"resistencia"`` → ``"la resistencia"``."""
+    return f"{'la' if level_kind == 'resistencia' else 'el'} {level_kind}"
+
+
+def _lower_first(text: str) -> str:
+    """Primera letra en minúscula (después de "TP1: " o "Stop: ")."""
+    return text[:1].lower() + text[1:]
+
+
+def _multiplier_text(value: float) -> str:
+    """Multiplicador sin ceros de más: ``0.5`` → ``"0,5"``, ``0.1875`` → ``"0,1875"``."""
+    return fmt_num(value, 4).rstrip("0").rstrip(",")
+
+
+def _signed_pct_from(price: Any, entry: Any) -> str:
+    p, e = _finite(price), _finite(entry)
+    if p is None or e is None or e == 0:
+        return DASH
+    return fmt_pct((p - e) / e * 100.0, sign=True)
+
+
+def _plan_level_rows(p: dict[str, Any], symbol: str) -> list[list[Cell | str]]:
+    """Filas de la tabla de niveles: entrada, alternativa, stop y objetivos."""
+    entry = p["entry"]["price"]
+    d = price_decimals(entry)
+    risk = p["risk"]
+    rows: list[list[Cell | str]] = [
+        [
+            Cell("Entrada (a mercado)", "bold"),
+            Cell(fmt_num(entry, d), "bold"),
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]
+    ]
+    alt = p.get("alternative")
+    if alt and alt.get("level_price") is not None:
         rows.append(
-            (
-                "Nivel salteado",
-                f"{level_word} {fmt_num(sk['price'], d)} ({sk['timeframe']}): a "
-                f"{fmt_num(sk['distance_atr'], 2)} ATR, menos de "
-                f"{fmt_num(side['min_stop_distance_atr'], 1)} (demasiado cerca del precio)",
-            )
+            [
+                "Entrada alternativa (límite)",
+                fmt_num(alt["level_price"], d),
+                _signed_pct_from(alt["level_price"], entry),
+                "",
+                "",
+                "",
+                f"{alt['level_kind']} de {alt['timeframe']}",
+            ]
         )
-    rows += [
-        ("Stop", stop),
-        ("Distancia al stop", fmt_pct(side["stop_distance_pct"])),
-        ("Riesgo", f"{fmt_usd(side['risk_usd'])} ({fees_mode})"),
-        ("Tamaño de la posición", f"{fmt_usd(side['size_usd'])} ({qty})"),
-        ("Margen", fmt_usd(side["margin_usd"])),
-        ("Apalancamiento", leverage),
-    ]
-    rows += [("", Cell(f"ATENCIÓN: {flag}", "alert")) for flag in side["leverage_flags"]]
-    fees_share = fmt_pct(side["fees_pct_of_risk"], 1)
-    rows += [
-        ("Comisiones ida y vuelta", f"{fmt_usd(side['fees_usd'])} ({fees_share} del riesgo)"),
-        ("Pérdida total si toca el stop", fmt_usd(side["loss_at_stop_usd"])),
-    ]
-    if side["liquidation_price"] is None:
-        rows.append(("Liquidación (aislada)", "no se puede liquidar con este margen"))
-    elif side["liquidation_at_open"]:
+    stop = p["stop"]
+    loss = risk.get("max_loss_usd")
+    rows.append(
+        [
+            Cell("Stop", "red"),
+            fmt_num(stop["price"], d),
+            _signed_pct_from(stop["price"], entry),
+            "-1R",
+            Cell("-" + fmt_usd(loss), "red") if _finite(loss) is not None else DASH,
+            "",
+            f"{stop['level_kind']} de {stop['level_timeframe']}",
+        ]
+    )
+    for tp in p["take_profits"]:
+        flags = ", ".join(tp["flags"])
+        rows.append(
+            [
+                Cell(tp["name"], "green"),
+                fmt_num(tp["price"], d),
+                _signed_pct_from(tp["price"], entry),
+                f"{fmt_num(tp['r_multiple'], 2)}R",
+                Cell(fmt_usd(tp["net_gain_usd"]), _signed_color(tp["net_gain_usd"])),
+                fmt_num(tp["net_rr"], 2),
+                Cell(flags, "yellow") if flags else "",
+            ]
+        )
+    return rows
+
+
+def _plan_position_rows(
+    p: dict[str, Any], symbol: str, tz: ZoneInfo
+) -> list[tuple[str, Cell | str]]:
+    pos, liq, risk, fees = p["position"], p["liquidation"], p["risk"], p["fees"]
+    d = price_decimals(p["entry"]["price"])
+    rows: list[tuple[str, Cell | str]] = []
+    rows.append(("Margen", fmt_usd(pos["margin_usd"])))
+    qty = fmt_num(pos["quantity"], max(4, d))
+    rows.append(("Tamaño de la posición", f"{fmt_usd(pos['size_usd'])} ({qty} {symbol})"))
+    lev_text = (
+        f"{fmt_num(pos['leverage'], 1)}x (tamaño / margen; tu tope es "
+        f"{fmt_leverage(pos['max_leverage'])})"
+    )
+    rows.append(
+        ("Apalancamiento resultante", Cell(lev_text, "alert" if pos["red_warning"] else None))
+    )
+    if pos.get("red_warning_text"):
+        rows.append(("", Cell(printable(pos["red_warning_text"]), "alert")))
+    if liq["price"] is None:
+        rows.append(("Liquidación (aislada)", "no se puede liquidar con este margen (1x)"))
+    elif liq["at_open"]:
         rows.append(
             (
                 "Liquidación (aislada)",
-                Cell(
-                    "nacería liquidada: el margen no cubre el mantenimiento + la comisión",
-                    "alert",
-                ),
+                Cell("nacería liquidada: el margen no cubre el mantenimiento", "alert"),
             )
         )
     else:
-        liq = fmt_num(side["liquidation_price"], d)
+        text = (
+            f"{fmt_num(liq['price'], d)} (a {fmt_pct(liq['distance_pct'])}; el stop está a "
+            f"{fmt_pct(liq['stop_distance_pct'])}: {fmt_num(liq['ratio'], 2)} veces la "
+            f"distancia, mínimo {fmt_num(liq['min_ratio'], 1)})"
+        )
+        ok = "cumple" if liq["ok"] else "NO cumple"
         rows.append(
-            ("Liquidación (aislada)", f"{liq} ({entry_dist(side['liquidation_distance_pct'])})")
+            ("Liquidación (aislada)", Cell(f"{text}: {ok}", None if liq["ok"] else "alert"))
         )
-        ratio_txt = (
-            f"{fmt_num(side['liquidation_ratio'], 2)} veces la distancia al stop "
-            f"(mínimo {fmt_num(side['liquidation_min_ratio'], 1)})"
+    wallet = liq.get("wallet")
+    if wallet:
+        where = (
+            "no se liquidaría"
+            if wallet["price"] is None
+            else f"{fmt_num(wallet['price'], d)} (a {fmt_pct(wallet['distance_pct'])})"
         )
-        if side["liquidation_ok"]:
-            rows.append(("Liquidación vs stop", Cell(f"{ratio_txt}: cumple", "green")))
-        else:
-            why = "llega ANTES que el stop" if side["liquidation_before_stop"] else "no cumple"
-            rows.append(("Liquidación vs stop", Cell(f"{ratio_txt}: {why}", "alert")))
-    if side["suggested_margin_usd"] is not None:
-        fits = "entra" if side["suggested_margin_fits"] else "NO entra"
-        new_lev = f"{fmt_num(side['suggested_leverage'], 1)}x"
-        cap = fmt_usd(side["max_margin_usd"])
-        margin = fmt_usd(side["suggested_margin_usd"])
-        rows.append(("Margen sugerido", f"{margin} → {new_lev}; {fits} en el tope de {cap}"))
-        # Para las alternativas alcanza con el aviso más grave (el último de la lista).
-        if side["suggested_leverage_flags"]:
-            flag = side["suggested_leverage_flags"][-1]
-            rows.append(("", Cell(f"ATENCIÓN: {flag}", "alert")))
-        risk = fmt_usd(side["safe_size_risk_usd"])
-        safe_lev = f"{fmt_num(side['safe_size_leverage'], 1)}x"
         rows.append(
             (
-                "o achicar el tamaño a",
-                f"{fmt_usd(side['safe_size_usd'])} (riesgo ≈ {risk}; {safe_lev})",
+                "Liquidación modelo Nexo",
+                f"{where}; solo informativo, con la billetera de "
+                f"{fmt_usd(wallet['equity_usd'], 0)}",
             )
         )
-        if side["safe_size_leverage_flags"]:
-            flag = side["safe_size_leverage_flags"][-1]
-            rows.append(("", Cell(f"ATENCIÓN: {flag}", "alert")))
-    if side["wallet_equity_usd"] is not None:
-        wl = side["wallet_liquidation_price"]
-        where_liq = (
-            "no se liquidaría"
-            if wl is None
-            else f"{fmt_num(wl, d)} ({entry_dist(side['wallet_liquidation_distance_pct'])})"
+    if risk["fees_included"]:
+        breakdown = "comisiones incluidas"
+    else:
+        # El monto ya trae las comisiones: se desglosa para que no se lean dos veces.
+        breakdown = (
+            f"{fmt_usd(risk['price_loss_usd'])} de precio + "
+            f"{fmt_usd(risk['fees_at_stop_usd'])} de comisiones"
         )
-        wallet = fmt_usd(side["wallet_equity_usd"], 0)
-        rows.append(("Liquidación modelo Nexo", f"{where_liq}; informativo, billetera de {wallet}"))
-    return lines + _kv(rows, style, indent=4)
+    loss_text = (
+        f"{fmt_usd(risk['max_loss_usd'])} si toca el stop ({breakdown}; el funding va aparte)"
+    )
+    rows.append(("Pérdida máxima", Cell(loss_text, "bold")))
+    mult = _finite(risk["risk_multiplier"])
+    if mult is not None and abs(mult - 1.0) > 1e-12:
+        rows.append(
+            (
+                "Riesgo pedido",
+                f"{fmt_usd(risk['requested_usd'])} del perfil × {_multiplier_text(mult)} = "
+                f"{fmt_usd(risk['after_adjustments_usd'])} (ajustes por régimen)",
+            )
+        )
+    if risk.get("reduced_by_position"):
+        rows.append(("", Cell("La posición se achicó: arriesgás menos que lo pedido.", "yellow")))
+    fee_text = (
+        f"{fmt_usd(fees['round_trip_at_stop_usd'])} ida y vuelta si sale en el stop "
+        f"({fmt_pct(fees['pct_of_risk'], 1)} del riesgo)"
+    )
+    if fees.get("round_trip_at_target_usd") is not None:
+        fee_text += (
+            f"; {fmt_usd(fees['round_trip_at_target_usd'])} si sale en el {fees['target_name']} "
+            f"({fmt_pct(fees['pct_of_target'], 1)} de la ganancia)"
+        )
+    rows.append(("Comisiones", fee_text))
+    rows.append(
+        (
+            "",
+            Cell(
+                f"{fmt_pct(fees['entry_rate_pct'], 3)} al entrar + "
+                f"{fmt_pct(fees['exit_rate_pct'], 3)} al salir, sobre el tamaño "
+                "(no sobre el margen)",
+                "dim",
+            ),
+        )
+    )
+    funding = p.get("funding")
+    if funding:
+        rows.append(("Funding estimado", funding["text"]))
+    ts = p.get("time_stop")
+    if ts:
+        when = fmt_time(ts["deadline"], tz)
+        rows.append(
+            (
+                "Stop por tiempo",
+                f"{when} ({fmt_num(ts['hours'], 0)} h): si para entonces no tocó el "
+                f"{ts['target_name']} ni el stop, cerrá",
+            )
+        )
+    return rows
 
 
-def _render_sizing(r: dict[str, Any], style: Style) -> list[str]:
-    ex = r["sizing_example"]
-    lines = _section(ex["title"], style)
-    note = "  Es un ejemplo para entender los números, no una recomendación ni un plan."
-    lines.append(style.paint(note, "dim"))
-    profile = (
-        f"{ex['profile']}: riesgo {fmt_usd(ex['risk_usd'])}, "
-        f"margen {fmt_usd(ex['margin_usd'])}, máximo {fmt_num(ex['max_leverage'], 0)}x"
+def _render_alternative(alt: dict[str, Any], entry: Any, style: Style) -> list[str]:
+    d = price_decimals(entry)
+    lines = ["", style.paint("  Entrada alternativa (orden límite)", "bold")]
+    if not alt.get("available"):
+        lines.append(f"    {alt.get('reason') or DASH}")
+        return lines
+    where = (
+        f"en {_with_article(alt['level_kind'])} de {alt['timeframe']}: "
+        f"{fmt_num(alt['level_price'], d)} "
+        f"({_signed_pct_from(alt['level_price'], entry)} del precio actual)"
     )
-    fees = (
-        f"entrada {fmt_pct(ex['entry_fee_pct'], 3)} + salida {fmt_pct(ex['exit_fee_pct'], 3)}"
-        " sobre el tamaño"
+    lines.append(f"    Orden límite {where}. Si el precio no llega, no entrás.")
+    status = alt["status"]
+    state = Cell(_STATUS_TEXT.get(status, status), _STATUS_COLOR.get(status))
+    rows: list[tuple[str, Cell | str]] = [("Estado", state)]
+    if alt.get("stop") is not None:
+        rows.append(("Stop", f"{fmt_num(alt['stop'], d)} (a {fmt_pct(alt['stop_distance_pct'])})"))
+    targets = [
+        f"{name.upper()} {fmt_num(alt[name], d)}" for name in ("tp1", "tp2", "tp3") if alt.get(name)
+    ]
+    if targets:
+        rows.append(("Objetivos", " · ".join(targets)))
+    if alt.get("size_usd") is not None:
+        rows.append(
+            (
+                "Posición",
+                f"{fmt_usd(alt['size_usd'])} con {fmt_usd(alt['margin_usd'])} de margen "
+                f"({fmt_num(alt['leverage'], 1)}x)",
+            )
+        )
+        rows.append(("Pérdida máxima", fmt_usd(alt["max_loss_usd"])))
+    if alt.get("net_gain_tp2_usd") is not None:
+        rows.append(
+            (
+                "Ganancia neta en el TP2",
+                f"{fmt_usd(alt['net_gain_tp2_usd'])} (R:R con comisiones "
+                f"{fmt_num(alt['net_rr_tp2'], 2)})",
+            )
+        )
+    liq = alt.get("liquidation")
+    if liq:
+        if liq.get("price") is None:
+            liq_text = "no se puede liquidar con este margen (1x)"
+        else:
+            ok = "cumple" if liq.get("ok") else "NO cumple"
+            liq_text = (
+                f"{fmt_num(liq['price'], d)} (a {fmt_pct(liq['distance_pct'])}; "
+                f"{fmt_num(liq['ratio'], 2)} veces la distancia al stop, mínimo "
+                f"{fmt_num(liq['min_ratio'], 1)}): {ok}"
+            )
+        rows.append(("Liquidación (aislada)", liq_text))
+    if alt.get("fees_round_trip_at_stop_usd") is not None:
+        fee_text = f"{fmt_usd(alt['fees_round_trip_at_stop_usd'])} si sale en el stop"
+        if alt.get("fees_round_trip_at_tp2_usd") is not None:
+            fee_text += f"; {fmt_usd(alt['fees_round_trip_at_tp2_usd'])} si sale en el TP2"
+        rows.append(("Comisiones (ida y vuelta)", fee_text))
+    ts = alt.get("time_stop")
+    if ts:
+        rows.append(
+            (
+                "Stop por tiempo",
+                f"{fmt_num(ts['hours'], 0)} h después de entrar: si no tocó el "
+                f"{ts['target_name']} ni el stop, cerrá",
+            )
+        )
+    lines += _kv(rows, style, indent=4)
+    # Los del régimen son los mismos que los del plan principal: acá solo los propios.
+    adjustments = [a for a in alt.get("adjustments") or [] if a.get("source") == "position"]
+    if adjustments:
+        lines.append(style.paint("    Ajustes de esta entrada:", "bold"))
+        for a in adjustments:
+            lines.append(f"      · {printable(a['message'])}")
+    for reason in alt.get("blocking_reasons") or []:
+        lines.append(style.paint(f"    ✗ {printable(reason)}", "red"))
+    return lines
+
+
+def _render_plan(r: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
+    p = r.get("plan")
+    lines = _section(PLAN_TITLE, style)
+    if not p:
+        return [*lines, "  No disponible."]
+    status = p["status"]
+    lines += _badge(_STATUS_TEXT.get(status, status), _STATUS_COLOR.get(status, "yellow"), style)
+    lines.append(style.paint(f"  {printable(p['headline'])}", "bold"))
+    prof = p["profile"]
+    profile_text = (
+        f"  Perfil {prof['name']}: riesgo {fmt_usd(prof['risk_per_trade_usd'], 0)} por "
+        f"operación, margen {fmt_usd(prof['margin_per_trade_usd'], 0)}, tope "
+        f"{fmt_leverage(prof['max_leverage'])}"
     )
-    lines += _kv(
-        [
-            ("Perfil", profile),
-            ("Comisiones", fees),
-            ("Margen de mantenimiento", fmt_pct(ex["maintenance_margin_pct"], 2)),
-        ],
-        style,
-    )
-    for key in ("long", "short"):
+    if p.get("min_rr") is not None:
+        profile_text += f", R:R mínimo {fmt_num(p['min_rr'], 2)} (lo pide {p['min_rr_reason']})"
+    lines.append(style.paint(profile_text + ".", "dim"))
+
+    if p["stop"] is not None:
+        title = "  Niveles"
+        if p["is_reference"]:
+            title += " (referencia, no operar)"
         lines.append("")
-        lines += _render_sizing_side(ex[key], ex, r, style)
+        lines.append(style.paint(title, "yellow" if p["is_reference"] else "bold"))
+        lines += render_table(
+            _plan_level_rows(p, r["symbol"]),
+            style,
+            header=["", "Precio", "Distancia", "R", "Ganancia neta", "R:R con comisiones", "Nota"],
+            aligns="<>>>>><",
+            indent=4,
+        )
+        atr_tf = p["stop"].get("atr_timeframe") or "15m"
+        legend = (
+            "    R = lo que arriesgás hasta el stop (1R; 2R es el doble). R:R 1,5 = por cada "
+            "1 USD que arriesgás ganás 1,5 (ya descontadas las comisiones). "
+            f"ATR {atr_tf} = lo que se mueve el precio en una vela normal de {atr_tf}."
+        )
+        lines.append(style.paint(legend, "dim"))
+        lines.append("")
+        lines += _kv(_plan_position_rows(p, r["symbol"], tz), style, indent=4)
+        why = [f"Stop: {_lower_first(p['stop']['explanation'])}"]
+        word = _with_article(p["stop"]["level_kind"])
+        for sk in p["stop"]["skipped_levels"]:
+            why.append(
+                f"Stop: se salteó {word} {fmt_num(sk['price'], price_decimals(sk['price']))} "
+                f"({sk['timeframe']}) por estar a {fmt_num(sk['distance_atr'], 2)} ATR "
+                "(demasiado cerca del precio)."
+            )
+        why += [f"{tp['name']}: {_lower_first(tp['explanation'])}" for tp in p["take_profits"]]
+        if p.get("tp1_missing_reason"):
+            why.append(p["tp1_missing_reason"])
+        if p.get("tp2_missing_reason"):
+            why.append(f"No hay TP2: {p['tp2_missing_reason']}.")
+        lines.append("")
+        lines.append(style.paint("  De dónde salen los niveles", "bold"))
+        lines += [f"    · {printable(w)}" for w in why]
+    elif p.get("stop_missing_reason"):
+        lines.append("")
+        lines.append(style.paint(f"  Sin stop: {printable(p['stop_missing_reason'])}", "yellow"))
+
+    if p["adjustments"]:
+        lines.append("")
+        lines.append(style.paint("  Ajustes", "bold"))
+        for a in p["adjustments"]:
+            lines.append(f"    · {printable(a['message'])}")
+
+    failed = [rule for rule in p["rules"] if not rule["ok"]]
+    lines.append("")
+    if failed:
+        lines.append(style.paint("  Reglas que no se cumplen", "bold"))
+        for rule in failed:
+            lines.append(style.paint(f"    ✗ {printable(rule['message'])}", "red"))
+            if rule.get("suggestion"):
+                lines.append(f"      → {printable(rule['suggestion'])}")
+    else:
+        total = len(p["rules"])
+        lines.append(style.paint(f"  Reglas: se cumplen las {total}.", "green"))
+    # Si se cargó cómo va el día, se muestra aunque la regla se cumpla.
+    day = p.get("day_state") or {}
+    if day.get("trades_today") or day.get("pnl_today_usd"):
+        daily = next((x for x in p["rules"] if x["code"] == "daily_limits"), None)
+        if daily is not None and daily["ok"]:
+            lines.append(f"    {printable(daily['message'])}")
+
+    # La advertencia roja del apalancamiento ya va debajo de su fila.
+    shown = (p.get("position") or {}).get("red_warning_text")
+    warnings = [w for w in p["warnings"] if w != shown]
+    if warnings:
+        lines.append("")
+        lines.append(style.paint("  Avisos", "yellow"))
+        for w in warnings:
+            color = "alert" if w.startswith("Advertencia") else "yellow"
+            lines.append(style.paint(f"    · {printable(w)}", color))
+
+    if p.get("alternative"):
+        lines += _render_alternative(p["alternative"], p["entry"]["price"], style)
     return lines
 
 
@@ -1433,7 +1643,8 @@ def render_text(report: dict[str, Any], *, color: bool = False) -> str:
     lines += _render_levels(report, style, tz)
     lines += _render_derivatives(report, style, tz)
     lines += _render_sentiment(report, style, tz)
-    lines += _render_sizing(report, style)
+    lines += _render_score(report, style)
+    lines += _render_plan(report, style, tz)
     if report["offline"]:
         lines.append("")
         lines += _banner(OFFLINE_BANNER, style)
@@ -1491,6 +1702,54 @@ def _positive_float(text: str) -> float:
     return value
 
 
+def _split_sign(text: str) -> tuple[float, str]:
+    """``"-30,5"`` → ``(-1.0, "30,5")``; acepta ``-``, ``−`` (signo menos) y ``+``."""
+    raw = text.strip().replace(" ", "")
+    sign = -1.0 if raw.startswith(("-", "−")) else 1.0
+    return sign, raw[1:] if raw[:1] in ("-", "−", "+") else raw
+
+
+def _signed_amount(text: str) -> float:
+    """Monto con signo (``-30``, ``-30,5``, ``+12``) para ``--pnl-today``."""
+    sign, body = _split_sign(text)
+    try:
+        value = parse_price(body)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"no es un monto en USD: {text!r} (ej. -30 o -30,5 si perdiste, 12 si ganaste)"
+        ) from None
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError("tiene que ser un número")
+    return sign * value
+
+
+def _non_negative_int(text: str) -> int:
+    try:
+        value = int(text.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"tiene que ser un número entero (vino {text!r})"
+        ) from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("no puede ser negativo")
+    return value
+
+
+def _leverage_value(text: str) -> float:
+    """Tope de apalancamiento: un número de 1 para arriba (``10``, ``12,5``)."""
+    sign, body = _split_sign(text)
+    try:
+        value = sign * parse_price(body)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"no es un número: {text!r} (ej. 10 o 12,5)") from None
+    if not math.isfinite(value) or value < MIN_EXCHANGE_LEVERAGE:
+        raise argparse.ArgumentTypeError(
+            f"tiene que ser {fmt_leverage(MIN_EXCHANGE_LEVERAGE)} o más "
+            f"({fmt_leverage(MIN_EXCHANGE_LEVERAGE)} = sin apalancamiento; vino {text!r})"
+        )
+    return value
+
+
 def _aware_datetime(text: str) -> datetime:
     try:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
@@ -1501,10 +1760,39 @@ def _aware_datetime(text: str) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
+# Opciones que aceptan montos negativos ("-30,5"): argparse toma "-30,5" como si
+# fuera otra opción, así que se pega al nombre ("--pnl-today=-30,5"). Solo si lo
+# que sigue parece un número negativo: "--pnl-today --json" no se pega (es otra
+# opción y argparse avisa que falta el monto).
+_NEGATIVE_AMOUNT_OPTIONS = ("--pnl-today",)
+_NEGATIVE_NUMBER = re.compile(r"[-−]\s*\d[\d.,]*")
+
+
+def _join_negative_amounts(argv: Sequence[str] | None) -> list[str]:
+    args = list(sys.argv[1:] if argv is None else argv)
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if (
+            a in _NEGATIVE_AMOUNT_OPTIONS
+            and i + 1 < len(args)
+            and _NEGATIVE_NUMBER.fullmatch(args[i + 1].strip())
+        ):
+            out.append(f"{a}={args[i + 1]}")
+            i += 2
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m scripts.analyze_cli",
-        description="Datos e indicadores de una moneda (fase 1: solo análisis, no opera).",
+        description=(
+            "Datos, indicadores, score y plan de una moneda (fase 1: solo análisis, no opera)."
+        ),
     )
     parser.add_argument("symbol", help="moneda, por ejemplo BTC")
     parser.add_argument(
@@ -1515,6 +1803,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--profile", default=None, help="perfil de riesgo (por defecto el de config)"
+    )
+    parser.add_argument(
+        "--max-leverage",
+        type=_leverage_value,
+        default=None,
+        metavar="X",
+        help="tope de apalancamiento a mano, de 1 para arriba (máximo "
+        "risk_profiles.leverage_hard_cap; por encima de "
+        "risk_profiles.leverage_red_warning_above muestra una advertencia roja)",
+    )
+    parser.add_argument(
+        "--high-vol-event",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="DESCRIPCIÓN",
+        help="marca un evento de alta volatilidad (Fed, CPI...): el plan da No operar",
+    )
+    parser.add_argument(
+        "--trades-today",
+        type=_non_negative_int,
+        default=0,
+        metavar="N",
+        help="operaciones que ya hiciste hoy (para el límite del día)",
+    )
+    parser.add_argument(
+        "--pnl-today",
+        type=_signed_amount,
+        default=0.0,
+        metavar="USD",
+        help="resultado de hoy en USD, negativo si perdiste (ej. -30)",
     )
     parser.add_argument("--offline", action="store_true", help="datos sintéticos, sin red")
     parser.add_argument("--json", action="store_true", help="salida en JSON")
@@ -1543,8 +1862,12 @@ async def _regime_report(
     synthetic: bool,
     clock: Callable[[], datetime] | None,
     err: TextIO,
-) -> dict[str, Any]:
-    """Régimen de 1h y diario para el reporte; nunca lanza (un error queda como motivo)."""
+) -> tuple[dict[str, Any], RegimeReport | None]:
+    """Régimen de 1h y diario para el reporte; nunca lanza (un error queda como motivo).
+
+    Devuelve el dict para el reporte y el ``RegimeReport`` de
+    ``regime.timeframe`` (1h, el que usa el plan) o ``None`` si no está.
+    """
 
     def notify(message: str) -> None:
         print(message, file=err, flush=True)
@@ -1554,18 +1877,22 @@ async def _regime_report(
         kwargs["clock"] = clock
     try:
         results = await get_market_regimes(symbol, settings, market_data, **kwargs)
-        return regimes_to_dict(results, include_history=False)
+        main_report = results.get(settings.regime.timeframe)
+        return (
+            regimes_to_dict(results, include_history=False),
+            main_report if isinstance(main_report, RegimeReport) else None,
+        )
     except Exception as exc:  # el régimen nunca tira abajo la consola
         logging.getLogger(__name__).exception("Falló el régimen de %s", symbol)
         reason = f"error inesperado ({type(exc).__name__}: {exc})"
         tfs = dict.fromkeys([settings.regime.timeframe, settings.regime.context_timeframe])
-        return {tf: {"available": False, "timeframe": tf, "reason": reason} for tf in tfs}
+        return {tf: {"available": False, "timeframe": tf, "reason": reason} for tf in tfs}, None
 
 
 async def _fetch_data(
     symbol: str, settings: AppSettings, args: argparse.Namespace, err: TextIO
-) -> tuple[MarketSnapshot, dict[str, Any] | None]:
-    """Snapshot de mercado y, si no se pidió ``--no-regime``, el régimen."""
+) -> tuple[MarketSnapshot, dict[str, Any] | None, RegimeReport | None]:
+    """Snapshot de mercado y, si no se pidió ``--no-regime``, el régimen (dict y reporte de 1h)."""
     want_regime = not args.no_regime
     if args.offline:
         market = SyntheticMarketData(
@@ -1578,12 +1905,12 @@ async def _fetch_data(
         snapshot = await build_offline_snapshot(
             symbol, settings, args.nexo_price, seed=args.seed, now=args.now, market=market
         )
-        regime = None
+        regime, regime_main = None, None
         if want_regime:
-            regime = await _regime_report(
+            regime, regime_main = await _regime_report(
                 snapshot.symbol, settings, market, synthetic=True, clock=lambda: market.now, err=err
             )
-        return snapshot, regime
+        return snapshot, regime, regime_main
     secrets = get_secrets()
     async with AsyncExitStack() as stack:
         client = make_client(settings.exchanges.request_timeout_s)
@@ -1596,12 +1923,12 @@ async def _fetch_data(
         snapshot = await build_snapshot(
             symbol, settings, market_data, nexo, client, cache, secrets, args.nexo_price
         )
-        regime = None
+        regime, regime_main = None, None
         if want_regime:
-            regime = await _regime_report(
+            regime, regime_main = await _regime_report(
                 snapshot.symbol, settings, market_data, synthetic=False, clock=None, err=err
             )
-        return snapshot, regime
+        return snapshot, regime, regime_main
 
 
 def main(
@@ -1610,7 +1937,7 @@ def main(
     """Punto de entrada. Devuelve el código de salida."""
     out = out or sys.stdout
     err = err or sys.stderr
-    args = build_parser().parse_args(argv)
+    args = build_parser().parse_args(_join_negative_amounts(argv))
     logging.basicConfig(
         level=logging.WARNING if args.verbose else logging.ERROR,
         format="%(levelname)s %(name)s: %(message)s",
@@ -1625,14 +1952,14 @@ def main(
     except (OSError, ValueError, yaml.YAMLError) as exc:
         print(f"No se pudo leer la configuración ({args.config}): {exc}", file=err)
         return EXIT_USAGE
-    profile = args.profile or settings.risk_profiles.default
-    if profile not in settings.risk_profiles.profiles:
-        options = ", ".join(settings.risk_profiles.profiles)
-        print(f"No existe el perfil {profile!r}. Opciones: {options}.", file=err)
+    try:
+        profile = get_profile(args.profile, settings, max_leverage_override=args.max_leverage)
+    except ValueError as exc:
+        print(str(exc), file=err)
         return EXIT_USAGE
 
     try:
-        snapshot, regime = asyncio.run(_fetch_data(symbol, settings, args, err))
+        snapshot, regime, regime_main = asyncio.run(_fetch_data(symbol, settings, args, err))
     except KeyboardInterrupt:
         print(f"\n{CANCELLED}", file=err)
         return EXIT_INTERRUPTED
@@ -1646,7 +1973,20 @@ def main(
     analysis = analyze_all(
         snapshot.candles, settings, snapshot.current_price, now=snapshot.created_at
     )
-    report = build_report(snapshot, analysis, settings, profile, regime)
+    report = build_report(
+        snapshot,
+        analysis,
+        settings,
+        profile,
+        regime,
+        regime_report=regime_main,
+        trades_today=args.trades_today,
+        pnl_today_usd=args.pnl_today,
+        high_volatility_event=args.high_vol_event is not None,
+        event_description=printable(args.high_vol_event) or None
+        if args.high_vol_event is not None
+        else None,
+    )
     if args.json:
         out.write(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
     else:

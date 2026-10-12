@@ -10,7 +10,10 @@ Cómo se calcula
     ``direction_hint`` es ``"long"`` si el total llega a
     ``scoring.direction_thresholds.long`` (+30), ``"short"`` si llega a
     ``short`` (-30) y ``None`` en el medio. Es solo una pista: el plan de riesgo
-    y los ajustes por régimen deciden si se opera.
+    y los ajustes por régimen deciden si se opera. La comparación es exacta y
+    es la misma función que usa el plan (``rules.direction_from_score`` llama a
+    ``direction_from_total``): el total ya viene redondeado a 9 decimales, así
+    que no hace falta tolerancia y la pista nunca contradice al plan.
 
 Datos faltantes
     Un componente sin datos aporta 0 puntos, queda con ``available=False`` y se
@@ -27,6 +30,9 @@ API
     - ``compute_score(inputs, settings) -> ConfluenceScore``: total, aporte por
       componente (en el orden de ``scoring.weights``, para las barras del
       dashboard), faltantes, pista de dirección y avisos en castellano.
+    - ``direction_from_total(total, long, short)``: la dirección por el total.
+    - ``reliable_trend(summary)``: la tendencia de un ``TimeframeSummary`` o
+      ``None`` si no es confiable (la usa también el plan).
 
 Funciones puras: no leen archivos ni usan la red. ``to_dict()`` devuelve dicts
 listos para JSON (sin NaN ni infinitos).
@@ -45,6 +51,7 @@ from app.scoring.components import (
     derivatives_component,
     fmt_num,
     momentum_component,
+    score_beside_threshold,
     sentiment_component,
     trend_component,
 )
@@ -69,8 +76,6 @@ COMPONENT_LABELS: dict[str, str] = {
     "derivatives": "Derivados",
     "sentiment": "Sentimiento",
 }
-# Tolerancia para comparar el total con los umbrales (errores de redondeo de float).
-_EPS = 1e-9
 # Decimales con los que se guardan puntos y total (limpia artefactos de float).
 _ROUND_DIGITS = 9
 
@@ -234,16 +239,27 @@ def _reading(key: str, inputs: ScoreInputs, settings: AppSettings) -> ComponentR
 def direction_from_total(
     total: float, long_threshold: float, short_threshold: float
 ) -> Direction | None:
-    """``"long"`` si ``total >= long_threshold``, ``"short"`` si ``total <= short_threshold``."""
-    if total >= long_threshold - _EPS:
+    """``"long"`` si ``total >= long_threshold``, ``"short"`` si ``total <= short_threshold``.
+
+    Comparación exacta, sin tolerancia: ``compute_score`` ya redondea el total
+    a 9 decimales (limpia el ruido de float) y el score mínimo de las reglas
+    también es exacto, así que un total que se ve "+30" pero es 29,999999999
+    no es long en ningún lado.
+    """
+    if total >= long_threshold:
         return "long"
-    if total <= short_threshold + _EPS:
+    if total <= short_threshold:
         return "short"
     return None
 
 
 def _summary(total: float, hint: Direction | None, long_t: float, short_t: float) -> str:
-    score = f"Score {fmt_num(total, 1, signed=True)}"
+    # Si no llega a ningún umbral, el total no se redondea al más cercano
+    # ("Score +29,97: no llega a long (+30 o más)" y no "Score +30: ...").
+    value, decimals = total, 1
+    if hint is None:
+        value, decimals = score_beside_threshold(total, long_t if total >= 0 else short_t)
+    score = f"Score {fmt_num(value, decimals, signed=True)}"
     long_txt = fmt_num(long_t, 1, signed=True)
     short_txt = fmt_num(short_t, 1, signed=True)
     if hint == "long":
@@ -307,13 +323,15 @@ def compute_score(inputs: ScoreInputs, settings: AppSettings) -> ConfluenceScore
 # --- desde el análisis ---------------------------------------------------------
 
 
-def _summary_trend(summary: TimeframeSummary) -> str | None:
+def reliable_trend(summary: TimeframeSummary | None) -> str | None:
     """Tendencia del resumen, o ``None`` si no es confiable.
 
     ``indicators.pipeline`` deja "lateral" cuando faltan velas o la EMA larga;
-    eso no es una lectura real de tendencia, así que acá cuenta como faltante.
+    eso no es una lectura real de tendencia, así que cuenta como faltante. Es
+    el mismo criterio para el score y para el plan (``risk.plan``), así los dos
+    leen igual la tendencia de 4h y 1h.
     """
-    if summary.candles_used <= 0 or summary.trend_emas is None:
+    if summary is None or summary.candles_used <= 0 or summary.trend_emas is None:
         return None
     mid, long_ = summary.trend_emas
     if clean_number(summary.ema.get(mid)) is None or clean_number(summary.ema.get(long_)) is None:
@@ -348,7 +366,7 @@ def inputs_from_analysis(
     macd_signal: dict[str, float | None] = {}
     for tf, ta in analysis.timeframes.items():
         s = ta.summary
-        trends[tf] = _summary_trend(s)
+        trends[tf] = reliable_trend(s)
         rsi[tf] = clean_number(s.rsi)
         macd[tf] = clean_number(s.macd)
         macd_signal[tf] = clean_number(s.macd_signal)
@@ -392,4 +410,5 @@ __all__ = [
     "compute_score",
     "direction_from_total",
     "inputs_from_analysis",
+    "reliable_trend",
 ]

@@ -121,6 +121,27 @@ def fmt_num(x: float, decimals: int = 2, *, signed: bool = False) -> str:
     return text.replace(".", ",")
 
 
+def score_beside_threshold(value: float, threshold: float, decimals: int = 1) -> tuple[float, int]:
+    """``(valor, decimales)`` para mostrar un score sin que el redondeo lo pegue al umbral.
+
+    Si con ``decimals`` decimales el score se ve igual que el umbral pero no lo
+    es (``49.96`` contra ``50`` se vería "+50"), se muestra con dos decimales
+    más y redondeado hacia el lado en que está: hacia abajo si está debajo
+    (``49.96`` → "+49,96"; ``29.999999999`` → "+29,999") y hacia arriba si está
+    arriba. Así un mensaje nunca dice "tiene que ser +50 y está en +50". Si no
+    hay riesgo de confusión devuelve ``(value, decimals)`` tal cual.
+    """
+    if value == threshold or f"{value:.{decimals}f}" != f"{threshold:.{decimals}f}":
+        return value, decimals
+    more = decimals + 2
+    factor = 10.0**more
+    scaled = round(value * factor, 6)  # limpia el ruido de float antes de truncar
+    shown = (math.floor(scaled) if value < threshold else math.ceil(scaled)) / factor
+    if shown == threshold:  # pegado al umbral aun con más decimales: un paso al costado
+        shown = threshold - 1.0 / factor if value < threshold else threshold + 1.0 / factor
+    return shown, more
+
+
 def _contrib(value: float) -> str:
     """Aporte de una parte entre paréntesis: ``(+0,5)``, ``(-1)``, ``(0)``."""
     return f"({fmt_num(value, 2, signed=True)})"

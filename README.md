@@ -38,7 +38,7 @@ celular en la misma red wifi.
 | 1 | Investigación de la Nexo Pro API ([informe](docs/nexo-api-research.md)) | ✅ |
 | 2 | Datos e indicadores + script de consola ([fuentes](docs/data-sources.md)) | ✅ (falta correrlo en vivo en la Mac) |
 | 3 | Detector de régimen (HMM) + `make train-regime` | ✅ (falta entrenarlo con datos reales en la Mac) |
-| 4 | Score, plan de riesgo, ajustes por régimen y perfiles | ⏳ |
+| 4 | Score, plan de riesgo, ajustes por régimen y perfiles | ✅ (se ve en la consola; falta probarlo con datos reales en la Mac) |
 | 5 | Circuit breakers y correlación | ⏳ |
 | 6 | API FastAPI | ⏳ |
 | 7 | Dashboard: régimen, KPIs y gráfico principal | ⏳ |
@@ -78,8 +78,8 @@ make lint    # ruff
 ### Script de consola (Hito 2)
 
 Imprime todo lo que la app sabe de una moneda: precios, indicadores por
-timeframe, soportes y resistencias, derivados, sentimiento, noticias y un
-ejemplo didáctico de tamaño de posición, comisiones y liquidación.
+timeframe, soportes y resistencias, derivados, sentimiento, noticias, el score
+de confluencia y el plan de operación (ver Hito 4).
 
 ```bash
 make cli SYMBOL=BTC                          # datos reales (Binance, o Bybit si falla)
@@ -146,6 +146,60 @@ make cli SYMBOL=BTC ARGS="--no-regime"         # sin régimen (más rápido)
 - `make train-regime` termina con código 1 si alguna moneda no se pudo
   entrenar o reentrenar (en ese caso queda el modelo anterior y lo dice), y
   con 130 si lo cortás con Ctrl+C (sale enseguida y no guarda nada a medias).
+
+### Score y plan de operación (Hito 4)
+
+La consola termina con el **score de confluencia** (de -100 a +100, con lo que
+suma o resta cada parte) y el **plan de operación**: un cartel grande LONG,
+SHORT o NO OPERAR y, abajo, entrada, stop, objetivos, margen, tamaño,
+apalancamiento, liquidación, comisiones y stop por tiempo. Es la misma función
+que va a usar la app (`risk.plan.build_trade_plan`). Nunca opera: solo calcula.
+
+```bash
+make cli SYMBOL=BTC                                         # plan con el perfil por omisión (agresivo)
+make cli SYMBOL=SOL ARGS="--nexo-price 187,45"              # niveles sobre el precio que ves en Nexo
+make cli SYMBOL=ETH ARGS="--max-leverage 30"                # tope a mano, de 1x a 50x (más de 25x: advertencia roja)
+make cli SYMBOL=BTC ARGS='--high-vol-event "Dato de CPI"'   # evento de alta volatilidad: No operar
+make cli SYMBOL=BTC ARGS="--trades-today 2 --pnl-today -30" # cómo te fue hoy (límites del día)
+make cli SYMBOL=BTC ARGS="--json"                           # el plan va en "plan" y el score en "score"
+```
+
+Cómo se arma, en pocas palabras (todos los números están en `config.yaml`):
+
+- **Dirección**: long si el score es +30 o más, short si es -30 o menos; en el
+  medio, No operar.
+- **Stop**: debajo del soporte (o arriba de la resistencia) más cercano de 15m
+  o 1h, con un colchón de media vela (0,5 ATR de 15m). Los niveles a menos de
+  una vela normal (1 ATR) se saltean.
+- **Objetivos**: TP1 en el siguiente soporte o resistencia (también salteando
+  los que están a menos de 1 ATR); TP2 en 1,5 veces lo que arriesgás, corrido
+  lo justo para que, pagadas las comisiones, ganes al menos lo que pide tu
+  perfil o el régimen (1,5 o 2 por cada 1 que arriesgás); TP3, un "R" más allá.
+  Si el TP2 queda más lejos de lo que se mueve el precio en un día normal (ATR
+  diario), No operar; los objetivos así se marcan "poco probable intradía".
+- **Tamaño**: primero el riesgo en dólares (50 USD en el perfil agresivo, con
+  las comisiones adentro), de ahí el tamaño, y el apalancamiento sale solo
+  (tamaño / margen). Si pasa tu tope o la liquidación queda cerca del stop, la
+  app sube el margen; si no alcanza, achica la posición; si el riesgo queda
+  debajo del mínimo, No operar. Si la posición queda más chica que el margen
+  (menos de 1x, pasa con stops muy lejos), el margen baja solo a 1x. Cada
+  ajuste (también los del régimen) se muestra con su motivo.
+- **No operar** también si: 4h y 1h van en direcciones opuestas, el régimen lo
+  bloquea (por ejemplo, long en Crash), el score no llega al mínimo que pide el
+  régimen (por ejemplo, +50 para un long con el régimen Bajista), llegaste al
+  límite de operaciones o de pérdida del día, o marcaste un evento de alta
+  volatilidad. Se listan todas las reglas que fallan, cada una con una
+  sugerencia, y los niveles se muestran igual como "referencia, no operar" para
+  que veas por qué.
+- **Avisos que no bloquean**: si el precio de Nexo que cargaste difiere más de
+  2 % del de Binance (¿error de tipeo?), el plan te pide revisarlo y no
+  recomienda la entrada alternativa; si con lo que ya perdiste hoy esta
+  operación te haría pasar el límite del día al tocar el stop, también avisa.
+- **Entrada alternativa**: una orden límite en el soporte (long) o la
+  resistencia (short) más cercano de 15m, con su propio stop, tamaño, ajustes,
+  liquidación y comisiones.
+- **Stop por tiempo**: si en 24 h no tocó el TP1 ni el stop, cerrá (la hora se
+  muestra en tu zona horaria). También estima el funding de esas 24 h.
 
 ## Configuración
 

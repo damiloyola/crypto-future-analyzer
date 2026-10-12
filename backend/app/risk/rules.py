@@ -14,7 +14,8 @@ Reglas
 
 - ``check_direction(score, thresholds)``: el score tiene que llegar al umbral de
   long (``>= +30``) o de short (``<= -30``); en el medio no hay dirección.
-  ``direction_from_score`` devuelve la dirección candidata.
+  ``direction_from_score`` devuelve la dirección candidata (es la misma
+  función que la pista del score, ``scoring.confluence.direction_from_total``).
 - ``check_min_abs_score(direction, score, min_abs)``: score mínimo en la
   dirección del plan (el que sube el régimen; ver ``regime_adjustments``).
 - ``check_timeframe_conflict(trend_4h, trend_1h)``: 4h y 1h en direcciones
@@ -47,8 +48,11 @@ Formato de números
 Este módulo también tiene los formateadores que usan los mensajes de ``risk``
 (coma decimal y punto de miles, como se lee en Argentina): ``fmt_num``,
 ``fmt_usd``, ``fmt_leverage``, ``fmt_multiplier``, ``fmt_percent``,
-``fmt_score``, ``fmt_price`` y ``fmt_ratio``. Y ``json_safe``, que deja un
-resultado listo para JSON (NaN e infinitos pasan a ``None``).
+``fmt_score``, ``fmt_score_beside`` (un score que no llega a un umbral nunca se
+ve redondeado a ese umbral), ``fmt_price`` (con ``price_decimals``, los mismos
+decimales que la consola) y ``fmt_ratio``. Y ``json_safe``, que deja un
+resultado listo para JSON (NaN e infinitos pasan a ``None``; los escalares de
+numpy, a ``bool``/``int``/``float`` de Python).
 """
 
 from __future__ import annotations
@@ -60,6 +64,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from app.risk.sizing import Side, ensure_finite, ensure_positive, ensure_side
+from app.scoring.components import score_beside_threshold
+from app.scoring.confluence import direction_from_total
 
 if TYPE_CHECKING:
     from app.config import DirectionThresholds
@@ -157,16 +163,47 @@ def fmt_score(value: float) -> str:
     return fmt_num(value, 1, sign=True)
 
 
-def fmt_price(value: float) -> str:
-    """Precio con decimales según su tamaño: BTC ``"60.000"``, XRP ``"0,5123"``."""
+def fmt_score_beside(value: float, threshold: float) -> str:
+    """Score que se compara con ``threshold``, sin redondearlo al umbral.
+
+    ``49.96`` contra ``50`` -> ``"+49,96"`` (``fmt_score`` diría ``"+50"``);
+    lejos del umbral es igual que ``fmt_score``. Ver
+    ``scoring.components.score_beside_threshold``.
+    """
+    v, decimals = score_beside_threshold(float(value), float(threshold), 1)
+    return fmt_num(v, decimals, sign=True)
+
+
+def price_decimals(reference: float) -> int:
+    """Decimales para un precio según su tamaño (BTC 2, SOL 2-3, XRP 4).
+
+    Es la misma regla que usa la tabla de la consola, así un precio se lee
+    igual en el titular del plan y en la tabla de niveles.
+    """
+    try:
+        v = float(reference)
+    except (TypeError, ValueError):
+        return 2
+    if not math.isfinite(v) or v <= 0:
+        return 2
+    return int(min(8, max(2, 4 - math.floor(math.log10(v)))))
+
+
+def fmt_price(value: float, reference: float | None = None) -> str:
+    """Precio con decimales según su tamaño: BTC ``"60.000"``, XRP ``"0,5123"``.
+
+    Con ``reference`` (el precio de entrada) se usan los decimales de esa
+    referencia para todos los precios del mismo plan, como la tabla de la
+    consola (``2.7207`` con entrada ``26.5`` -> ``"2,721"``). Los ceros de más a
+    la derecha se sacan.
+    """
     try:
         v = float(value)
     except (TypeError, ValueError):
         return _DASH
     if not math.isfinite(v) or v <= 0:
         return fmt_num(v, 2)
-    decimals = int(min(8, max(2, 4 - math.floor(math.log10(v)))))
-    return fmt_num(v, decimals)
+    return fmt_num(v, price_decimals(v if reference is None else reference))
 
 
 def fmt_ratio(value: float) -> str:
@@ -175,9 +212,18 @@ def fmt_ratio(value: float) -> str:
 
 
 def json_safe(obj: Any) -> Any:
-    """Convierte a tipos de JSON: NaN/inf -> ``None``, tuplas -> listas, objetos con ``to_dict``."""
+    """Convierte a tipos de JSON: NaN/inf -> ``None``, tuplas -> listas, objetos con ``to_dict``.
+
+    Los escalares de numpy (``np.bool_``, ``np.float64``, ``np.int64``) pasan a
+    ``bool``/``float``/``int`` de Python: ``np.bool_(False)`` no puede terminar
+    como el texto ``"False"``, que en el frontend se leería como verdadero.
+    """
     if obj is None or isinstance(obj, bool | str):
         return obj
+    item = getattr(obj, "item", None)
+    if callable(item) and getattr(obj, "shape", None) == ():
+        # Escalar de numpy (sin importar numpy acá): su valor de Python.
+        return json_safe(item())
     if isinstance(obj, numbers.Integral):
         return int(obj)
     if isinstance(obj, numbers.Real):
@@ -234,13 +280,11 @@ def direction_from_score(score_total: float, thresholds: DirectionThresholds) ->
     """Dirección candidata: ``"long"`` si score >= umbral long, ``"short"`` si <= umbral short.
 
     ``None`` si queda entre los dos umbrales (``scoring.direction_thresholds``).
+    Usa ``scoring.confluence.direction_from_total``, la misma función que la
+    pista del score: los dos nunca se contradicen.
     """
     score = ensure_finite(score_total, "El score")
-    if score >= thresholds.long:
-        return "long"
-    if score <= thresholds.short:
-        return "short"
-    return None
+    return direction_from_total(score, float(thresholds.long), float(thresholds.short))
 
 
 def check_direction(score_total: float, thresholds: DirectionThresholds) -> RuleResult:
@@ -249,9 +293,10 @@ def check_direction(score_total: float, thresholds: DirectionThresholds) -> Rule
     side = direction_from_score(score, thresholds)
     long_t, short_t = fmt_score(thresholds.long), fmt_score(thresholds.short)
     if side is None:
+        nearest = thresholds.long if score >= 0 else thresholds.short
         return _fail(
             DIRECTION,
-            f"el score ({fmt_score(score)}) está entre {short_t} y {long_t}, "
+            f"el score ({fmt_score_beside(score, nearest)}) está entre {short_t} y {long_t}, "
             "no hay una dirección clara.",
             f"Esperá a que el score llegue a {long_t} (long) o a {short_t} (short).",
         )
@@ -294,7 +339,8 @@ def check_min_abs_score(
     return _fail(
         MIN_ABS_SCORE,
         f"para un {_side_word(side)} el score tiene que ser {fmt_score(needed)} {cmp} "
-        f"y está en {fmt_score(score)}" + (f" (lo pide {reason})." if reason else "."),
+        f"y está en {fmt_score_beside(score, needed)}"
+        + (f" (lo pide {reason})." if reason else "."),
         "Esperá a que las señales se alineen más a favor.",
     )
 

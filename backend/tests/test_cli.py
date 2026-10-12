@@ -24,19 +24,22 @@ from scripts import analyze_cli
 from scripts.analyze_cli import (
     DASH,
     OFFLINE_BANNER,
+    PLAN_TITLE,
     REGIME_TITLE,
     REGIME_UNAVAILABLE,
-    SIZING_TITLE,
+    SCORE_TITLE,
     build_report,
     fmt_compact_usd,
     fmt_duration,
     fmt_num,
     fmt_pct,
+    fmt_usd,
     main,
     parse_price,
     price_decimals,
     printable,
     render_text,
+    score_bar,
 )
 from tests.fakes import FIXED_NOW, FIXED_NOW_ISO, FakeMarketData
 
@@ -49,7 +52,8 @@ SECTIONS = [
     "Rango diario típico",
     "Derivados",
     "Sentimiento y noticias",
-    SIZING_TITLE,
+    SCORE_TITLE,
+    PLAN_TITLE,
 ]
 LEAKS = re.compile(r"\b(nan|none|inf|null)\b", re.IGNORECASE)
 
@@ -123,7 +127,7 @@ def test_text_output_has_banner_and_sections(btc_text):
     assert btc_text.count(OFFLINE_BANNER) == 2  # arriba y abajo
     for title in SECTIONS:
         assert title in btc_text, title
-    for word in ("LONG hipotético", "SHORT hipotético", "Fear & Greed", "Funding actual"):
+    for word in ("Componente", "Reglas", "Fear & Greed", "Funding actual"):
         assert word in btc_text
     assert "BTC/USDT" in btc_text
     assert "\x1b[" not in btc_text  # sin colores si no es una terminal
@@ -189,8 +193,9 @@ def test_json_output_structure(btc_json):
     assert r["profile"] == "agresivo"
     assert list(r["timeframes"]) == ["1d", "4h", "1h", "15m", "5m"]
     assert set(r["levels"]) == {"15m", "1h"}
-    for key in ("prices", "daily_range", "derivatives", "sentiment", "sizing_example", "sources"):
+    for key in ("prices", "daily_range", "derivatives", "sentiment", "score", "plan", "sources"):
         assert key in r
+    assert "sizing_example" not in r
     assert r["prices"]["execution_source"] == "binance"
     assert r["prices"]["nexo_price"] is None
     assert len(r["sentiment"]["headlines"]) > 0
@@ -213,43 +218,267 @@ def test_json_numbers_are_plausible(btc_json):
     assert 0 <= fg <= 100
 
 
-def test_json_sizing_example_is_consistent(btc_json):
-    ex = btc_json["sizing_example"]
-    assert ex["profile"] == "agresivo"
-    for key in ("long", "short"):
-        side = ex[key]
-        assert side["available"], side
-        assert side["leverage"] == pytest.approx(side["size_usd"] / side["margin_usd"])
-        assert side["fees_usd"] > 0
-        assert side["loss_at_stop_usd"] == pytest.approx(side["risk_usd"])  # comisiones incluidas
-        entry, stop, liq = side["entry"], side["stop"], side["liquidation_price"]
-        if key == "long":
-            assert stop < entry and liq < entry
-        else:
-            assert stop > entry and liq > entry
-        assert side["liquidation_ok"] == (side["liquidation_ratio"] >= 2.0)
-        if not side["liquidation_ok"]:
-            assert side["suggested_margin_usd"] > side["margin_usd"]
-        if side["leverage"] > 50:
-            assert any("tope duro" in f for f in side["leverage_flags"])
-        # Decisión del usuario: el nivel del stop está a 1 ATR(15m) o más de la entrada
-        # y los más cercanos aparecen como salteados.
-        min_atr = side["min_stop_distance_atr"]
-        assert min_atr == 1.0
-        assert side["level_distance_atr"] >= min_atr
-        for sk in side["skipped_levels"]:
-            assert sk["distance_atr"] < min_atr
-            if key == "long":
-                assert side["level_price"] < sk["price"] < entry
-            else:
-                assert entry < sk["price"] < side["level_price"]
+# --- score y plan (Hito 4) --------------------------------------------------------
+
+DEADLINE_UTC = "2026-10-13T14:37:20+00:00"  # FIXED_NOW + trade_plan.time_stop_hours (24 h)
+BADGES = {"LONG": "║      LONG      ║", "SHORT": "║      SHORT      ║"}
+BADGES["NO_OPERAR"] = "║      NO OPERAR      ║"
 
 
-def test_text_explains_skipped_levels(btc_json, btc_text):
-    sides = [btc_json["sizing_example"][k] for k in ("long", "short")]
-    if any(side["skipped_levels"] for side in sides):
-        assert "Nivel salteado" in btc_text
-        assert "demasiado cerca del precio" in btc_text
+@pytest.fixture(scope="module")
+def sol_json(small_config) -> dict:
+    # Con la semilla por omisión y FIXED_NOW, SOL da un SHORT que cumple todas las reglas.
+    code, out, err = run("SOL", "--offline", "--json", "--now", FIXED_NOW_ISO)
+    assert code == 0, err
+    return json.loads(out)
+
+
+def assert_plan_invariants(plan: dict) -> None:
+    """Invariantes de cualquier plan del JSON de la consola."""
+    assert plan["status"] in {"LONG", "SHORT", "NO_OPERAR"}
+    failing = [r for r in plan["rules"] if not r["ok"]]
+    assert plan["blocking_reasons"] == [r["message"] for r in failing]
+    assert (plan["status"] == "NO_OPERAR") == bool(failing)
+    assert all(r["message"].startswith("No operar: ") for r in failing)
+    if plan["status"] != "NO_OPERAR":
+        assert plan["status"].lower() == plan["direction"]
+    assert plan["is_reference"] == (plan["status"] == "NO_OPERAR" and plan["stop"] is not None)
+    if plan["stop"] is None:
+        assert plan["take_profits"] == [] and plan["position"] is None
+        return
+    entry, stop = plan["entry"]["price"], plan["stop"]["price"]
+    is_long = plan["direction"] == "long"
+    assert stop < entry if is_long else stop > entry
+    pos, risk = plan["position"], plan["risk"]
+    assert pos["leverage"] == pytest.approx(pos["size_usd"] / pos["margin_usd"])
+    assert 1.0 <= pos["leverage"] <= pos["max_leverage"] * (1 + 1e-9)
+    assert risk["max_loss_usd"] <= risk["after_adjustments_usd"] * (1 + 1e-9)
+    tps = {tp["name"]: tp for tp in plan["take_profits"]}
+    assert {"TP2", "TP3"} <= set(tps)
+    assert tps["TP2"]["net_rr"] >= plan["min_rr"] * (1 - 1e-9)
+    assert tps["TP3"]["r_multiple"] > tps["TP2"]["r_multiple"]
+    for tp in tps.values():
+        assert tp["price"] > entry if is_long else tp["price"] < entry
+    assert plan["fees"]["round_trip_at_stop_usd"] > 0
+    assert plan["time_stop"]["deadline"] == DEADLINE_UTC
+
+
+def _plan_block(text: str) -> str:
+    return text[text.index(f"━━ {PLAN_TITLE}") :]
+
+
+def test_json_plan_is_consistent(btc_json, sol_json):
+    for report in (btc_json, sol_json):
+        assert_plan_invariants(report["plan"])
+        json.dumps(report["plan"], allow_nan=False)
+
+
+def test_plan_uses_the_1h_regime(btc_json):
+    plan_regime, regime_1h = btc_json["plan"]["regime"], btc_json["regime"]["1h"]
+    assert plan_regime["available"] is True and plan_regime["timeframe"] == "1h"
+    assert plan_regime["name"] == regime_1h["name"]
+    assert plan_regime["category"] == regime_1h["category"]
+    assert plan_regime["confidence"] == pytest.approx(regime_1h["confidence"])
+
+
+@pytest.mark.parametrize("symbol", ["BTC", "ETH", "SOL", "XRP"])
+def test_plan_for_each_symbol_offline(symbol):
+    code, out, err = run(symbol, "--offline", "--json", "--now", FIXED_NOW_ISO)
+    assert code == 0, err
+    report = json.loads(out)
+    plan = report["plan"]
+    assert_plan_invariants(plan)
+    assert plan["direction"] == report["score"]["direction_hint"]
+    text = render_text(report)
+    block = _plan_block(text)
+    assert BADGES[plan["status"]] in block
+    assert plan["headline"] in block
+    assert LEAKS.search(text) is None
+    for rule in plan["rules"]:
+        if not rule["ok"]:
+            assert f"✗ {rule['message']}" in block
+            if rule["suggestion"]:
+                assert f"→ {rule['suggestion']}" in block
+
+
+def test_score_section(btc_json, btc_text):
+    sc = btc_json["score"]
+    block = btc_text[btc_text.index(f"━━ {SCORE_TITLE}") : btc_text.index(f"━━ {PLAN_TITLE}")]
+    assert sc["summary"] in block
+    assert score_bar(sc["total"], 30, -30) in block
+    for c in sc["components"]:
+        assert c["label"] in block
+        assert c["details"][0] in block
+    total_line = next(line for line in block.splitlines() if line.strip().startswith("Total"))
+    assert fmt_num(sc["total"], 1, sign=True) in total_line
+    assert sum(c["points"] for c in sc["components"]) == pytest.approx(sc["total"])
+    assert LEAKS.search(block) is None
+
+
+def test_score_bar():
+    assert score_bar(0, 30, -30) == "-100 ├──────────────┊─────●─────┊──────────────┤ +100"
+    assert score_bar(100, 30, -30).endswith("●┤ +100")
+    assert score_bar(-250, 30, -30).startswith("-100 ├●")  # se recorta a -100
+    assert score_bar(32, 30, -30).count("●") == 1
+    assert "●" not in score_bar(None, 30, -30)
+
+
+def test_reference_plan_shows_levels_and_why_not(btc_json, btc_text):
+    plan = btc_json["plan"]
+    block = _plan_block(btc_text)
+    # Con la config chica del régimen, BTC da long bloqueado: niveles como referencia.
+    assert plan["status"] == "NO_OPERAR" and plan["is_reference"] is True
+    assert "Niveles (referencia, no operar)" in block
+    for label in ("Entrada (a mercado)", "Stop", "TP2", "TP3", "Pérdida máxima", "Comisiones"):
+        assert label in block, label
+    assert "Reglas que no se cumplen" in block
+    if plan["stop"]["skipped_levels"]:
+        assert "se salteó" in block and "demasiado cerca del precio" in block
+
+
+def test_tradeable_plan_text(sol_json):
+    plan = sol_json["plan"]
+    assert plan["status"] == "SHORT" and plan["is_reference"] is False
+    assert all(r["ok"] for r in plan["rules"])
+    block = _plan_block(render_text(sol_json))
+    assert BADGES["SHORT"] in block
+    assert plan["headline"].startswith("SHORT a mercado en ")
+    assert f"Reglas: se cumplen las {len(plan['rules'])}." in block
+    for label in (
+        "Entrada (a mercado)",
+        "Margen",
+        "Tamaño de la posición",
+        "Apalancamiento resultante",
+        "Liquidación (aislada)",
+        "Liquidación modelo Nexo",
+        "Pérdida máxima",
+        "Comisiones",
+        "Funding estimado",
+        "De dónde salen los niveles",
+        "Ajustes",
+    ):
+        assert label in block, label
+    # El stop por tiempo va en la hora del usuario (Buenos Aires = UTC-3).
+    assert plan["time_stop"]["deadline"] == DEADLINE_UTC
+    assert "13/10 11:37 (24 h)" in block
+    fees = plan["fees"]
+    assert f"({fmt_pct(fees['pct_of_risk'], 1)} del riesgo)" in block
+    assert f"({fmt_pct(fees['pct_of_target'], 1)} de la ganancia)" in block
+    tp2 = next(tp for tp in plan["take_profits"] if tp["name"] == "TP2")
+    row = next(line for line in block.splitlines() if line.strip().startswith("TP2"))
+    assert fmt_usd(tp2["net_gain_usd"]) in row and fmt_num(tp2["net_rr"], 2) in row
+
+
+def test_alternative_entry_is_summarized(sol_json):
+    alt = sol_json["plan"]["alternative"]
+    entry = sol_json["plan"]["entry"]["price"]
+    assert alt["kind"] == "limit" and alt["timeframe"] == "15m"
+    if alt["available"]:
+        assert alt["level_kind"] == "resistencia" and alt["level_price"] > entry  # short
+        assert alt["entry"] == alt["level_price"]
+        block = _plan_block(render_text(sol_json))
+        assert "Entrada alternativa (orden límite)" in block
+        assert "Entrada alternativa (límite)" in block  # fila de la tabla
+    else:
+        assert alt["reason"]
+
+
+def test_no_regime_plan_takes_it_as_low_confidence():
+    code, out, err = run("SOL", "--offline", "--json", "--now", FIXED_NOW_ISO, "--no-regime")
+    assert code == 0, err
+    plan = json.loads(out)["plan"]
+    assert plan["regime"] == {"available": False}
+    assert "regime_unavailable" in [a["code"] for a in plan["adjustments"]]
+    assert plan["risk"]["after_adjustments_usd"] == pytest.approx(25.0)  # 50 × 0,5
+
+
+def test_max_leverage_override_shows_red_warning():
+    code, out, err = run(
+        "BTC", "--offline", "--json", "--now", FIXED_NOW_ISO, "--max-leverage", "30"
+    )
+    assert code == 0, err
+    report = json.loads(out)
+    prof = report["plan"]["profile"]
+    assert prof["max_leverage"] == 30 and prof["leverage_overridden"] is True
+    assert prof["red_warning"] is True
+    text = render_text(report)
+    header = text[: text.index("━━ Fuentes de datos")]
+    assert "tope de apalancamiento 30x, cambiado a mano; el perfil trae 25x" in header
+    assert "Advertencia: el tope de apalancamiento está en 30x" in header
+    assert "Advertencia: el tope de apalancamiento está en 30x" in _plan_block(text)
+
+
+def test_max_leverage_above_hard_cap_exits_2():
+    code, out, err = run("BTC", "--offline", "--max-leverage", "60")
+    assert code == 2 and out == ""
+    assert "No se permite más de 50x de apalancamiento (pediste 60x)." in err
+
+
+@pytest.mark.parametrize("bad", ["0", "-5", "abc", "0,5", "0.0001"])
+def test_max_leverage_invalid_exits_2(capsys, bad):
+    with pytest.raises(SystemExit) as info:
+        main(["BTC", "--offline", f"--max-leverage={bad}"])
+    assert info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--max-leverage" in err
+    # Mensajes propios del apalancamiento (no los ejemplos de precios).
+    assert "96000,5" not in err
+    if bad != "abc":
+        assert "tiene que ser 1x o más (1x = sin apalancamiento" in err
+
+
+def test_high_volatility_event_blocks_the_plan():
+    code, out, err = run(
+        "SOL", "--offline", "--json", "--now", FIXED_NOW_ISO, "--high-vol-event", "CPI de EE. UU."
+    )
+    assert code == 0, err
+    report = json.loads(out)
+    plan = report["plan"]
+    assert plan["status"] == "NO_OPERAR" and plan["is_reference"] is True
+    failing = [r for r in plan["rules"] if not r["ok"]]
+    assert [r["code"] for r in failing] == ["high_volatility_event"]
+    assert failing[0]["message"].startswith(
+        "No operar: marcaste un evento de alta volatilidad (CPI de EE. UU.)"
+    )
+    block = _plan_block(render_text(report))
+    assert "✗ No operar: marcaste un evento de alta volatilidad (CPI de EE. UU.)" in block
+    assert "→ Esperá a que pase el evento y desmarcalo." in block
+
+
+def test_high_volatility_event_without_description():
+    code, out, err = run("SOL", "--offline", "--json", "--now", FIXED_NOW_ISO, "--high-vol-event")
+    assert code == 0, err
+    plan = json.loads(out)["plan"]
+    rule = next(r for r in plan["rules"] if r["code"] == "high_volatility_event")
+    assert rule["ok"] is False
+    assert rule["message"].startswith("No operar: marcaste un evento de alta volatilidad;")
+
+
+def test_daily_limits_from_the_command_line():
+    base = ("SOL", "--offline", "--json", "--now", FIXED_NOW_ISO)
+    code, out, _ = run(*base, "--trades-today", "3")
+    rule = next(r for r in json.loads(out)["plan"]["rules"] if r["code"] == "daily_limits")
+    assert code == 0 and rule["ok"] is False
+    assert "ya hiciste 3 operaciones hoy y el máximo es 3" in rule["message"]
+    code, out, _ = run(*base, "--pnl-today", "-100")
+    rule = next(r for r in json.loads(out)["plan"]["rules"] if r["code"] == "daily_limits")
+    assert code == 0 and rule["ok"] is False
+    assert "hoy perdiste 100 USD y el límite es 100 USD" in rule["message"]
+    code, out, _ = run(*base, "--pnl-today", "-30,5", "--trades-today", "1")
+    plan = json.loads(out)["plan"]
+    rule = next(r for r in plan["rules"] if r["code"] == "daily_limits")
+    assert code == 0 and rule["ok"] is True and plan["status"] == "SHORT"
+    assert "1 de 3 operaciones, pérdida 30,50 USD" in rule["message"]
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"), [("--trades-today", "-1"), ("--trades-today", "2.5"), ("--pnl-today", "x")]
+)
+def test_bad_day_state_exits_2(capsys, flag, value):
+    with pytest.raises(SystemExit) as info:
+        main(["BTC", "--offline", f"{flag}={value}"])
+    assert info.value.code == 2
+    assert flag in capsys.readouterr().err
 
 
 def test_json_never_contains_nan():
@@ -268,8 +497,12 @@ def test_other_profile(btc_json):
         "BTC", "--offline", "--json", "--now", FIXED_NOW_ISO, "--profile", "conservador"
     )
     assert code == 0
-    ex = json.loads(out)["sizing_example"]
-    assert ex["profile"] == "conservador" and ex["risk_usd"] == 15
+    report = json.loads(out)
+    assert report["profile"] == "conservador"
+    plan = report["plan"]
+    assert plan["profile"]["name"] == "conservador"
+    assert plan["profile"]["risk_per_trade_usd"] == 15
+    assert plan["risk"]["requested_usd"] == 15
 
 
 # --- errores ----------------------------------------------------------------------
@@ -356,47 +589,34 @@ def test_ambiguous_nexo_price_exits_2(capsys):
     assert "ambiguo" in err and "96000" in err
 
 
-def test_short_born_liquidated_is_said_plainly(tmp_path):
-    # Regresión: con esta hora y SIN saltear niveles pegados al precio
-    # (min_stop_distance_atr: 0), el SHORT tiene la liquidación del lado ganador
-    # de la entrada; se mostraba "a 0,05 % de la entrada" y "-0,39 veces la
-    # distancia". Con la regla del usuario (1 ATR) ese stop ya no se elige.
-    cfg = tmp_path / "config.yaml"
-    original = DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
-    assert "min_stop_distance_atr: 1.0" in original
-    cfg.write_text(
-        original.replace("min_stop_distance_atr: 1.0", "min_stop_distance_atr: 0"),
-        encoding="utf-8",
-    )
-    argv = (
-        "BTC",
-        "--offline",
-        "--now",
-        "2026-10-12T04:36:39Z",
-        "--config",
-        str(cfg),
-        "--no-regime",
-    )
-    code, out, err = run(*argv, "--json")
-    assert code == 0, err
-    short = json.loads(out)["sizing_example"]["short"]
-    assert short["liquidation_price"] < short["entry"]
-    assert short["liquidation_at_open"] is True and short["liquidation_ok"] is False
-    assert short["suggested_leverage"] > 50
-    assert any("tope duro" in f for f in short["suggested_leverage_flags"])
-    assert any("tope duro" in f for f in short["safe_size_leverage_flags"])
-    code, text, _ = run(*argv)
-    block = text[text.index("SHORT hipotético") :]
-    assert "nacería liquidada" in block
-    assert "-0,39" not in block and "veces la distancia al stop" not in block
-    margin_line = next(line for line in block.splitlines() if "Margen sugerido" in line)
-    after = block.splitlines()[block.splitlines().index(margin_line) + 1]
-    assert "ATENCIÓN" in after and "tope duro" in after
+def test_born_liquidated_is_said_plainly(sol_json):
+    # Regresión (del ejemplo de sizing del Hito 2): si la liquidación cae del lado
+    # ganador de la entrada no se muestra "a 0,05 %" ni "-0,39 veces la distancia".
+    # Con el ajuste de margen del plan no debería pasar nunca, pero si llega a pasar
+    # se dice así.
+    report = json.loads(json.dumps(sol_json))
+    report["plan"]["liquidation"].update(at_open=True, ok=False, ratio=-0.39)
+    block = _plan_block(render_text(report))
+    line = next(x for x in block.splitlines() if "Liquidación (aislada)" in x)
+    assert "nacería liquidada" in line
+    assert "-0,39" not in line and "veces la distancia" not in line
 
 
-def test_long_liquidation_is_not_flagged_as_born_liquidated(btc_json):
-    for key in ("long", "short"):
-        assert btc_json["sizing_example"][key]["liquidation_at_open"] is False
+def test_red_leverage_warning_is_shown_once(sol_json):
+    report = json.loads(json.dumps(sol_json))
+    text = "Advertencia: el apalancamiento queda en 34,8x, más de 25x. Un movimiento chico..."
+    report["plan"]["position"].update(red_warning=True, red_warning_text=text)
+    report["plan"]["warnings"].append(text)
+    block = _plan_block(render_text(report))
+    assert block.count(text) == 1
+    line = next(x for x in block.splitlines() if "Apalancamiento resultante" in x)
+    after = block.splitlines()[block.splitlines().index(line) + 1]
+    assert after.strip() == text  # justo debajo de su fila, sin "ATENCIÓN:" de más
+
+
+def test_plan_liquidation_is_never_born_liquidated(btc_json, sol_json):
+    for report in (btc_json, sol_json):
+        assert report["plan"]["liquidation"]["at_open"] is False
 
 
 def test_printable_strips_terminal_escapes():
@@ -697,11 +917,14 @@ def test_regime_unavailable_does_not_break_the_cli(tmp_path):
     assert code == 0, err
     block = _regime_block(out)
     assert block.count(f"{REGIME_UNAVAILABLE}: no hay suficiente historia") == 2
-    assert SIZING_TITLE in out
+    assert PLAN_TITLE in out
+    assert "el régimen no está disponible" in out  # el plan lo toma como confianza baja
     assert LEAKS.search(out) is None
     code, out, _ = run("BTC", "--offline", "--json", "--now", FIXED_NOW_ISO, "--config", str(cfg))
-    regime = json.loads(out)["regime"]
+    report = json.loads(out)
+    regime = report["regime"]
     assert regime["1h"]["available"] is False and "suficiente historia" in regime["1h"]["reason"]
+    assert report["plan"]["regime"] == {"available": False}
 
 
 def test_offline_regime_does_not_change_market_numbers(tmp_path):
@@ -715,7 +938,7 @@ def test_offline_regime_does_not_change_market_numbers(tmp_path):
     code, out, _ = run(*argv, "--no-regime")
     without = json.loads(out)
     # La historia larga para el régimen agrega velas viejas pero no cambia las recientes.
-    for key in ("prices", "timeframes", "levels", "daily_range", "derivatives", "sizing_example"):
+    for key in ("prices", "timeframes", "levels", "daily_range", "derivatives", "score"):
         assert without[key] == with_regime[key], key
 
 
@@ -831,3 +1054,148 @@ def test_ctrl_c_exits_130_without_traceback(monkeypatch):
     code, out, err = run("BTC", "--offline", "--now", FIXED_NOW_ISO)
     assert code == 130 and out == ""
     assert err.strip() == "Cancelado por el usuario." and "Traceback" not in err
+
+
+# --- revisión final del Hito 4 ------------------------------------------------------
+
+
+def test_fractional_leverage_cap_is_not_rounded():
+    # Antes: "tope de apalancamiento 26x" en una línea y "está en 25,5x" en la siguiente.
+    code, out, err = run("BTC", "--offline", "--no-regime", "--max-leverage", "25,5")
+    assert code == 0, err
+    header = out[: out.index("━━ Fuentes de datos")]
+    assert "tope de apalancamiento 25,5x, cambiado a mano; el perfil trae 25x" in header
+    assert "tope 25,5x" in _plan_block(out)
+    assert "26x" not in out
+
+
+def test_pnl_today_followed_by_another_option_is_not_eaten(capsys):
+    # "--pnl-today --json" pegaba "--json" como monto ("no es un número: '-json'").
+    with pytest.raises(SystemExit) as info:
+        main(["BTC", "--offline", "--pnl-today", "--json"])
+    assert info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--pnl-today" in err and "-json" not in err.replace("--json", "")
+
+
+def test_pnl_today_bad_amount_message(capsys):
+    with pytest.raises(SystemExit) as info:
+        main(["BTC", "--offline", "--pnl-today=-"])
+    assert info.value.code == 2
+    err = capsys.readouterr().err
+    assert "no es un monto en USD: '-' (ej. -30 o -30,5" in err
+
+
+def test_max_leverage_help_does_not_hardcode_the_red_threshold():
+    action = next(
+        a for a in analyze_cli.build_parser()._actions if "--max-leverage" in a.option_strings
+    )
+    assert "25x" not in action.help
+    assert "leverage_red_warning_above" in action.help
+
+
+def test_fees_outside_the_risk_are_broken_down(tmp_path):
+    # Con fees_included_in_risk: false la pérdida máxima ya trae las comisiones:
+    # antes decía "(más comisiones)" y se leían dos veces.
+    data = yaml.safe_load(_CONFIG["path"].read_text(encoding="utf-8"))
+    data["trade_plan"]["fees_included_in_risk"] = False
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    code, out, err = run(
+        "SOL", "--offline", "--json", "--no-regime", "--now", FIXED_NOW_ISO, "--config", str(path)
+    )
+    assert code == 0, err
+    report = json.loads(out)
+    risk = report["plan"]["risk"]
+    assert risk["fees_included"] is False
+    assert risk["max_loss_usd"] == pytest.approx(risk["price_loss_usd"] + risk["fees_at_stop_usd"])
+    line = next(x for x in render_text(report).splitlines() if "Pérdida máxima" in x)
+    assert "más comisiones" not in line
+    assert (
+        f"{fmt_usd(risk['max_loss_usd'])} si toca el stop ({fmt_usd(risk['price_loss_usd'])} de "
+        f"precio + {fmt_usd(risk['fees_at_stop_usd'])} de comisiones; el funding va aparte)"
+    ) in line
+
+
+def test_day_state_is_shown_and_in_the_json():
+    base = ("SOL", "--offline", "--json", "--now", FIXED_NOW_ISO)
+    code, out, err = run(*base, "--trades-today", "1", "--pnl-today", "-30,5")
+    assert code == 0, err
+    report = json.loads(out)
+    day = report["plan"]["day_state"]
+    assert day["trades_today"] == 1 and day["pnl_today_usd"] == -30.5
+    assert day["max_daily_loss_usd"] == 100.0 and day["high_volatility_event"] is False
+    block = _plan_block(render_text(report))
+    assert "Hoy: 1 de 3 operaciones, pérdida 30,50 USD de 100 USD permitidos." in block
+    # Sin cargar el día no se muestra esa línea.
+    code, out, _ = run(*base)
+    assert "Hoy: " not in _plan_block(render_text(json.loads(out)))
+
+
+def test_daily_limit_warning_in_the_plan_block():
+    code, out, err = run("SOL", "--offline", "--now", FIXED_NOW_ISO, "--pnl-today", "-99")
+    assert code == 0, err
+    block = _plan_block(out)
+    assert "Ojo con el límite del día: hoy ya perdiste 99 USD" in block
+
+
+def test_levels_table_explains_r_rr_and_atr(sol_json):
+    block = _plan_block(render_text(sol_json))
+    assert "R = lo que arriesgás hasta el stop" in block
+    assert "R:R 1,5 = por cada 1 USD que arriesgás ganás 1,5" in block
+    assert "ATR 15m = lo que se mueve el precio en una vela normal de 15m" in block
+
+
+def test_alternative_block_shows_its_adjustments_liquidation_fees_and_time_stop(sol_json):
+    report = json.loads(json.dumps(sol_json))
+    alt = report["plan"]["alternative"]
+    if not alt["available"]:
+        pytest.skip("con estos datos no hay entrada alternativa")
+    alt["adjustments"].append(
+        {
+            "source": "position",
+            "code": "margin_raised",
+            "message": "Margen subido de 100 a 166,20 USD para no pasar de 25x.",
+            "risk_multiplier": 1.0,
+        }
+    )
+    block = _plan_block(render_text(report))
+    alt_block = block[block.index("Entrada alternativa (orden límite)") :]
+    assert "Ajustes de esta entrada:" in alt_block
+    assert "Margen subido de 100 a 166,20 USD para no pasar de 25x." in alt_block
+    assert "Liquidación (aislada)" in alt_block
+    assert "Comisiones (ida y vuelta)" in alt_block
+    assert "Stop por tiempo" in alt_block
+    # Los ajustes del régimen ya están arriba: no se repiten en la alternativa.
+    assert "el régimen" not in alt_block.split("Ajustes de esta entrada:")[1]
+
+
+def test_mistyped_nexo_price_is_warned_in_the_plan():
+    price = synthetic_price("XRP") * 10  # un cero de más
+    code, out, err = run(
+        "XRP", "--offline", "--json", "--now", FIXED_NOW_ISO, "--nexo-price", f"{price:.4f}"
+    )
+    assert code == 0, err
+    report = json.loads(out)
+    plan = report["plan"]
+    assert plan["entry"]["price_suspect"] is True
+    assert any(w.startswith("Revisá el precio de entrada") for w in plan["warnings"])
+    assert "sí cumple las reglas" not in plan["headline"]
+    assert "Revisá el precio de entrada" in _plan_block(render_text(report))
+
+
+def test_plan_headline_prices_match_the_table(sol_json):
+    # El titular usa los mismos decimales que la tabla (sin los ceros de más).
+    plan = sol_json["plan"]
+    assert plan["status"] == "SHORT"
+    d = price_decimals(plan["entry"]["price"])
+
+    def shown(x: float) -> str:
+        text = fmt_num(x, d)
+        return text.rstrip("0").rstrip(",") if "," in text else text
+
+    tp2 = next(tp for tp in plan["take_profits"] if tp["name"] == "TP2")
+    assert plan["headline"].startswith(
+        f"SHORT a mercado en {shown(plan['entry']['price'])}: stop en "
+        f"{shown(plan['stop']['price'])} y objetivo principal (TP2) en {shown(tp2['price'])};"
+    )

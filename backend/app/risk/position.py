@@ -30,8 +30,11 @@ del tope del perfil") con la matemática de ``sizing``, ``fees`` y
    liquidar; un short sí (con una suba de casi el 100 %), y si eso queda a
    menos de ``min_distance_ratio`` veces la distancia al stop (con 2 veces,
    stops a más del 49 % de la entrada) la regla de liquidación da "No operar".
-7. Si la pérdida real al tocar el stop queda debajo de
-   ``profile.min_operable_risk_usd``, ``ok=False``: "No operar".
+7. Si el riesgo queda debajo de ``profile.min_operable_risk_usd``,
+   ``ok=False``: "No operar". El riesgo que se compara es el mismo que pide el
+   perfil (``PositionFit.floor_risk_usd``): la pérdida real al tocar el stop
+   (precio + comisiones) si ``trade_plan.fees_included_in_risk``; si las
+   comisiones van aparte, solo la pérdida por precio.
 
 Cada ajuste queda en ``adjustments`` con su motivo, en el orden en que se
 hizo, por ejemplo "Margen subido de 100 a 178,67 USD para no pasar de 25x; el
@@ -197,12 +200,24 @@ class PositionFit:
         """La posición se achicó y ahora se arriesga menos que lo pedido."""
         return self.size_reduced
 
+    @property
+    def floor_risk_usd(self) -> float:
+        """El riesgo que se compara con el mínimo operable, en los términos del perfil.
+
+        Con ``fees_included_in_risk`` (decisión del usuario) es la pérdida real
+        al tocar el stop, comisiones incluidas (``risk_usd``). Si las comisiones
+        van aparte, el riesgo del perfil es solo la pérdida por precio
+        (``price_loss_at_stop_usd``): sumarle las comisiones haría pasar el piso
+        a un riesgo que en realidad quedó debajo.
+        """
+        return self.risk_usd if self.fees_included_in_risk else self.price_loss_at_stop_usd
+
     def checks(self) -> tuple[RuleResult, ...]:
         """Reglas de bloqueo sobre la posición final: apalancamiento, liquidación y riesgo."""
         return (
             check_leverage(self.leverage, self.profile),
             check_liquidation(self.liquidation_check),
-            check_min_operable_risk(self.risk_usd, self.profile),
+            check_min_operable_risk(self.floor_risk_usd, self.profile),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -480,19 +495,23 @@ def fit_position(
         )
 
     # Bloqueos: piso de riesgo y, como red de seguridad, las reglas de la posición.
+    # El piso se compara con el riesgo en los términos del perfil (ver
+    # ``PositionFit.floor_risk_usd``).
     floor = float(profile.min_operable_risk_usd)
+    floor_risk = loss if fees_included else price_loss
     block_reason: str | None = None
-    if loss < floor * (1.0 - REL_TOL):
+    if floor_risk < floor * (1.0 - REL_TOL):
         if size_reduced:
+            # El margen máximo (no el final: si bajó a 1x, ese ya no es el máximo).
             block_reason = (
-                f"No operar: aun con el margen máximo de {fmt_usd(margin)} la posición entra "
-                f"solo hasta {fmt_usd(size)} y arriesgarías {fmt_usd(loss)}, menos que el "
-                f"mínimo operable de {fmt_usd(floor)}."
+                f"No operar: aun con el margen máximo de {fmt_usd(max_margin)} la posición "
+                f"entra solo hasta {fmt_usd(size)} y arriesgarías {fmt_usd(floor_risk)}, menos "
+                f"que el mínimo operable de {fmt_usd(floor)}."
             )
         else:
             block_reason = (
-                f"No operar: el riesgo ({fmt_usd(loss)}) queda debajo del mínimo operable "
-                f"de {fmt_usd(floor)}."
+                f"No operar: el riesgo ({fmt_usd(floor_risk)}) queda debajo del mínimo "
+                f"operable de {fmt_usd(floor)}."
             )
     elif not liq_check.ok:
         block_reason = check_liquidation(liq_check).message

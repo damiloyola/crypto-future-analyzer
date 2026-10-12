@@ -535,3 +535,42 @@ def test_random_positions_respect_the_rules(settings):
         if not fit.size_reduced:
             assert fit.risk_usd == pytest.approx(risk)
         assert all(c.ok for c in fit.checks()) == fit.ok
+
+
+# --- revisión final del Hito 4 ------------------------------------------------------
+
+
+def test_block_reason_names_the_max_margin_not_the_lowered_one(settings, agresivo):
+    # Short con el stop a 60 %: la liquidación achica la posición y después el
+    # margen baja a 1x. El "margen máximo" del motivo es el máximo (100 con el
+    # multiplicador en 1), no el margen final ya bajado a 1x (82,48).
+    custom = with_plan_liquidation(settings, max_margin_multiplier=1.0)
+    profile = dataclasses.replace(agresivo, min_operable_risk_usd=49.9)
+    fit = fit_position("short", 100.0, 160.0, 50.0, profile, custom)
+    assert fit.size_reduced and fit.margin_lowered_to_1x and not fit.ok
+    assert fit.margin_usd == pytest.approx(fit.size_usd) and fit.margin_usd < 100.0
+    assert fit.block_reason.startswith("No operar: aun con el margen máximo de 100 USD")
+    assert f"margen máximo de {fit.margin_usd:.2f}".replace(".", ",") not in fit.block_reason
+
+
+def test_floor_compares_the_price_risk_when_fees_are_outside(settings):
+    # Comisiones aparte: el riesgo del perfil es solo el de precio. 12 USD de
+    # precio + comisiones pasan los 15 USD, pero el riesgo (12) no llega al mínimo.
+    custom = settings.model_copy(
+        update={
+            "trade_plan": settings.trade_plan.model_copy(update={"fees_included_in_risk": False})
+        }
+    )
+    profile = get_profile("agresivo", custom)
+    fit = fit_position("long", ENTRY, 59760.0, 12.0, profile, custom)
+    assert fit.price_loss_at_stop_usd == pytest.approx(12.0)
+    assert fit.risk_usd > profile.min_operable_risk_usd  # con las comisiones sí pasaría
+    assert fit.floor_risk_usd == pytest.approx(12.0)
+    assert not fit.ok
+    assert fit.block_reason == (
+        "No operar: el riesgo (12 USD) queda debajo del mínimo operable de 15 USD."
+    )
+    assert not fit.checks()[-1].ok
+    # Con las comisiones adentro (la decisión del usuario) se compara la pérdida total.
+    inside = fit_position("long", ENTRY, 59760.0, 20.0, get_profile("agresivo", settings), settings)
+    assert inside.floor_risk_usd == pytest.approx(inside.risk_usd)

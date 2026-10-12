@@ -141,3 +141,24 @@ def test_to_dict_is_json_safe(settings):
     assert d["max_leverage"] == 30
     assert d["red_warning"] is True
     assert isinstance(d["warnings"], list) and len(d["warnings"]) == 2
+
+
+# --- revisión final del Hito 4 ------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [0.5, 0.9999])
+def test_override_below_1x_is_rejected(settings, bad):
+    # Con menos de 1x el margen sería más grande que la posición: todo plan daba
+    # "No operar" con sugerencias imposibles ("subí el margen").
+    with pytest.raises(ValueError, match="tiene que ser 1x o más"):
+        get_profile("agresivo", settings, bad)
+
+
+def test_override_of_exactly_1x_is_accepted(settings):
+    assert get_profile("agresivo", settings, 1).max_leverage == 1.0
+
+
+def test_hard_cap_message_shows_enough_decimals(settings):
+    # Antes: "No se permite más de 50x de apalancamiento (pediste 50x)".
+    with pytest.raises(ValueError, match=r"pediste 50,04x"):
+        get_profile("agresivo", settings, 50.04)

@@ -42,8 +42,10 @@ from app.risk.rules import (
     fmt_price,
     fmt_ratio,
     fmt_score,
+    fmt_score_beside,
     fmt_usd,
     json_safe,
+    price_decimals,
 )
 
 FEE = 0.0006
@@ -355,3 +357,43 @@ def test_no_liquidation_passes():
     check = check_liquidation_vs_stop("long", 100.0, 50.0, None, 2.0)
     r = check_liquidation(check)
     assert r.ok and "no se puede liquidar" in r.message
+
+
+# --- revisión final del Hito 4 ------------------------------------------------------
+
+
+def test_json_safe_turns_numpy_scalars_into_python_values():
+    np = pytest.importorskip("numpy")
+    # np.bool_(False) terminaba como el texto "False", que en JS es verdadero.
+    assert json_safe(np.bool_(False)) is False
+    assert json_safe(np.bool_(True)) is True
+    assert json_safe(np.float64(1.5)) == 1.5 and type(json_safe(np.float64(1.5))) is float
+    assert json_safe(np.int64(3)) == 3 and type(json_safe(np.int64(3))) is int
+    assert json_safe(np.float64("nan")) is None
+    assert json_safe({"ok": np.bool_(False), "v": (np.float64(2.0),)}) == {
+        "ok": False,
+        "v": [2.0],
+    }
+
+
+def test_score_messages_do_not_round_the_score_to_the_threshold(settings):
+    r = check_min_abs_score("long", 49.96, 50.0, reason="el régimen Bajista")
+    assert r.ok is False
+    assert "tiene que ser +50 o más y está en +49,96" in r.message
+    assert "está en +50" not in r.message
+    short = check_min_abs_score("short", -49.96, 50.0)
+    assert "tiene que ser -50 o menos y está en -49,96" in short.message
+    th = settings.scoring.direction_thresholds
+    assert "el score (+29,97) está entre" in check_direction(29.97, th).message
+    assert "el score (-29,97) está entre" in check_direction(-29.97, th).message
+    # Lejos del umbral queda como siempre (un decimal).
+    assert "el score (+12,3) está entre" in check_direction(12.34, th).message
+    assert fmt_score_beside(45.0, 50.0) == "+45"
+
+
+def test_price_uses_the_reference_decimals():
+    # Mismo precio, misma cantidad de decimales que la tabla de la consola.
+    assert price_decimals(60000.0) == 2 and price_decimals(2.6543) == 4
+    assert fmt_price(2.7207, 26.5) == "2,721"  # con la entrada de 26,5
+    assert fmt_price(2.7207) == "2,7207"  # sin referencia, por su tamaño
+    assert fmt_price(167.5, 167.5) == "167,5"
