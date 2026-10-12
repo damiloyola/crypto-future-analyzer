@@ -14,8 +14,10 @@
   los retornos medios casi nunca empatan, así que en la práctica el orden (y
   el nombre) sale solo del retorno medio. Como la feature de retorno es el
   retorno acumulado de las últimas ``regime.features.smoothing_window`` velas
-  (decisión del usuario), ese orden refleja la tendencia del día y no una vela
-  suelta; ``return_window`` lo vuelve a pasar a retorno por vela para mostrarlo.
+  (decisión del usuario), ese orden refleja la tendencia de esas velas (el día
+  en el régimen de 1 hora; unas tres semanas y media en el diario) y no una
+  vela suelta; ``return_window`` lo vuelve a pasar a retorno por vela para
+  mostrarlo.
 
 - ``stationary_distribution(transmat)``: distribución estacionaria de la cadena
   (la fracción de tiempo que, a la larga, se pasa en cada estado). Es la

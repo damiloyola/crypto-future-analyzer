@@ -407,6 +407,9 @@ def test_every_covariance_type_filters_like_hmmlearn(settings, covariance_type):
             "n_restarts": 1,
             "max_iter": 20,
             "min_training_samples": 100,
+            # X ya son las features (sin suavizar): si no, el retorno medio por
+            # vela de cada estado saldría dividido por 24.
+            "features": settings.regime.features.model_copy(update={"smoothing_window": 1}),
         }
     )
     model = train_regime_model(X, index, "BTC", "1h", cfg)

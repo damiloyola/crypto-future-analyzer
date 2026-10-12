@@ -134,7 +134,7 @@ def test_hand_computed_values():
     low = [99.0, 100.0, 98.0, 98.0, 108.0, 107.9]
     df = candles_from(close, volume, high, low)
 
-    out = compute_features(df, realized_vol_window=2, volume_zscore_window=3)
+    out = compute_features(df, realized_vol_window=2, volume_zscore_window=3, smoothing_window=1)
 
     assert list(out.columns) == list(FEATURE_COLUMNS)
     assert out.index.equals(df.index)
@@ -166,10 +166,10 @@ def test_hand_computed_values():
 def test_constant_returns_give_exactly_zero_volatility():
     close = [100.0 * 1.01**i for i in range(10)]  # retorno constante (salvo redondeo)
     flat = [50.0] * 10  # precio quieto: retorno exactamente 0
-    out_flat = compute_features(candles_from(flat, [1.0] * 10), 3, 2)
+    out_flat = compute_features(candles_from(flat, [1.0] * 10), 3, 2, smoothing_window=1)
     assert (out_flat["realized_vol"].iloc[3:] == 0.0).all()
     assert (out_flat["log_return"].iloc[1:] == 0.0).all()
-    out_growth = compute_features(candles_from(close, [1.0] * 10), 3, 2)
+    out_growth = compute_features(candles_from(close, [1.0] * 10), 3, 2, smoothing_window=1)
     assert np.all(out_growth["realized_vol"].iloc[3:].to_numpy() < 1e-12)
 
 
@@ -177,7 +177,7 @@ def test_constant_returns_give_exactly_zero_volatility():
 @pytest.mark.parametrize("seed", SEEDS)
 def test_matches_naive_reference(seed: int, freq: str):
     df = random_walk_candles(seed, n=400, freq=freq)
-    out = compute_features(df, realized_vol_window=24, volume_zscore_window=168)
+    out = compute_features(df, realized_vol_window=24, volume_zscore_window=168, smoothing_window=1)
     expected = np.asarray(naive_features(df, 24, 168), dtype=float)
     np.testing.assert_allclose(out.to_numpy(), expected, rtol=TOL, atol=TOL)
 
@@ -188,9 +188,9 @@ def test_matches_naive_reference(seed: int, freq: str):
 @pytest.mark.parametrize(("rv_window", "vz_window"), [(24, 168), (3, 5), (2, 2)])
 def test_prefix_gives_exactly_the_same_values(rv_window: int, vz_window: int):
     df = random_walk_candles(3, n=300)
-    full = compute_features(df, rv_window, vz_window).to_numpy()
+    full = compute_features(df, rv_window, vz_window, smoothing_window=1).to_numpy()
     for k in range(0, len(df) + 1):
-        prefix = compute_features(df.iloc[:k], rv_window, vz_window).to_numpy()
+        prefix = compute_features(df.iloc[:k], rv_window, vz_window, smoothing_window=1).to_numpy()
         assert prefix.shape == (k, len(FEATURE_COLUMNS))
         # Igualdad exacta (bit a bit), con los NaN en las mismas posiciones.
         assert np.array_equal(prefix, full[:k], equal_nan=True), f"cambió con k={k}"
@@ -198,7 +198,7 @@ def test_prefix_gives_exactly_the_same_values(rv_window: int, vz_window: int):
 
 def test_future_rows_do_not_change_the_past():
     df = random_walk_candles(11, n=400)
-    base = compute_features(df).to_numpy()
+    base = compute_features(df, smoothing_window=1).to_numpy()
     rng = np.random.default_rng(0)
     for k in (1, 24, 25, 167, 168, 169, 250, 399):
         altered = df.copy()
@@ -208,15 +208,15 @@ def test_future_rows_do_not_change_the_past():
             1 + rng.random((len(future), 1))
         )
         altered.loc[future, "volume"] *= 100.0
-        out = compute_features(altered).to_numpy()
+        out = compute_features(altered, smoothing_window=1).to_numpy()
         assert np.array_equal(out[:k], base[:k], equal_nan=True), f"cambió con k={k}"
 
 
 def test_does_not_modify_input():
     df = random_walk_candles(5, n=200)
     snapshot = df.copy(deep=True)
-    compute_features(df)
-    feature_matrix(df)
+    compute_features(df, smoothing_window=1)
+    feature_matrix(df, smoothing_window=1)
     pd.testing.assert_frame_equal(df, snapshot)
 
 
@@ -228,9 +228,9 @@ def test_does_not_modify_input():
     [(24, 168, 167), (2, 2, 2), (10, 5, 10), (5, 10, 9), (24, 25, 24), (24, 26, 25)],
 )
 def test_warmup_length(rv_window: int, vz_window: int, expected: int):
-    assert warmup_bars(rv_window, vz_window) == expected
+    assert warmup_bars(rv_window, vz_window, smoothing_window=1) == expected
     df = random_walk_candles(2, n=300)
-    out = compute_features(df, rv_window, vz_window)
+    out = compute_features(df, rv_window, vz_window, smoothing_window=1)
     assert leading_nan_rows(out) == expected
     assert np.isfinite(out.iloc[expected:].to_numpy()).all()
     assert out["log_return"].isna().sum() == 1
@@ -241,27 +241,27 @@ def test_warmup_length(rv_window: int, vz_window: int, expected: int):
 
 def test_warmup_matches_config(settings: AppSettings):
     cfg = settings.regime.features
-    assert warmup_bars(cfg.realized_vol_window, cfg.volume_zscore_window) == max(
-        cfg.realized_vol_window, cfg.volume_zscore_window - 1
-    )
+    assert warmup_bars(
+        cfg.realized_vol_window, cfg.volume_zscore_window, smoothing_window=1
+    ) == max(cfg.realized_vol_window, cfg.volume_zscore_window - 1)
 
 
 def test_shorter_than_warmup_is_all_nan():
     df = random_walk_candles(4, n=30)
-    out = compute_features(df, 24, 168)
+    out = compute_features(df, 24, 168, smoothing_window=1)
     assert out["realized_vol"].isna().sum() == 24
     assert out["volume_z"].isna().all()
-    X, index = feature_matrix(df, 24, 168)
+    X, index = feature_matrix(df, 24, 168, smoothing_window=1)
     assert X.shape == (0, len(FEATURE_COLUMNS))
     assert len(index) == 0
 
 
 def test_empty_frame():
     df = random_walk_candles(4, n=1).iloc[:0]
-    out = compute_features(df)
+    out = compute_features(df, smoothing_window=1)
     assert out.shape == (0, len(FEATURE_COLUMNS))
     assert list(out.columns) == list(FEATURE_COLUMNS)
-    X, index = feature_matrix(df)
+    X, index = feature_matrix(df, smoothing_window=1)
     assert X.shape == (0, len(FEATURE_COLUMNS))
     assert isinstance(index, pd.DatetimeIndex)
 
@@ -272,7 +272,7 @@ def test_empty_frame():
 def test_zero_volume_window_gives_zero_z():
     n = 12
     df = candles_from([100.0 + i for i in range(n)], [0.0] * n)
-    out = compute_features(df, realized_vol_window=2, volume_zscore_window=4)
+    out = compute_features(df, realized_vol_window=2, volume_zscore_window=4, smoothing_window=1)
     z = out["volume_z"].to_numpy()
     assert np.isnan(z[:3]).all()
     assert (z[3:] == 0.0).all()
@@ -281,7 +281,7 @@ def test_zero_volume_window_gives_zero_z():
 def test_constant_volume_window_gives_zero_z():
     n = 12
     df = candles_from([100.0] * n, [1234.5] * n)
-    out = compute_features(df, realized_vol_window=2, volume_zscore_window=5)
+    out = compute_features(df, realized_vol_window=2, volume_zscore_window=5, smoothing_window=1)
     assert (out["volume_z"].iloc[4:] == 0.0).all()
 
 
@@ -290,12 +290,16 @@ def test_spike_after_constant_volume():
     window = 6
     volume = [10.0] * 8 + [500.0]
     df = candles_from([100.0] * len(volume), volume)
-    out = compute_features(df, realized_vol_window=2, volume_zscore_window=window)
+    out = compute_features(
+        df, realized_vol_window=2, volume_zscore_window=window, smoothing_window=1
+    )
     assert out["volume_z"].iloc[-1] == pytest.approx((window - 1) / math.sqrt(window), rel=1e-12)
     assert (out["volume_z"].iloc[window - 1 : -1] == 0.0).all()
     # Y una vela sin volumen tras volumen constante da el mínimo posible.
     volume_drop = [10.0] * 8 + [0.0]
-    out_drop = compute_features(candles_from([100.0] * 9, volume_drop), 2, window)
+    out_drop = compute_features(
+        candles_from([100.0] * 9, volume_drop), 2, window, smoothing_window=1
+    )
     assert out_drop["volume_z"].iloc[-1] == pytest.approx(
         -(window - 1) / math.sqrt(window), rel=1e-12
     )
@@ -304,7 +308,7 @@ def test_spike_after_constant_volume():
 def test_trading_resumes_after_zero_volume():
     volume = [0.0] * 6 + [5.0, 7.0, 6.0, 8.0]
     df = candles_from([100.0 + i for i in range(len(volume))], volume)
-    out = compute_features(df, realized_vol_window=2, volume_zscore_window=4)
+    out = compute_features(df, realized_vol_window=2, volume_zscore_window=4, smoothing_window=1)
     z = out["volume_z"].to_numpy()
     assert np.isfinite(z[3:]).all()
     assert z[6] > 0  # primera vela con volumen: muy por encima de lo habitual
@@ -318,9 +322,9 @@ def test_feature_matrix_drops_exactly_the_warmup(settings: AppSettings, freq: st
     cfg = settings.regime.features
     rv, vz = cfg.realized_vol_window, cfg.volume_zscore_window
     df = random_walk_candles(9, n=450, freq=freq)
-    warm = warmup_bars(rv, vz)
+    warm = warmup_bars(rv, vz, smoothing_window=1)
 
-    X, index = feature_matrix(df, rv, vz)
+    X, index = feature_matrix(df, rv, vz, smoothing_window=1)
 
     assert X.dtype == np.float64
     assert X.shape == (len(df) - warm, len(FEATURE_COLUMNS))
@@ -328,7 +332,7 @@ def test_feature_matrix_drops_exactly_the_warmup(settings: AppSettings, freq: st
     assert np.isfinite(X).all()
     assert isinstance(index, pd.DatetimeIndex)
     assert index.equals(df.index[warm:])
-    full = compute_features(df, rv, vz).to_numpy()
+    full = compute_features(df, rv, vz, smoothing_window=1).to_numpy()
     assert np.array_equal(X, full[warm:])
     expected = np.asarray(naive_features(df, rv, vz), dtype=float)[warm:]
     np.testing.assert_allclose(X, expected, rtol=TOL, atol=TOL)
@@ -336,7 +340,7 @@ def test_feature_matrix_drops_exactly_the_warmup(settings: AppSettings, freq: st
 
 def test_feature_matrix_daily_index_is_daily():
     df = random_walk_candles(8, n=260, freq="1D")
-    X, index = feature_matrix(df, 24, 168)
+    X, index = feature_matrix(df, 24, 168, smoothing_window=1)
     assert len(X) == 260 - 167
     assert (index.to_series().diff().dropna() == pd.Timedelta(days=1)).all()
     assert str(index.tz) == "UTC"
@@ -344,7 +348,7 @@ def test_feature_matrix_daily_index_is_daily():
 
 def test_accepts_frame_without_closed_column():
     df = random_walk_candles(6, n=200).drop(columns=["closed", "open"])
-    X, _ = feature_matrix(df, 24, 168)
+    X, _ = feature_matrix(df, 24, 168, smoothing_window=1)
     assert X.shape == (200 - 167, 4)
 
 
@@ -354,9 +358,9 @@ def test_accepts_frame_without_closed_column():
 def test_missing_columns_raise():
     df = random_walk_candles(1, n=50).drop(columns=["volume", "low"])
     with pytest.raises(ValueError, match="faltan columnas.*low.*volume"):
-        feature_matrix(df)
+        feature_matrix(df, smoothing_window=1)
     with pytest.raises(ValueError, match="faltan columnas"):
-        compute_features(df)
+        compute_features(df, smoothing_window=1)
 
 
 @pytest.mark.parametrize("col", ["close", "high", "low"])
@@ -365,7 +369,7 @@ def test_invalid_prices_raise(col: str, bad: float):
     df = random_walk_candles(1, n=50)
     df.loc[df.index[10], col] = bad
     with pytest.raises(ValueError, match="precios"):
-        feature_matrix(df)
+        feature_matrix(df, smoothing_window=1)
 
 
 @pytest.mark.parametrize("bad", [-1.0, math.nan, math.inf])
@@ -373,35 +377,35 @@ def test_invalid_volume_raises(bad: float):
     df = random_walk_candles(1, n=50)
     df.loc[df.index[10], "volume"] = bad
     with pytest.raises(ValueError, match="volume"):
-        compute_features(df)
+        compute_features(df, smoothing_window=1)
 
 
 def test_unclosed_candle_raises():
     df = random_walk_candles(1, n=50)
     df.loc[df.index[-1], "closed"] = False
     with pytest.raises(ValueError, match="sin cerrar"):
-        compute_features(df)
+        compute_features(df, smoothing_window=1)
 
 
 def test_index_must_be_sorted_unique_datetime():
     df = random_walk_candles(1, n=50)
     with pytest.raises(ValueError, match="ordenadas"):
-        compute_features(df.iloc[::-1])
+        compute_features(df.iloc[::-1], smoothing_window=1)
     with pytest.raises(ValueError, match="repetidas"):
-        compute_features(pd.concat([df.iloc[:10], df.iloc[9:]]))
+        compute_features(pd.concat([df.iloc[:10], df.iloc[9:]]), smoothing_window=1)
     with pytest.raises(ValueError, match="índice de fechas"):
-        compute_features(df.reset_index(drop=True))
+        compute_features(df.reset_index(drop=True), smoothing_window=1)
 
 
 @pytest.mark.parametrize("bad", [1, 0, -3, 2.5, True, "24"])
 def test_invalid_windows_raise(bad: object):
     df = random_walk_candles(1, n=50)
     with pytest.raises(ValueError, match="realized_vol_window"):
-        compute_features(df, realized_vol_window=bad)  # type: ignore[arg-type]
+        compute_features(df, realized_vol_window=bad, smoothing_window=1)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="volume_zscore_window"):
-        feature_matrix(df, volume_zscore_window=bad)  # type: ignore[arg-type]
+        feature_matrix(df, volume_zscore_window=bad, smoothing_window=1)  # type: ignore[arg-type]
     with pytest.raises(ValueError):
-        warmup_bars(bad, 168)  # type: ignore[arg-type]
+        warmup_bars(bad, 168, smoothing_window=1)  # type: ignore[arg-type]
 
 
 # --- suavizado (decisión del usuario: resumen de las últimas 24 velas) --------
@@ -429,38 +433,64 @@ def test_smoothed_values_match_definition(sm: int):
 
 def test_smoothing_one_is_the_literal_spec():
     df = random_walk_candles(3, n=300)
-    pd.testing.assert_frame_equal(
-        compute_features(df, 24, 168), compute_features(df, 24, 168, smoothing_window=1)
-    )
+    out = compute_features(df, 24, 168, smoothing_window=1)
+    close = df["close"].to_numpy()
+    np.testing.assert_allclose(out["log_return"].iloc[1:], np.log(close[1:] / close[:-1]))
+    raw_range = (df["high"] - df["low"]) / df["close"]
+    np.testing.assert_allclose(out["range_pct"], raw_range, rtol=1e-15)
+
+
+def test_smoothing_window_has_no_default():
+    # Regresión: el valor por omisión era 1 (sin suavizar) mientras la config y los
+    # modelos guardados usan 24. Un modelo suavizado aceptaba esas features sin
+    # protestar y el estado más probable coincidía con el correcto en ~8 % de las
+    # velas. Ahora hay que decir siempre el suavizado, por nombre.
+    df = random_walk_candles(3, n=300)
+    with pytest.raises(TypeError, match="smoothing_window"):
+        compute_features(df, 24, 168)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="smoothing_window"):
+        feature_matrix(df)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="smoothing_window"):
+        warmup_bars(24, 168)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        warmup_bars(24, 168, 24)  # type: ignore[misc]  # ni en posición
 
 
 @pytest.mark.parametrize(("rv", "vz", "sm"), [(24, 168, 24), (24, 168, 1), (5, 3, 8), (10, 4, 2)])
 def test_smoothed_warmup_and_causality(rv: int, vz: int, sm: int):
     df = random_walk_candles(5, n=320)
-    full = compute_features(df, rv, vz, sm)
-    warm = warmup_bars(rv, vz, sm)
+    full = compute_features(df, rv, vz, smoothing_window=sm)
+    warm = warmup_bars(rv, vz, smoothing_window=sm)
     assert leading_nan_rows(full) == warm
     assert np.isfinite(full.iloc[warm:].to_numpy()).all()
     # Causal: calcular sobre un prefijo da exactamente lo mismo, bit a bit.
     for k in (1, warm - 1, warm, warm + 1, 250, 320):
         if k < 1:
             continue
-        pd.testing.assert_frame_equal(compute_features(df.iloc[:k], rv, vz, sm), full.iloc[:k])
+        pd.testing.assert_frame_equal(
+            compute_features(df.iloc[:k], rv, vz, smoothing_window=sm), full.iloc[:k]
+        )
     # Cambiar el futuro no cambia el pasado.
     changed = df.copy()
     changed.iloc[200:, changed.columns.get_loc("close")] *= 3.0
     changed.iloc[200:, changed.columns.get_loc("high")] *= 3.0
     changed.iloc[200:, changed.columns.get_loc("low")] *= 3.0
     changed.iloc[200:, changed.columns.get_loc("volume")] *= 50.0
-    pd.testing.assert_frame_equal(compute_features(changed, rv, vz, sm).iloc[:200], full.iloc[:200])
+    pd.testing.assert_frame_equal(
+        compute_features(changed, rv, vz, smoothing_window=sm).iloc[:200], full.iloc[:200]
+    )
 
 
 def test_feature_matrix_with_config_smoothing(settings: AppSettings):
     f = settings.regime.features
     assert f.smoothing_window == 24  # decisión del usuario
     df = random_walk_candles(9, n=600)
-    X, index = feature_matrix(df, f.realized_vol_window, f.volume_zscore_window, f.smoothing_window)
-    warm = warmup_bars(f.realized_vol_window, f.volume_zscore_window, f.smoothing_window)
+    X, index = feature_matrix(
+        df, f.realized_vol_window, f.volume_zscore_window, smoothing_window=f.smoothing_window
+    )
+    warm = warmup_bars(
+        f.realized_vol_window, f.volume_zscore_window, smoothing_window=f.smoothing_window
+    )
     assert warm == 190
     assert X.shape == (600 - warm, 4) and index.equals(df.index[warm:])
 

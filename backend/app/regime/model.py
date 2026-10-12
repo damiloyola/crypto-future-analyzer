@@ -233,7 +233,10 @@ def train_regime_model(
 
     ``X_raw``: features crudas (sin estandarizar), una fila por vela cerrada y
     columnas en el orden de ``FEATURE_COLUMNS`` (o un DataFrame con esas
-    columnas). ``index``: la hora de apertura de cada fila (UTC, creciente).
+    columnas), armadas con las ventanas de ``regime_cfg.features`` (el modelo
+    no puede comprobarlo: el retorno medio por vela de cada estado se calcula
+    dividiendo por ``regime_cfg.features.smoothing_window``).
+    ``index``: la hora de apertura de cada fila (UTC, creciente).
     Lanza ``RegimeTrainingError`` si los datos no alcanzan o ningún ajuste sirve,
     y ``ValueError`` si ``timeframe`` no es ni el del régimen ni el de contexto.
     """
@@ -336,8 +339,8 @@ def train_regime_model(
         )
     if chosen_n == regime_cfg.n_states_max and regime_cfg.n_states_max > regime_cfg.n_states_min:
         notes.append(
-            f"El BIC eligió el máximo de estados permitido ({chosen_n}); es lo habitual con "
-            "tanta historia y no es un problema."
+            f"El BIC eligió el máximo de estados permitido ({chosen_n}); ese tope se eligió a "
+            "propósito (regime.n_states_max), así que no es un problema."
         )
 
     labels_for_n = regime_cfg.labels.get(chosen_n)

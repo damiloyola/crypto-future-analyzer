@@ -360,7 +360,11 @@ def test_max_states_choice_is_noted(small_cfg):
     X, _ = sample_source(3, 1500, seed=15)
     model = train_regime_model(X, hourly_index(len(X)), "BTC", "1h", cfg)
     assert model.n_states == 3
-    assert any("máximo de estados permitido" in n and "no es un problema" in n for n in model.notes)
+    note = next(n for n in model.notes if "máximo de estados permitido" in n)
+    assert "no es un problema" in note
+    # Regresión: decía "es lo habitual con tanta historia" también en modelos con el
+    # aviso de que se entrenaron con poca historia.
+    assert "historia" not in note
 
 
 # --- parámetros libres y huella de config -------------------------------------

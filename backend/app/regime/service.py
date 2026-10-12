@@ -84,9 +84,11 @@ Qué cuenta como "cambio" (``regime.change_level``)
   ``instability_window`` velas) miran la **categoría** (crash, bajista,
   neutral, alcista, euforia). La categoría cruda de cada vela es la de mayor
   probabilidad sumada entre sus estados. El nombre que se muestra es el del
-  estado más probable dentro de la categoría vigente (por ejemplo "Alcista
-  fuerte" dentro de "alcista"). Pasar de "Alcista" a "Alcista fuerte" no es un
-  cambio.
+  estado más probable dentro de la categoría vigente. Con hasta 5 estados
+  (``regime.n_states_max: 5``, decisión del usuario) cada categoría es un solo
+  estado y da lo mismo que ``"state"``. La diferencia aparece solo si se sube
+  el máximo y hay variantes del mismo tipo (``regime.labels`` de 6 o 7, por
+  ejemplo "Bajista fuerte" y "Bajista"): pasar de una a otra no es un cambio.
 - ``"state"``: todo mira el estado del HMM.
 
 Mientras no hay ningún régimen confirmado (arranque), se informa el crudo con
@@ -387,14 +389,18 @@ async def _fetch_closed(
 def _features(df: pd.DataFrame, regime_cfg: RegimeConfig) -> tuple[np.ndarray, pd.DatetimeIndex]:
     f = regime_cfg.features
     try:
-        return feature_matrix(df, f.realized_vol_window, f.volume_zscore_window, f.smoothing_window)
+        return feature_matrix(
+            df, f.realized_vol_window, f.volume_zscore_window, smoothing_window=f.smoothing_window
+        )
     except ValueError as exc:
         raise RegimeUnavailable(f"las velas recibidas tienen datos inválidos: {exc}") from exc
 
 
 def _warmup(regime_cfg: RegimeConfig) -> int:
     f = regime_cfg.features
-    return warmup_bars(f.realized_vol_window, f.volume_zscore_window, f.smoothing_window)
+    return warmup_bars(
+        f.realized_vol_window, f.volume_zscore_window, smoothing_window=f.smoothing_window
+    )
 
 
 # --- modelo ----------------------------------------------------------------------
@@ -865,6 +871,7 @@ class RegimeBar:
     state_category: str
     state_prob: float  # su probabilidad filtrada (0-1)
     regime: str | None  # régimen vigente (confirmado), None en el arranque
+    regime_rank: int | None  # rango del estado que le da nombre (0 = el más bajista)
     category: str | None
     confidence: float  # confianza: probabilidad del estado más probable (= state_prob)
     regime_prob: float | None  # probabilidad del régimen vigente (None en el arranque)
@@ -925,24 +932,43 @@ class RegimeReport:
     def history_summary(self) -> dict[str, Any] | None:
         """Resumen de la historia mostrada: cuántas veces cambió y qué tan estable fue.
 
-        ``regime_changes`` cuenta cambios del régimen vigente (de tipo o de estado
-        según ``change_level``), ``avg_regime_hours`` es la duración media de cada
-        tramo, ``unstable_pct`` y ``low_confidence_pct`` el % de velas inestables y
-        con confianza debajo del umbral. Sirve para ver de un vistazo si el
-        régimen se comporta bien con datos reales. ``None`` sin historia.
+        - ``regime_changes``: cambios del régimen **confirmado** (de tipo o de
+          estado según ``change_level``; en ``"state"`` se compara el estado y no
+          el nombre, por si dos estados se llaman igual en ``regime.labels``).
+        - ``completed_stretches`` y ``avg_regime_hours``: cuántos tramos
+          **completos** hubo (empezaron y terminaron dentro de la historia) y su
+          duración media en horas. El primer tramo y el actual quedan cortados
+          por la ventana, así que no cuentan: con 0 o 1 cambio no hay ninguno
+          completo y ``avg_regime_hours`` es ``None`` (nunca se presenta la
+          ventana como si fuera la duración de un régimen).
+        - ``unstable_pct`` y ``low_confidence_pct``: % de velas inestables y con
+          confianza debajo del umbral.
+
+        Sirve para ver de un vistazo si el régimen se comporta bien con datos
+        reales. ``None`` sin historia.
         """
         bars = self.history
         if not bars:
             return None
-        labels = [b.category if self.change_level == "category" else b.regime for b in bars]
-        known = [lb for lb in labels if lb is not None]
-        changes = sum(1 for a, b in zip(known, known[1:], strict=False) if a != b)
-        hours = len(bars) * self.timeframe_minutes / 60.0
+        by_category = self.change_level == "category"
+        change_at: list[int] = []  # velas en las que se confirmó un régimen distinto
+        previous: Hashable | None = None
+        for i, b in enumerate(bars):
+            key = b.category if by_category else b.regime_rank
+            if key is None:
+                continue
+            if previous is not None and key != previous:
+                change_at.append(i)
+            previous = key
+        bar_hours = self.timeframe_minutes / 60.0
+        stretches = [(b - a) * bar_hours for a, b in zip(change_at, change_at[1:], strict=False)]
+        hours = len(bars) * bar_hours
         return {
             "bars": len(bars),
             "days": hours / 24.0,
-            "regime_changes": changes,
-            "avg_regime_hours": hours / (changes + 1),
+            "regime_changes": len(change_at),
+            "completed_stretches": len(stretches),
+            "avg_regime_hours": sum(stretches) / len(stretches) if stretches else None,
             "unstable_pct": 100.0 * sum(b.unstable for b in bars) / len(bars),
             "low_confidence_pct": 100.0
             * sum(b.confidence < self.low_confidence_threshold for b in bars)
@@ -1029,6 +1055,7 @@ class RegimeReport:
                     "state_category": b.state_category,
                     "state_prob": b.state_prob,
                     "regime": b.regime,
+                    "regime_rank": b.regime_rank,
                     "category": b.category,
                     "confidence": b.confidence,
                     "regime_prob": b.regime_prob,
@@ -1194,8 +1221,9 @@ def build_report(
         warnings.append(
             RegimeWarning(
                 "unstable",
-                f"Régimen inestable: {summary.changes_in_window} cambios en las últimas "
-                f"{_velas(cfg.instability_window)} (el límite es "
+                f"Régimen inestable: el {'tipo' if level == 'category' else 'estado'} más "
+                f"probable cambió {_plural(summary.changes_in_window, 'vez', 'veces')} en las "
+                f"últimas {_velas(cfg.instability_window)} (el límite es "
                 f"{cfg.instability_max_changes}). Conviene operar más chico.",
             )
         )
@@ -1243,6 +1271,7 @@ def build_report(
                 state_category=raw.category,
                 state_prob=bc.raw_state_prob[t],
                 regime=None if shown is None else states[shown].name,
+                regime_rank=None if shown is None else states[shown].rank,
                 category=None if conf_label is None else _label_category(conf_label, level, states),
                 confidence=bc.confidence[t],
                 regime_prob=bc.regime_prob[t],

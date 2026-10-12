@@ -191,10 +191,10 @@ class RegimeConfig(_Strict):
     inference_days: int = Field(45, ge=2)
     context_inference_days: int = Field(400, ge=30)
     display_days: int = Field(30, ge=1)
-    burn_in_bars: int = Field(50, ge=0)
+    burn_in_bars: int = Field(100, ge=0)
     features: RegimeFeaturesConfig
     n_states_min: int = 3
-    n_states_max: int = 7
+    n_states_max: int = 5
     selection_criterion: Literal["bic"] = "bic"
     covariance_type: Literal["full", "diag", "spherical", "tied"] = "full"
     n_restarts: int = Field(5, ge=1)

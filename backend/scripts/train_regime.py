@@ -166,7 +166,7 @@ def render_status(
     warm = warmup_bars(
         cfg.features.realized_vol_window,
         cfg.features.volume_zscore_window,
-        cfg.features.smoothing_window,
+        smoothing_window=cfg.features.smoothing_window,
     )
     if status.candles_downloaded is not None:
         candles = (

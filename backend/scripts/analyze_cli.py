@@ -913,6 +913,39 @@ def render_regime_states(
     )
 
 
+def _hours_text(hours: float) -> str:
+    return f"{fmt_num(hours / 24, 1)} días" if hours >= 72 else f"{fmt_num(hours, 0)} h"
+
+
+def _history_summary_text(hs: dict[str, Any], g: dict[str, Any]) -> str:
+    """Texto de la fila "Últimos N días": cambios de régimen confirmados y tramos completos.
+
+    El primer tramo y el actual quedan cortados por la ventana, así que la
+    duración solo se informa con tramos completos (2 cambios o más). Con 0
+    cambios el régimen actual viene de antes de la ventana (ver "Empezó"); con 1,
+    ese cambio es el que dio inicio al actual.
+    """
+    n = hs["regime_changes"]
+    if n == 0:
+        text = "ningún cambio de régimen confirmado"
+        if g.get("confirmed"):
+            text += " (el actual ya venía de antes)"
+    elif n == 1:
+        text = "1 cambio de régimen confirmado (el que dio inicio al actual)"
+    else:
+        complete = hs["completed_stretches"]
+        avg = _hours_text(hs["avg_regime_hours"])
+        if complete == 1:
+            detail = f"el tramo completo entre los dos duró ~{avg}"
+        else:
+            detail = f"los {complete} tramos completos duraron ~{avg} en promedio"
+        text = f"{n} cambios de régimen confirmados ({detail})"
+    return (
+        f"{text}; inestable el {fmt_num(hs['unstable_pct'], 0)} % del tiempo; confianza baja "
+        f"el {fmt_num(hs['low_confidence_pct'], 0)} %"
+    )
+
+
 def _render_one_regime(tf: str, g: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
     role = "contexto diario" if g.get("is_context") else "el que se usa para operar"
     lines = ["", style.paint(f"  {tf} · {role}", "bold")]
@@ -968,33 +1001,26 @@ def _render_one_regime(tf: str, g: dict[str, Any], style: Style, tz: ZoneInfo) -
         )
     window, limit = g["instability_window"], g["instability_max_changes"]
     changes = g["changes_in_window"]
-    word = "cambio" if changes == 1 else "cambios"
+    # "Estabilidad" cuenta cambios del tipo (o estado) MÁS PROBABLE vela a vela;
+    # "Últimos N días", cambios del régimen CONFIRMADO. Son cosas distintas (un
+    # tipo que aparece una o dos velas cuenta acá pero no se confirma), así que
+    # se dicen con palabras distintas para que no parezca una contradicción.
+    kind = "tipo" if g.get("change_level", "category") == "category" else "estado"
+    moved = f"el {kind} más probable cambió {changes} {'vez' if changes == 1 else 'veces'}"
     if g["unstable"]:
         stability = Cell(
-            f"RÉGIMEN INESTABLE: {changes} {word} en las últimas {window} velas (más de "
+            f"RÉGIMEN INESTABLE: {moved} en las últimas {window} velas (más de "
             f"{limit}); conviene operar más chico",
             "alert",
         )
     else:
         stability = Cell(
-            f"estable: {changes} {word} en las últimas {window} velas (inestable si son más "
-            f"de {limit})"
+            f"estable: {moved} en las últimas {window} velas (inestable si son más de {limit})"
         )
     rows.append(("Estabilidad", stability))
     hs = g.get("history_summary")
     if hs:
-        n = hs["regime_changes"]
-        every = hs["avg_regime_hours"]
-        every_text = f"{fmt_num(every / 24, 1)} días" if every >= 72 else f"{fmt_num(every, 0)} h"
-        rows.append(
-            (
-                f"Últimos {fmt_num(hs['days'], 0)} días",
-                f"{n} {'cambio' if n == 1 else 'cambios'} de régimen "
-                f"(cada tramo dura ~{every_text}); "
-                f"inestable el {fmt_num(hs['unstable_pct'], 0)} % del tiempo; confianza baja el "
-                f"{fmt_num(hs['low_confidence_pct'], 0)} %",
-            )
-        )
+        rows.append((f"Últimos {fmt_num(hs['days'], 0)} días", _history_summary_text(hs, g)))
     m = g["model"]
     model_text = (
         f"del {fmt_time(m['trained_at'], tz)}, {m['n_states']} estados (elegidos por BIC), "

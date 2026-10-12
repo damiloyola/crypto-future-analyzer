@@ -618,7 +618,9 @@ def test_regime_section_shows_both_timeframes(btc_text, btc_json):
     block = _regime_block(btc_text)
     assert "1h · el que se usa para operar" in block
     assert "1d · contexto diario" in block
-    assert "Últimos " in block and "cambios de régimen" in block or "cambio de régimen" in block
+    # Regresión: la aserción era ``A and B or C`` y pasaba aunque faltara "Últimos".
+    assert block.count("Últimos 30 días") == 2
+    assert block.count("de régimen confirmado") == 2
     for label in ("Régimen actual", "Confianza", "Empezó", "Estabilidad", "Modelo"):
         assert block.count(label) == 2, label
     assert "Retorno medio por vela" in block and "% del tiempo" in block
@@ -656,6 +658,7 @@ def test_regime_json_structure(btc_json):
             "bars",
             "days",
             "regime_changes",
+            "completed_stretches",
             "avg_regime_hours",
             "unstable_pct",
             "low_confidence_pct",
@@ -751,6 +754,55 @@ def test_confidence_row_names_the_top_state_when_it_is_not_the_regime(btc_json):
     text = "\n".join(analyze_cli._render_one_regime("1h", g, style, tz))
     line = next(x for x in text.splitlines() if "Confianza" in x)
     assert line.rstrip().endswith("40 % (baja: menos de 60 %)")
+
+
+_UTC = analyze_cli._tz("UTC")
+
+
+def _summary_row(g: dict, **summary) -> str:
+    g = dict(g)
+    g["history_summary"] = {
+        "bars": 720,
+        "days": 30.0,
+        "unstable_pct": 0.0,
+        "low_confidence_pct": 0.0,
+        **summary,
+    }
+    text = "\n".join(analyze_cli._render_one_regime("1h", g, analyze_cli.Style(False), _UTC))
+    return next(x for x in text.splitlines() if "Últimos 30 días" in x)
+
+
+def test_history_summary_row_never_presents_the_window_as_a_duration(btc_json):
+    # Regresión: sin cambios decía "cada tramo dura ~30,0 días" (la ventana misma)
+    # al lado de "Empezó hace 43 días"; con 1 cambio promediaba dos tramos cortados.
+    g = dict(btc_json["regime"]["1h"], confirmed=True)
+    none = _summary_row(g, regime_changes=0, completed_stretches=0, avg_regime_hours=None)
+    assert "ningún cambio de régimen confirmado (el actual ya venía de antes)" in none
+    assert "dura" not in none and "duró" not in none
+    one = _summary_row(g, regime_changes=1, completed_stretches=0, avg_regime_hours=None)
+    assert "1 cambio de régimen confirmado (el que dio inicio al actual)" in one
+    assert "dura" not in one and "duró" not in one
+    two = _summary_row(g, regime_changes=2, completed_stretches=1, avg_regime_hours=30.0)
+    assert "2 cambios de régimen confirmados (el tramo completo entre los dos duró ~30 h)" in two
+    many = _summary_row(g, regime_changes=4, completed_stretches=3, avg_regime_hours=96.0)
+    assert "4 cambios de régimen confirmados (los 3 tramos completos duraron ~4,0 días" in many
+    assert LEAKS.search(none + one + two + many) is None
+
+
+def test_stability_row_does_not_read_like_the_confirmed_changes(btc_json):
+    # Regresión: "Estabilidad: 4 cambios en las últimas 20 velas" y justo abajo
+    # "Últimos 30 días: 0 cambios de régimen" parecía una contradicción. Una fila
+    # cuenta el tipo más probable vela a vela y la otra el régimen confirmado.
+    g = dict(btc_json["regime"]["1h"], changes_in_window=4, unstable=False)
+    text = "\n".join(analyze_cli._render_one_regime("1h", g, analyze_cli.Style(False), _UTC))
+    row = next(x for x in text.splitlines() if "Estabilidad" in x)
+    assert "el tipo más probable cambió 4 veces en las últimas 20 velas" in row
+    g.update(changes_in_window=1)
+    text = "\n".join(analyze_cli._render_one_regime("1h", g, analyze_cli.Style(False), _UTC))
+    assert "cambió 1 vez en las últimas" in text
+    g.update(change_level="state", changes_in_window=6, unstable=True)
+    text = "\n".join(analyze_cli._render_one_regime("1h", g, analyze_cli.Style(False), _UTC))
+    assert "RÉGIMEN INESTABLE: el estado más probable cambió 6 veces" in text
 
 
 def test_regime_candles_from_bybit_are_warned(monkeypatch, no_secrets, tracked_clients):

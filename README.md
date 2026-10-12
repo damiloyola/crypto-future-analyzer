@@ -103,8 +103,13 @@ las velas hasta ella (algoritmo forward; hay tests que lo verifican).
 
 Mira el **resumen de las últimas 24 velas** (cuánto subió o bajó, rango y
 volumen promedio, más la volatilidad), no cada vela suelta: así una vela
-grande no alcanza para declarar un "Crash" y cada régimen dura del orden de
-un día (decisión tuya; `regime.features.smoothing_window`, 1 = vela por vela).
+grande no alcanza para declarar un "Crash" y, en el régimen de 1 hora, cada
+régimen dura del orden de un día (decisión tuya;
+`regime.features.smoothing_window`, 1 = vela por vela). Ojo: el ajuste es uno
+solo para los dos timeframes, así que en el régimen diario de contexto las 24
+velas son **24 días**: mira la tendencia de las últimas tres semanas y media,
+cada régimen dura de 2 a 4 semanas y hacen falta 190 días de calentamiento
+(así lo elegiste: el diario da la foto grande y es solo informativo).
 
 ```bash
 make train-regime                              # todas las favoritas, 1 hora y diario
@@ -124,16 +129,20 @@ make cli SYMBOL=BTC ARGS="--no-regime"         # sin régimen (más rápido)
 - Qué muestra: régimen actual y si está confirmado (se mantuvo 3 velas
   seguidas) o hay un cambio en espera; confianza (la probabilidad del estado
   más probable en la última vela, "baja" si es menos de 60 %); "régimen
-  inestable" si hubo más de 4 cambios en las últimas 20 velas; hace cuánto
-  empezó; y una tabla por régimen con retorno medio por vela, volatilidad,
-  duración típica y % del tiempo. Avisa si el modelo es viejo, si se entrenó
-  con poca historia o si las velas vinieron de Bybit.
-- Resumen de los últimos 30 días: cuántas veces cambió el régimen, cuánto dura
-  cada tramo, % del tiempo "inestable" y % con confianza baja. Con datos de
-  prueba: un cambio cada ~33 h, inestable menos del 1 % del tiempo. Si con
-  datos reales sale muy distinto, avisame.
-- Para la inestabilidad solo cuentan los cambios de tipo (Neutral → Bajista),
-  no entre variantes del mismo tipo (`regime.change_level: category`).
+  inestable" si el tipo más probable cambió más de 4 veces en las últimas 20
+  velas; hace cuánto empezó; y una tabla por régimen con retorno medio por
+  vela, volatilidad, duración típica y % del tiempo. Avisa si el modelo es
+  viejo, si se entrenó con poca historia o si las velas vinieron de Bybit.
+- Resumen de los últimos 30 días: cuántas veces cambió el régimen confirmado,
+  cuánto duraron en promedio los tramos completos (los que empezaron y
+  terminaron dentro de los 30 días; con 0 o 1 cambio no hay ninguno y no se
+  muestra duración), % del tiempo "inestable" y % con confianza baja. Con
+  datos de prueba: un cambio cada ~33 h, inestable menos del 1 % del tiempo.
+  Si con datos reales sale muy distinto, avisame.
+- La confirmación y la inestabilidad cuentan cambios de tipo (Neutral →
+  Bajista; `regime.change_level: category`). Con hasta 5 estados cada tipo es
+  un solo estado, así que es lo mismo que contar cambios de estado (los
+  nombres para 6 y 7 estados de `regime.labels` hoy no se usan).
 - `make train-regime` termina con código 1 si alguna moneda no se pudo
   entrenar o reentrenar (en ese caso queda el modelo anterior y lo dice), y
   con 130 si lo cortás con Ctrl+C (sale enseguida y no guarda nada a medias).

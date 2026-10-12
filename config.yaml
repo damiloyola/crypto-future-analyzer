@@ -178,7 +178,10 @@ regime:
   inference_days: 45
   context_inference_days: 400
   display_days: 30             # historia del régimen que se muestra (fondo del gráfico, panel)
-  burn_in_bars: 50             # primeras velas del cálculo que se descartan (arranque del filtro)
+  # Primeras velas del cálculo que se descartan: el filtro tarda hasta ~55 velas
+  # en "olvidar" dónde arrancó (con 100 queda margen y siguen sobrando velas
+  # para mostrar 30 días).
+  burn_in_bars: 100
   features:
     realized_vol_window: 24    # velas para la volatilidad realizada
     volume_zscore_window: 168  # velas para el z-score del volumen (1 semana)
@@ -197,7 +200,7 @@ regime:
   random_seed: 42
   retrain_every_days: 7
   # true = si el modelo tiene más de retrain_every_days días, se reentrena solo
-  # antes de analizar (tarda menos de un minuto por moneda).
+  # antes de analizar (tarda alrededor de 1 minuto y cuarto por moneda).
   auto_retrain: true
   models_dir: "data/models"
   synthetic_models_dir: "data/models/sintetico"  # modo --offline: nunca pisa los reales
@@ -205,11 +208,13 @@ regime:
   instability_window: 20       # ventana para contar cambios de régimen
   instability_max_changes: 4   # más de 4 cambios en 20 velas = "régimen inestable"
   # Qué cuenta como "cambio" para confirmar e inestabilidad:
-  # "category" = solo cuando cambia el tipo (ej. Neutral → Bajista); pasar de
-  # "Alcista" a "Alcista fuerte" no cuenta. "state" = cualquier cambio de estado.
+  # "category" = solo cuando cambia el tipo (ej. Neutral → Bajista).
+  # "state" = cualquier cambio de estado. Con hasta 5 estados cada tipo es un
+  # solo estado, así que las dos opciones dan lo mismo.
   change_level: "category"
   # Nombres según cuántos estados elija el BIC, del más bajista al más alcista.
   # "category" es la categoría canónica que usan los ajustes de riesgo.
+  # Las listas de 6 y 7 solo se usan si subís n_states_max.
   labels:
     3:
       - {name: "Bajista", category: "bajista"}

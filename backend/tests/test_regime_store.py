@@ -49,6 +49,8 @@ def cfg(settings):
             "max_iter": 30,
             "min_training_samples": 200,
             "labels": labels,
+            # X ya son las features (sin suavizar).
+            "features": settings.regime.features.model_copy(update={"smoothing_window": 1}),
         }
     )
 

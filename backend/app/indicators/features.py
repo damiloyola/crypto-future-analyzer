@@ -29,10 +29,14 @@ Las cuatro features, en el orden de ``FEATURE_COLUMNS`` (con
 
 Por qué el suavizado (decisión del usuario, ``regime.features.smoothing_window``,
 24 por defecto): vela por vela, una sola vela grande ya parece un "Crash" o una
-"Euforia" y el régimen cambia cada pocas horas. Con el resumen de las últimas 24
-velas (cuánto subió o bajó en el día, rango y volumen promedio) el régimen
-describe el clima del día y dura del orden de un día. La volatilidad realizada
-ya es una medida de ventana y no se vuelve a suavizar.
+"Euforia" y el régimen cambia cada pocas horas. En el régimen de 1 hora, el
+resumen de las últimas 24 velas (cuánto subió o bajó en el día, rango y volumen
+promedio) hace que el régimen describa el clima del día y dure del orden de un
+día. La volatilidad realizada ya es una medida de ventana y no se vuelve a
+suavizar. Ojo: ``regime.features`` es uno solo para los dos timeframes, así que
+en el régimen diario de contexto las 24 velas son **24 días** (la tendencia de
+las últimas tres semanas y media), cada régimen dura del orden de 2 a 4 semanas
+y el calentamiento es de 190 días.
 
 Cada ventana se calcula por separado (media y desvío en dos pasadas sobre las
 velas de la ventana, sin sumas acumuladas), así no arrastra errores de redondeo
@@ -49,14 +53,19 @@ entrenamiento y aplicado igual hacia adelante.
 
 Funciones:
 
-- ``compute_features(df, realized_vol_window=24, volume_zscore_window=168,
-  smoothing_window=1)``: ``DataFrame`` con índice igual al de ``df`` y columnas
+- ``compute_features(df, realized_vol_window=24, volume_zscore_window=168, *,
+  smoothing_window)``: ``DataFrame`` con índice igual al de ``df`` y columnas
   ``FEATURE_COLUMNS``.
-- ``warmup_bars(realized_vol_window, volume_zscore_window, smoothing_window=1)``:
-  cuántas filas iniciales quedan con ``NaN``.
-- ``feature_matrix(df, realized_vol_window=24, volume_zscore_window=168,
-  smoothing_window=1)``: ``(X, index)`` con ``X`` de forma ``(T, 4)`` en float64,
+- ``warmup_bars(realized_vol_window=24, volume_zscore_window=168, *,
+  smoothing_window)``: cuántas filas iniciales quedan con ``NaN``.
+- ``feature_matrix(df, realized_vol_window=24, volume_zscore_window=168, *,
+  smoothing_window)``: ``(X, index)`` con ``X`` de forma ``(T, 4)`` en float64,
   sin el calentamiento.
+
+``smoothing_window`` es obligatorio y va por nombre: no tiene valor por omisión
+para que nadie arme sin querer features sin suavizar para un modelo entrenado
+con suavizado (el modelo las aceptaría sin protestar y el régimen saldría
+cualquier cosa). Pasá siempre ``regime.features.smoothing_window``.
 
 Validaciones (``ValueError`` en español): faltan columnas, índice que no es
 ``DatetimeIndex`` ordenado y sin duplicados, precios no finitos o <= 0, volumen
@@ -167,7 +176,7 @@ def _rolling_sum_mean(values: np.ndarray, window: int) -> tuple[np.ndarray, np.n
 
 
 def warmup_bars(
-    realized_vol_window: int = 24, volume_zscore_window: int = 168, smoothing_window: int = 1
+    realized_vol_window: int = 24, volume_zscore_window: int = 168, *, smoothing_window: int
 ) -> int:
     """Cantidad de filas iniciales de ``compute_features`` con algún ``NaN``.
 
@@ -187,7 +196,8 @@ def compute_features(
     df: pd.DataFrame,
     realized_vol_window: int = 24,
     volume_zscore_window: int = 168,
-    smoothing_window: int = 1,
+    *,
+    smoothing_window: int,
 ) -> pd.DataFrame:
     """Las cuatro features del HMM por vela, causales (ver el docstring del módulo)."""
     rv = _require_window(realized_vol_window, "realized_vol_window")
@@ -236,7 +246,8 @@ def feature_matrix(
     df: pd.DataFrame,
     realized_vol_window: int = 24,
     volume_zscore_window: int = 168,
-    smoothing_window: int = 1,
+    *,
+    smoothing_window: int,
 ) -> tuple[np.ndarray, pd.DatetimeIndex]:
     """Matriz ``(T, 4)`` float64 para el HMM, sin las filas de calentamiento.
 
@@ -244,7 +255,9 @@ def feature_matrix(
     las velas se validan antes (precios > 0, volumen >= 0, todo finito), las
     únicas filas con ``NaN`` son exactamente las ``warmup_bars(...)`` primeras.
     """
-    features = compute_features(df, realized_vol_window, volume_zscore_window, smoothing_window)
+    features = compute_features(
+        df, realized_vol_window, volume_zscore_window, smoothing_window=smoothing_window
+    )
     values = features.to_numpy(dtype="float64")
     keep = np.isfinite(values).all(axis=1)
     X = np.ascontiguousarray(values[keep])

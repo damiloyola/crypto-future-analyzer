@@ -68,7 +68,10 @@ El frontend solo muestra lo que devuelve la API; no calcula riesgo.
   Neutral, Alcista, Euforia), reentrenamiento automático semanal al analizar,
   inestabilidad y confirmación por cambio de **tipo** (`change_level:
   category`). Confianza = probabilidad del estado más probable en la última
-  vela (con 5 estados cada tipo es un solo estado).
+  vela (con 5 estados cada tipo es un solo estado). El diario de contexto
+  también resume 24 velas = **24 días** (regímenes de 2 a 4 semanas,
+  calentamiento de 190 días): el usuario lo confirmó; es solo informativo
+  (`regime_adjustments.apply_context_regime: false`).
 - Al usuario hay que explicarle todo en palabras simples (hace mucho que no
   opera futuros) y hacerle las preguntas con opciones (AskUserQuestion).
 

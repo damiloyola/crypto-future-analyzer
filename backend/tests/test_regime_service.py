@@ -327,7 +327,9 @@ def test_short_training_warning_threshold(four_state_status):
     s, status = four_state_status
     model = status.model
     f = s.regime.features
-    warm = warmup_bars(f.realized_vol_window, f.volume_zscore_window, f.smoothing_window)
+    warm = warmup_bars(
+        f.realized_vol_window, f.volume_zscore_window, smoothing_window=f.smoothing_window
+    )
     expected = s.regime.training_days * 24 - warm
     enough = dataclasses.replace(model, n_samples=int(0.8 * expected) + 1)
     few = dataclasses.replace(model, n_samples=int(0.8 * expected) - 1)
@@ -403,7 +405,9 @@ def test_history_covers_display_days_after_burn_in(
     df = market.candles_frame("BTC", timeframe)
     df = df[df["closed"] & (df.index >= pd.Timestamp(FIXED_NOW - timedelta(days=days)))]
     f = cfg.features
-    X, _ = feature_matrix(df, f.realized_vol_window, f.volume_zscore_window, f.smoothing_window)
+    X, _ = feature_matrix(
+        df, f.realized_vol_window, f.volume_zscore_window, smoothing_window=f.smoothing_window
+    )
     assert r.bars_analyzed == len(X) - cfg.burn_in_bars
     for b in r.history:
         assert 0.0 <= b.state_prob <= 1.0
@@ -486,7 +490,9 @@ def test_insufficient_history_says_so(settings, tmp_path):
     assert "no hay suficiente historia" in reason and "velas de 1 hora" in reason
     # 100 para entrenar + el calentamiento de las features, en palabras simples.
     f = small_settings(settings, tmp_path).regime.features
-    warm = warmup_bars(f.realized_vol_window, f.volume_zscore_window, f.smoothing_window)
+    warm = warmup_bars(
+        f.realized_vol_window, f.volume_zscore_window, smoothing_window=f.smoothing_window
+    )
     assert warm == 190  # 168 de volumen + 24 de suavizado - 2
     assert f"hacen falta al menos {warm + 100}" in reason
     assert f"las primeras {warm} solo sirven para calcular los indicadores" in reason
@@ -700,6 +706,11 @@ def test_flicker_marks_unstable_and_pending_but_confidence_is_the_top_state(four
     assert r.regime_prob == pytest.approx(0.01)  # el confirmado, solo para mostrar
     codes = [w.code for w in r.warnings]
     assert {"pending", "unstable"} <= set(codes) and "low_confidence" not in codes
+    unstable = next(w.text for w in r.warnings if w.code == "unstable")
+    assert unstable.startswith(
+        f"Régimen inestable: el tipo más probable cambió {r.changes_in_window} veces en las "
+        "últimas 20 velas"
+    )
     assert r.history[-1].unstable and r.history[-1].regime == by_rank[2].name
     assert r.history[-1].state == by_rank[3].name
     assert r.history[-1].confidence == pytest.approx(0.97)
@@ -838,13 +849,21 @@ def test_history_summary_matches_history(reports, tf):
     hs = r.history_summary()
     assert hs is not None
     bars = r.history
-    cats = [b.category for b in bars if b.category is not None]
+    known = [(i, b.category) for i, b in enumerate(bars) if b.category is not None]
+    changes = [i for (_, a), (i, b) in zip(known, known[1:], strict=False) if a != b]
     assert hs["bars"] == len(bars)
-    pairs = zip(cats, cats[1:], strict=False)
-    assert hs["regime_changes"] == sum(1 for a, b in pairs if a != b)
+    assert hs["regime_changes"] == len(changes)
     hours = len(bars) * r.timeframe_minutes / 60
     assert hs["days"] == pytest.approx(hours / 24)
-    assert hs["avg_regime_hours"] == pytest.approx(hours / (hs["regime_changes"] + 1))
+    # Solo los tramos completos (entre dos cambios) dan la duración.
+    stretches = [
+        (b - a) * r.timeframe_minutes / 60 for a, b in zip(changes, changes[1:], strict=False)
+    ]
+    assert hs["completed_stretches"] == len(stretches)
+    if stretches:
+        assert hs["avg_regime_hours"] == pytest.approx(sum(stretches) / len(stretches))
+    else:
+        assert hs["avg_regime_hours"] is None
     assert hs["unstable_pct"] == pytest.approx(100 * sum(b.unstable for b in bars) / len(bars))
     low = sum(b.confidence < r.low_confidence_threshold for b in bars)
     assert hs["low_confidence_pct"] == pytest.approx(100 * low / len(bars))
@@ -854,3 +873,48 @@ def test_history_summary_matches_history(reports, tf):
 def test_history_summary_none_without_history(reports):
     empty = dataclasses.replace(reports["1h"], history=())
     assert empty.history_summary() is None
+
+
+def _summary_for(s, status, ranks):
+    return report_for(s, status, ranks).history_summary()
+
+
+def test_history_summary_counts_only_complete_stretches(four_state_status):
+    # Regresión: la duración era ventana / (cambios + 1). Sin cambios decía que
+    # "cada tramo dura ~30 días" (la ventana misma) aunque el régimen llevara 43;
+    # con 1 cambio promediaba dos tramos cortados por la ventana.
+    s, status = four_state_status
+    want = s.regime.display_days * 24  # 720 velas de 1h
+    none = _summary_for(s, status, [1] * (want + 80))
+    assert none["regime_changes"] == 0 and none["completed_stretches"] == 0
+    assert none["avg_regime_hours"] is None
+
+    one = _summary_for(s, status, [0] * 100 + [1] * (want - 20))
+    assert one["regime_changes"] == 1 and one["completed_stretches"] == 0
+    assert one["avg_regime_hours"] is None
+
+    # Cambios confirmados (3.ª vela de cada racha) dentro de la ventana: los tramos
+    # completos son el de 200 velas y el de 150; el primero y el último están cortados.
+    three = _summary_for(s, status, [0] * 300 + [1] * 200 + [2] * 150 + [3] * 150)
+    assert three["bars"] == want
+    assert three["regime_changes"] == 3 and three["completed_stretches"] == 2
+    assert three["avg_regime_hours"] == pytest.approx(175.0)
+
+
+def test_history_summary_state_level_counts_states_not_names(four_state_status):
+    # Regresión: en change_level "state" comparaba los nombres; si dos estados se
+    # llamaban igual (la config lo permite), sus cambios no contaban.
+    s, status = four_state_status
+    states = tuple(
+        dataclasses.replace(st, name="Neutral") if st.rank in (1, 2) else st
+        for st in status.model.states
+    )
+    same_name = dataclasses.replace(status, model=dataclasses.replace(status.model, states=states))
+    s_state = s.model_copy(update={"regime": s.regime.model_copy(update={"change_level": "state"})})
+    ranks = [1 if (t // 20) % 2 == 0 else 2 for t in range(200)]
+    r = report_for(s_state, same_name, ranks)
+    assert {b.regime for b in r.history[2:]} == {"Neutral"}  # las 2 primeras, sin confirmar
+    hs = r.history_summary()
+    assert hs["regime_changes"] == 9  # un cambio de estado cada 20 velas
+    assert hs["completed_stretches"] == 8 and hs["avg_regime_hours"] == pytest.approx(20.0)
+    assert [b.regime_rank for b in r.history[20:23]] == [1, 1, 2]  # se confirma en la 3.ª
