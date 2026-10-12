@@ -1,0 +1,30 @@
+# Secretos: las API keys las escribe el usuario a mano en .env
+.env
+.env.*
+!.env.example
+
+# Datos locales (base SQLite, modelos HMM, lock, informes)
+data/*
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# Sistema / editores
+.DS_Store
+.idea/
+.vscode/
+*.log

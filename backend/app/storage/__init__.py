@@ -1,0 +1,1 @@
+"""Persistencia en SQLite (SQLModel)."""

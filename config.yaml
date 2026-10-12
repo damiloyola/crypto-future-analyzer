@@ -1,0 +1,414 @@
+# =============================================================================
+# Crypto Future Analyzer: configuración general
+# =============================================================================
+# Acá viven TODAS las reglas y umbrales. El código las aplica en forma
+# determinista; el LLM nunca las lee para decidir nada.
+#
+# Convenciones:
+#   - Porcentajes expresados como número "humano": 0.06 significa 0,06 %.
+#     Cuando un valor es una fracción (0 a 1) se aclara en el comentario.
+#   - Montos en USD (USDT).
+#   - Las claves están en inglés para que coincidan con el código; los
+#     comentarios explican cada una.
+#   - El archivo se valida al arrancar (backend/app/config.py). Si algo no
+#     cierra (pesos que no suman 1, apalancamiento > 50x, etc.) la app no arranca.
+# =============================================================================
+
+app:
+  # Zona horaria del usuario. Define cuándo empieza "el día" y "la semana"
+  # para los límites de pérdida y los circuit breakers.
+  user_timezone: "America/Argentina/Buenos_Aires"
+  # Zona horaria del "día de mercado": VWAP diario y máximo/mínimo del día
+  # anterior. En cripto la convención es UTC (la vela diaria abre 00:00 UTC).
+  market_timezone: "UTC"
+  host: "0.0.0.0"           # 0.0.0.0 = accesible desde el celular en la misma red
+  backend_port: 8000
+  frontend_port: 5173
+  data_dir: "data"          # SQLite, modelos HMM, estado manual, informes
+  lock_file: "data/LOCKED"  # si existe, la app NO genera planes (ver safety)
+  incident_dir: "data/incidents"
+
+symbols:
+  # Monedas que se muestran como favoritas en el selector.
+  favorites: ["BTC", "ETH", "SOL", "XRP", "AVAX"]
+  quote: "USDT"
+  default: "BTC"
+
+# -----------------------------------------------------------------------------
+# Exchanges (todo por la interfaz común de backend/app/exchanges/base.py)
+# -----------------------------------------------------------------------------
+exchanges:
+  data_primary: "binance"   # velas, funding, OI, long/short
+  data_fallback: "bybit"    # se usa si Binance falla
+  execution_venue: "nexo"   # precio sobre el que se calculan los niveles finales
+  request_timeout_s: 10
+  max_retries: 2
+  binance:
+    spot_base_url: "https://api.binance.com"
+    futures_base_url: "https://fapi.binance.com"
+    use_perpetual_klines: true  # true = /fapi/v1/klines (perpetuos USDT-M)
+  bybit:
+    base_url: "https://api.bybit.com"
+    category: "linear"
+  nexo:
+    # Ver docs/nexo-api-research.md. No hay endpoints públicos confirmados:
+    # todos los de la Nexo Pro API piden API key firmada. Hasta que eso
+    # cambie, el conector queda preparado pero apagado, y se usa el precio de
+    # Binance con un aviso visible en la UI.
+    enabled: false
+    base_url: "https://pro-api.nexo.io/api/v1"
+    # Fase 4. En la fase 1 el código bloquea las órdenes aunque esto sea true.
+    allow_orders: false
+    # Mapeo de símbolos a instrumentos de futuros de Nexo (a confirmar en fase 4).
+    instruments:
+      BTC: "BTCUSDT"
+      ETH: "ETHUSDT"
+      SOL: "SOLUSDT"
+      XRP: "XRPUSDT"
+      AVAX: "AVAXUSDT"
+
+# Segundos que se guarda cada respuesta antes de volver a pedirla.
+cache_ttl_seconds:
+  price: 30
+  klines_5m: 30
+  klines_15m: 60
+  klines_1h: 120
+  klines_4h: 300
+  klines_1d: 900
+  funding: 300
+  open_interest: 300
+  long_short_ratio: 300
+  fear_greed: 1800
+  global_market: 600
+  news: 900
+
+data_sources:
+  fear_greed_url: "https://api.alternative.me/fng/"
+  coingecko_base_url: "https://api.coingecko.com/api/v3"
+  # Solo si CRYPTOPANIC_API_KEY está en .env. Si no, se usan los RSS.
+  cryptopanic_base_url: "https://cryptopanic.com/api/developer/v2"
+  rss_feeds:
+    - "https://www.coindesk.com/arc/outboundfeeds/rss/"
+    - "https://cointelegraph.com/rss"
+  news_max_headlines: 15
+  # Palabras para filtrar titulares por moneda (sin distinguir mayúsculas).
+  news_keywords:
+    BTC: ["bitcoin", "btc"]
+    ETH: ["ethereum", "eth", "ether"]
+    SOL: ["solana", "sol"]
+    XRP: ["xrp", "ripple"]
+    AVAX: ["avalanche", "avax"]
+  # Titulares que no nombran ninguna moneda pero mueven todo el mercado.
+  macro_keywords: ["fed", "fomc", "cpi", "inflation", "sec", "etf", "rate", "powell", "tariff"]
+
+# -----------------------------------------------------------------------------
+# Timeframes (estilo intradiario)
+# -----------------------------------------------------------------------------
+timeframes:
+  context: ["4h", "1d"]
+  structure: "1h"
+  entry: "15m"
+  fine_tune: "5m"          # opcional
+  candles_per_request: 500 # velas que se piden por timeframe para indicadores
+
+# -----------------------------------------------------------------------------
+# Indicadores (backend/app/indicators)
+# -----------------------------------------------------------------------------
+indicators:
+  ema_periods: [20, 50, 200]
+  vwap_timeframes: ["15m", "1h"]  # VWAP diario (se reinicia en el día de mercado)
+  rsi_period: 14
+  rsi_overbought: 70
+  rsi_oversold: 30
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+  atr_period: 14
+  bollinger:
+    period: 20
+    std: 2.0
+  relative_volume_period: 20
+  levels:
+    pivot_left: 3            # velas a la izquierda para confirmar un swing
+    pivot_right: 3           # velas a la derecha (el pivote se confirma con retraso)
+    cluster_atr_mult: 0.5    # niveles a menos de 0,5 × ATR se agrupan en uno
+    max_levels_each_side: 3  # 3 más cercanos arriba y 3 abajo del precio
+    include_previous_day: true
+
+# -----------------------------------------------------------------------------
+# Detector de régimen (HMM), backend/app/regime
+# -----------------------------------------------------------------------------
+regime:
+  timeframe: "1h"
+  context_timeframe: "1d"
+  training_days: 540           # ~1,5 años de velas de 1h
+  context_training_days: 1500  # velas diarias para el régimen de contexto
+  features:
+    realized_vol_window: 24    # velas para la volatilidad realizada
+    volume_zscore_window: 168  # velas para el z-score del volumen (1 semana)
+  n_states_min: 3
+  n_states_max: 7
+  selection_criterion: "bic"   # el número de estados se elige solo, por BIC
+  covariance_type: "full"
+  n_restarts: 5                # inicializaciones por cada número de estados
+  max_iter: 200
+  random_seed: 42
+  retrain_every_days: 7
+  models_dir: "data/models"
+  confirmation_bars: 3         # un régimen nuevo se confirma tras 3 velas seguidas
+  instability_window: 20       # ventana para contar cambios de régimen
+  instability_max_changes: 4   # más de 4 cambios en 20 velas = "régimen inestable"
+  # Nombres según cuántos estados elija el BIC, del más bajista al más alcista.
+  # "category" es la categoría canónica que usan los ajustes de riesgo.
+  labels:
+    3:
+      - {name: "Bajista", category: "bajista"}
+      - {name: "Neutral", category: "neutral"}
+      - {name: "Alcista", category: "alcista"}
+    4:
+      - {name: "Crash", category: "crash"}
+      - {name: "Bajista", category: "bajista"}
+      - {name: "Alcista", category: "alcista"}
+      - {name: "Euforia", category: "euforia"}
+    5:
+      - {name: "Crash", category: "crash"}
+      - {name: "Bajista", category: "bajista"}
+      - {name: "Neutral", category: "neutral"}
+      - {name: "Alcista", category: "alcista"}
+      - {name: "Euforia", category: "euforia"}
+    6:
+      - {name: "Crash", category: "crash"}
+      - {name: "Bajista", category: "bajista"}
+      - {name: "Neutral bajista", category: "neutral"}
+      - {name: "Neutral alcista", category: "neutral"}
+      - {name: "Alcista", category: "alcista"}
+      - {name: "Euforia", category: "euforia"}
+    7:
+      - {name: "Crash", category: "crash"}
+      - {name: "Bajista fuerte", category: "bajista"}
+      - {name: "Bajista", category: "bajista"}
+      - {name: "Neutral", category: "neutral"}
+      - {name: "Alcista", category: "alcista"}
+      - {name: "Alcista fuerte", category: "alcista"}
+      - {name: "Euforia", category: "euforia"}
+
+# -----------------------------------------------------------------------------
+# Score de confluencia, de -100 a +100 (backend/app/scoring)
+# -----------------------------------------------------------------------------
+scoring:
+  weights:            # tienen que sumar 1.0
+    trend_4h: 0.20
+    trend_1h: 0.20
+    trend_15m: 0.15
+    momentum: 0.20    # RSI y MACD en 15m y 1h
+    derivatives: 0.15 # funding, OI y ratio long/short
+    sentiment: 0.10   # Fear & Greed y noticias
+  momentum:
+    timeframes: ["15m", "1h"]
+    rsi_neutral: 50
+    rsi_overbought: 70  # arriba de esto el aporte alcista se recorta
+    rsi_oversold: 30    # abajo de esto el aporte bajista se recorta
+  derivatives:
+    # Funding por período de 8 h, en % (0.05 = 0,05 %).
+    funding_high_pct: 0.05       # funding "muy positivo": longs sobrecargados
+    funding_very_high_pct: 0.10
+    funding_low_pct: -0.03       # funding negativo: shorts sobrecargados
+    oi_lookback_hours: 24
+    oi_rising_pct: 3.0           # OI +3 % en 24 h = "OI subiendo"
+    long_short_crowded_long: 2.0 # ratio de cuentas long/short que indica exceso de longs
+    long_short_crowded_short: 0.7
+  sentiment:
+    fear_greed_extreme_fear: 25
+    fear_greed_extreme_greed: 75
+    # "contrarian": miedo extremo suma al long y codicia extrema resta.
+    # "trend": al revés (acompaña el sentimiento).
+    fear_greed_mode: "contrarian"
+    news_share: 0.5    # parte del componente que aportan las noticias (0 a 1)
+  direction_thresholds:
+    long: 30           # score >= +30, candidato a long
+    short: -30         # score <= -30, candidato a short
+
+# -----------------------------------------------------------------------------
+# Plan de operación (backend/app/risk)
+# -----------------------------------------------------------------------------
+trade_plan:
+  stop_timeframes: ["15m", "1h"]  # dónde buscar el soporte/resistencia del stop
+  stop_atr_buffer: 0.5            # stop = nivel - 0,5 × ATR(15m) (espejado en short)
+  take_profit:
+    tp1: "next_level"   # siguiente S/R
+    tp2_r: 1.5
+    tp3_r: 2.5
+  flag_tp_beyond_daily_range: true  # TP más lejos que el ATR diario = "poco probable intradía"
+  time_stop_hours: 24
+  liquidation:
+    min_distance_ratio: 2.0       # distancia a liquidación >= 2 × distancia al stop
+    # Cuando no se cumple, la app prueba subir el margen manteniendo el riesgo
+    # en USD. Tope: margen del perfil × este multiplicador (y nunca más que el
+    # saldo de la billetera cargado a mano).
+    max_margin_multiplier: 2.0
+
+fees:
+  # Nexo: 0,06 % taker publicado como tarifa estándar de futuros. El maker no
+  # está publicado; por defecto se usa el mismo valor (conservador).
+  # Se cobran sobre el TAMAÑO de la posición, en la entrada y en la salida.
+  nexo:
+    taker_pct: 0.06
+    maker_pct: 0.06
+  entry_order: "taker"
+  exit_order: "taker"
+  # Estimar el costo de funding por mantener la posición hasta el stop por tiempo.
+  include_funding_estimate: true
+  funding_interval_hours: 8
+
+liquidation:
+  # Margen aislado (lo que pidió el diseño). Ver docs/nexo-api-research.md:
+  # Nexo usa la billetera de futuros entera como colateral, así que con más
+  # saldo en esa billetera la liquidación real queda MÁS LEJOS que esta.
+  # El cálculo aislado es el conservador.
+  model: "isolated"
+  maintenance_margin_pct: 0.5   # % del tamaño de la posición. Nexo no publica tabla.
+
+# -----------------------------------------------------------------------------
+# Perfiles de riesgo (seleccionables en la UI)
+# -----------------------------------------------------------------------------
+risk_profiles:
+  default: "agresivo"
+  leverage_hard_cap: 50          # por encima de esto no se permite nunca
+  leverage_red_warning_above: 25 # por encima: advertencia roja permanente
+  profiles:
+    conservador:
+      monthly_wallet_usd: 300
+      margin_per_trade_usd: 50
+      risk_per_trade_usd: 15
+      min_rr: 2.0
+      max_leverage: 5
+      max_trades_per_day: 2
+      max_daily_loss_usd: 30
+      min_operable_risk_usd: 5    # si los ajustes bajan el riesgo de acá: "No operar"
+    moderado:
+      monthly_wallet_usd: 300
+      margin_per_trade_usd: 75
+      risk_per_trade_usd: 30
+      min_rr: 1.5
+      max_leverage: 10
+      max_trades_per_day: 3
+      max_daily_loss_usd: 60
+      min_operable_risk_usd: 10
+    agresivo:
+      monthly_wallet_usd: 300
+      margin_per_trade_usd: 100
+      risk_per_trade_usd: 50
+      min_rr: 1.5
+      max_leverage: 25
+      max_trades_per_day: 3
+      max_daily_loss_usd: 100
+      min_operable_risk_usd: 15
+
+# -----------------------------------------------------------------------------
+# Ajustes según el régimen (se acumulan con los de confianza y estabilidad)
+# -----------------------------------------------------------------------------
+# min_abs_score: score mínimo en valor absoluto en la dirección del plan
+#   (long: score >= +X; short: score <= -X).
+# min_rr: pisa el R:R mínimo del perfil si es mayor.
+# risk_multiplier: multiplica el riesgo en USD.
+# only_if_funding_very_high: el ajuste solo aplica si el funding supera
+#   scoring.derivatives.funding_very_high_pct.
+regime_adjustments:
+  crash:
+    long: {blocked: true}
+    short: {risk_multiplier: 0.5}
+  bajista:
+    long: {min_abs_score: 50}
+    short: {}
+  neutral:
+    long: {min_abs_score: 45, min_rr: 2.0, risk_multiplier: 0.75}
+    short: {min_abs_score: 45, min_rr: 2.0, risk_multiplier: 0.75}
+  alcista:
+    long: {}
+    short: {min_abs_score: 50}
+  euforia:
+    long: {risk_multiplier: 0.5, only_if_funding_very_high: true}
+    short: {min_abs_score: 40}
+  low_confidence:
+    threshold: 0.60      # fracción 0-1
+    risk_multiplier: 0.5
+  unstable:
+    risk_multiplier: 0.5
+  # El régimen diario se muestra como contexto; por defecto no ajusta el plan.
+  apply_context_regime: false
+
+# -----------------------------------------------------------------------------
+# Circuit breakers (backend/app/safety): tienen poder de veto
+# -----------------------------------------------------------------------------
+circuit_breakers:
+  daily_loss_reduce:
+    pct_of_daily_limit: 50   # pérdida del día >= 50 % del límite diario
+    risk_multiplier: 0.5     # riesgo × 0,5 el resto del día
+  daily_loss_block:
+    pct_of_daily_limit: 100  # pérdida del día >= límite: bloqueo hasta mañana
+  losing_streak:
+    consecutive_losses: 3
+    cooldown_hours: 4
+  weekly_loss_reduce:
+    pct_of_monthly_wallet: 60  # pérdida de la semana >= 60 % de la billetera mensual
+    risk_multiplier: 0.5       # hasta fin de semana
+  monthly_drawdown_lock:
+    pct_from_peak: 70          # billetera del mes cae >= 70 % desde su máximo: LOCK
+  week_starts_on: "monday"
+
+correlation:
+  timeframe: "1h"
+  lookback_days: 30
+  high_threshold: 0.8           # correlación de retornos >= 0,8 = "muy correlacionadas"
+  max_combined_risk_multiplier: 1.5  # riesgo combinado <= 1,5 × riesgo por operación
+
+# -----------------------------------------------------------------------------
+# Matemática de la billetera (panel educativo)
+# -----------------------------------------------------------------------------
+wallet_math:
+  monte_carlo:
+    simulations: 200
+    trades: 30
+    default_win_rate: 0.45   # fracción 0-1, editable en la UI
+    default_rr: 1.5          # editable en la UI
+    percentiles: [10, 50, 90]
+    random_seed: null        # null = distinto en cada corrida
+
+leverage_simulator:
+  levels: [5, 10, 25, 50, 100]
+  noise_atr_mult: 1.0  # liquidación a menos de 1 × ATR(15m) = dentro del ruido
+
+# -----------------------------------------------------------------------------
+# LLM (backend/app/llm): interpreta y redacta, nunca decide números
+# -----------------------------------------------------------------------------
+llm:
+  enabled: true                 # si no hay ANTHROPIC_API_KEY se apaga solo
+  model: "claude-sonnet-5-5"
+  max_tokens: 4000
+  timeout_s: 90
+  invalid_json_retries: 1       # un reintento; si falla, análisis sin LLM
+  headlines_in_prompt: 15
+  horizon_hours: 24
+
+# -----------------------------------------------------------------------------
+# Historial: "¿qué pasó después?"
+# -----------------------------------------------------------------------------
+history:
+  outcome_window_hours: 24
+  price_checkpoints_hours: [1, 4, 24]
+
+# -----------------------------------------------------------------------------
+# Validación histórica walk-forward (backend/app/validation)
+# -----------------------------------------------------------------------------
+validation:
+  train_months: 6
+  test_months: 1
+  total_months: 18
+  entry_timeframe: "15m"
+  slippage_pct_per_side: 0.05
+  max_open_per_symbol: 1
+  random_benchmark_runs: 100
+  confidence_buckets: [0.60, 0.80]  # < 60 %, 60-80 %, > 80 %
+  stress_test:
+    daily_shocks_pct: [-15, -10, 10, 15]

@@ -1,0 +1,42 @@
+@import "tailwindcss";
+
+/*
+ * Tokens de la estética "terminal de trading": tema oscuro por defecto,
+ * verde = alcista, rojo = bajista, ámbar = neutral. Los colores de régimen son
+ * los mismos en el banner, el fondo del gráfico y el panel de régimen.
+ */
+@theme {
+  --color-bg: #0b0e14;
+  --color-panel: #121722;
+  --color-panel-2: #182030;
+  --color-border: #243044;
+  --color-text: #e6edf6;
+  --color-muted: #8a97ab;
+
+  --color-bull: #22c55e;
+  --color-bear: #ef4444;
+  --color-neutral: #f59e0b;
+  --color-entry: #3b82f6;
+
+  --color-regime-crash: #7f1d1d;
+  --color-regime-bajista: #dc2626;
+  --color-regime-neutral: #6b7280;
+  --color-regime-alcista: #16a34a;
+  --color-regime-euforia: #8b5cf6;
+
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, "JetBrains Mono", Consolas, monospace;
+  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-bg text-text font-sans antialiased;
+  }
+  /* Cifras siempre monoespaciadas y alineadas. */
+  .num {
+    @apply font-mono tabular-nums;
+  }
+}
