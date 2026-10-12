@@ -16,7 +16,7 @@ setup: setup-backend setup-frontend ## Instala todas las dependencias
 
 setup-backend: ## Crea el entorno de Python e instala el backend
 	@if command -v uv >/dev/null 2>&1; then \
-		uv venv --python 3.12 $(VENV) && uv pip install --python $(PY) -e "$(BACKEND)[dev]"; \
+		uv venv --allow-existing --python 3.12 $(VENV) && uv pip install --python $(PY) -e "$(BACKEND)[dev]"; \
 	else \
 		python3 -c 'import sys; assert (3,11) <= sys.version_info[:2] < (3,14), "Se necesita Python 3.11 a 3.13 (recomendado: brew install python@3.12 o brew install uv)"' && \
 		python3 -m venv $(VENV) && $(PY) -m pip install --upgrade pip && $(PY) -m pip install -e "$(BACKEND)[dev]"; \
