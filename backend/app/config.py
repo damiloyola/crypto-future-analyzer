@@ -74,6 +74,7 @@ class NexoConfig(_Strict):
     base_url: str
     allow_orders: bool = False
     instruments: dict[str, str] = Field(default_factory=dict)
+    manual_price_max_diff_pct: float = Field(2.0, gt=0)
 
 
 class ExchangesConfig(_Strict):
@@ -103,6 +104,7 @@ class TimeframesConfig(_Strict):
     entry: Timeframe
     fine_tune: Timeframe | None = None
     candles_per_request: int = 500
+    closed_candles_only: bool = True
 
 
 # --- indicadores -------------------------------------------------------------
@@ -291,6 +293,7 @@ class FeesConfig(_Strict):
 class LiquidationConfig(_Strict):
     model: Literal["isolated"] = "isolated"
     maintenance_margin_pct: float = Field(gt=0, lt=100)
+    show_wallet_model: bool = True
 
 
 # --- perfiles ----------------------------------------------------------------

@@ -66,6 +66,10 @@ exchanges:
       SOL: "SOLUSDT"
       XRP: "XRPUSDT"
       AVAX: "AVAXUSDT"
+    # Precio de Nexo cargado a mano en la UI (opcional, vale solo para ese
+    # análisis). Si difiere de Binance más que este %, se avisa: puede ser un
+    # error de tipeo.
+    manual_price_max_diff_pct: 2.0
 
 # Segundos que se guarda cada respuesta antes de volver a pedirla.
 cache_ttl_seconds:
@@ -110,6 +114,9 @@ timeframes:
   entry: "15m"
   fine_tune: "5m"          # opcional
   candles_per_request: 500 # velas que se piden por timeframe para indicadores
+  # true = los indicadores usan solo velas cerradas (no cambian mientras la
+  # vela actual se forma). El precio que se muestra es siempre el actual.
+  closed_candles_only: true
 
 # -----------------------------------------------------------------------------
 # Indicadores (backend/app/indicators)
@@ -268,6 +275,9 @@ liquidation:
   # El cálculo aislado es el conservador.
   model: "isolated"
   maintenance_margin_pct: 0.5   # % del tamaño de la posición. Nexo no publica tabla.
+  # Además del aislado (que usan las reglas), mostrar como dato la liquidación
+  # "modelo Nexo": toda la billetera de futuros cargada a mano como colateral.
+  show_wallet_model: true
 
 # -----------------------------------------------------------------------------
 # Perfiles de riesgo (seleccionables en la UI)
