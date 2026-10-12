@@ -174,6 +174,7 @@ class IndicatorsConfig(_Strict):
 class RegimeFeaturesConfig(_Strict):
     realized_vol_window: int = Field(24, ge=2)
     volume_zscore_window: int = Field(168, ge=2)
+    smoothing_window: int = Field(24, ge=1)
 
 
 class RegimeLabel(_Strict):

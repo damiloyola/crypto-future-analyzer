@@ -163,7 +163,11 @@ def render_status(
         if not forced:
             text += " Usá --force para reentrenar igual."
         result = Cell(text)
-    warm = warmup_bars(cfg.features.realized_vol_window, cfg.features.volume_zscore_window)
+    warm = warmup_bars(
+        cfg.features.realized_vol_window,
+        cfg.features.volume_zscore_window,
+        cfg.features.smoothing_window,
+    )
     if status.candles_downloaded is not None:
         candles = (
             f"{fmt_num(status.candles_downloaded, 0)} velas cerradas de {timeframe}; se usaron "

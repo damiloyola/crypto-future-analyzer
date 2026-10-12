@@ -387,14 +387,14 @@ async def _fetch_closed(
 def _features(df: pd.DataFrame, regime_cfg: RegimeConfig) -> tuple[np.ndarray, pd.DatetimeIndex]:
     f = regime_cfg.features
     try:
-        return feature_matrix(df, f.realized_vol_window, f.volume_zscore_window)
+        return feature_matrix(df, f.realized_vol_window, f.volume_zscore_window, f.smoothing_window)
     except ValueError as exc:
         raise RegimeUnavailable(f"las velas recibidas tienen datos inválidos: {exc}") from exc
 
 
 def _warmup(regime_cfg: RegimeConfig) -> int:
     f = regime_cfg.features
-    return warmup_bars(f.realized_vol_window, f.volume_zscore_window)
+    return warmup_bars(f.realized_vol_window, f.volume_zscore_window, f.smoothing_window)
 
 
 # --- modelo ----------------------------------------------------------------------
@@ -922,6 +922,33 @@ class RegimeReport:
     def role(self) -> str:
         return "context" if self.is_context else "main"
 
+    def history_summary(self) -> dict[str, Any] | None:
+        """Resumen de la historia mostrada: cuántas veces cambió y qué tan estable fue.
+
+        ``regime_changes`` cuenta cambios del régimen vigente (de tipo o de estado
+        según ``change_level``), ``avg_regime_hours`` es la duración media de cada
+        tramo, ``unstable_pct`` y ``low_confidence_pct`` el % de velas inestables y
+        con confianza debajo del umbral. Sirve para ver de un vistazo si el
+        régimen se comporta bien con datos reales. ``None`` sin historia.
+        """
+        bars = self.history
+        if not bars:
+            return None
+        labels = [b.category if self.change_level == "category" else b.regime for b in bars]
+        known = [lb for lb in labels if lb is not None]
+        changes = sum(1 for a, b in zip(known, known[1:], strict=False) if a != b)
+        hours = len(bars) * self.timeframe_minutes / 60.0
+        return {
+            "bars": len(bars),
+            "days": hours / 24.0,
+            "regime_changes": changes,
+            "avg_regime_hours": hours / (changes + 1),
+            "unstable_pct": 100.0 * sum(b.unstable for b in bars) / len(bars),
+            "low_confidence_pct": 100.0
+            * sum(b.confidence < self.low_confidence_threshold for b in bars)
+            / len(bars),
+        }
+
     def to_dict(self, *, include_history: bool = True) -> dict[str, Any]:
         """Dict listo para JSON (sin NaN ni infinitos: se vuelven ``None``)."""
         m = self.model
@@ -989,6 +1016,7 @@ class RegimeReport:
             "transition_matrix": [list(row) for row in self.transition_matrix],
             "distribution": list(self.distribution),
             "history_bars": len(self.history),
+            "history_summary": self.history_summary(),
             "warnings": [w.text for w in self.warnings],
             "warning_codes": [w.code for w in self.warnings],
             "data_source": self.data_source,

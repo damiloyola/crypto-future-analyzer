@@ -336,15 +336,17 @@ def train_regime_model(
         )
     if chosen_n == regime_cfg.n_states_max and regime_cfg.n_states_max > regime_cfg.n_states_min:
         notes.append(
-            f"El BIC eligió la cantidad máxima de estados permitida ({chosen_n}); "
-            "con más estados quizás ajustaría mejor."
+            f"El BIC eligió el máximo de estados permitido ({chosen_n}); es lo habitual con "
+            "tanta historia y no es un problema."
         )
 
     labels_for_n = regime_cfg.labels.get(chosen_n)
     if labels_for_n is None or len(labels_for_n) != chosen_n:
         raise RegimeTrainingError(f"regime.labels no tiene los {chosen_n} nombres necesarios")
     try:
-        states = label_states(chosen.hmm, scaler, labels_for_n)
+        states = label_states(
+            chosen.hmm, scaler, labels_for_n, return_window=regime_cfg.features.smoothing_window
+        )
     except LabelingError as exc:
         raise RegimeTrainingError(f"no se pudieron etiquetar los estados: {exc}") from exc
 

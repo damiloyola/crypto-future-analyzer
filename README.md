@@ -37,7 +37,7 @@ celular en la misma red wifi.
 | 0 | Esqueleto del proyecto | ✅ |
 | 1 | Investigación de la Nexo Pro API ([informe](docs/nexo-api-research.md)) | ✅ |
 | 2 | Datos e indicadores + script de consola ([fuentes](docs/data-sources.md)) | ✅ (falta correrlo en vivo en la Mac) |
-| 3 | Detector de régimen (HMM) + `make train-regime` | ✅ (falta entrenarlo con datos reales en la Mac; hay preguntas de diseño abiertas) |
+| 3 | Detector de régimen (HMM) + `make train-regime` | ✅ (falta entrenarlo con datos reales en la Mac) |
 | 4 | Score, plan de riesgo, ajustes por régimen y perfiles | ⏳ |
 | 5 | Circuit breakers y correlación | ⏳ |
 | 6 | API FastAPI | ⏳ |
@@ -101,6 +101,11 @@ hora (el régimen para operar) y velas diarias (el de contexto), siempre
 cerradas y sin mirar el futuro: el régimen de cada vela se calcula solo con
 las velas hasta ella (algoritmo forward; hay tests que lo verifican).
 
+Mira el **resumen de las últimas 24 velas** (cuánto subió o bajó, rango y
+volumen promedio, más la volatilidad), no cada vela suelta: así una vela
+grande no alcanza para declarar un "Crash" y cada régimen dura del orden de
+un día (decisión tuya; `regime.features.smoothing_window`, 1 = vela por vela).
+
 ```bash
 make train-regime                              # todas las favoritas, 1 hora y diario
 make train-regime SYMBOL=SOL                   # una sola moneda
@@ -110,11 +115,12 @@ make cli SYMBOL=BTC                            # la consola ya muestra el régim
 make cli SYMBOL=BTC ARGS="--no-regime"         # sin régimen (más rápido)
 ```
 
-- La cantidad de estados (de 3 a 7) la elige sola el BIC. Los modelos se
-  guardan en `data/models/` (los de prueba, en `data/models/sintetico/`, y
-  nunca se mezclan) y se reentrenan solos cuando tienen 7 días
-  (`regime.auto_retrain`). Entrenar una moneda tarda unos 2 minutos (casi
-  todo es el modelo de 1 hora); si hace falta, la consola avisa antes.
+- La cantidad de estados (de 3 a 5: Crash, Bajista, Neutral, Alcista y
+  Euforia) la elige sola el BIC. Los modelos se guardan en `data/models/`
+  (los de prueba, en `data/models/sintetico/`, y nunca se mezclan) y se
+  reentrenan solos cuando tienen 7 días (`regime.auto_retrain`). Entrenar una
+  moneda tarda alrededor de 1 minuto y cuarto (casi todo es el modelo de 1
+  hora); si hace falta, la consola avisa antes.
 - Qué muestra: régimen actual y si está confirmado (se mantuvo 3 velas
   seguidas) o hay un cambio en espera; confianza (la probabilidad del estado
   más probable en la última vela, "baja" si es menos de 60 %); "régimen
@@ -122,13 +128,15 @@ make cli SYMBOL=BTC ARGS="--no-regime"         # sin régimen (más rápido)
   empezó; y una tabla por régimen con retorno medio por vela, volatilidad,
   duración típica y % del tiempo. Avisa si el modelo es viejo, si se entrenó
   con poca historia o si las velas vinieron de Bybit.
+- Resumen de los últimos 30 días: cuántas veces cambió el régimen, cuánto dura
+  cada tramo, % del tiempo "inestable" y % con confianza baja. Con datos de
+  prueba: un cambio cada ~33 h, inestable menos del 1 % del tiempo. Si con
+  datos reales sale muy distinto, avisame.
+- Para la inestabilidad solo cuentan los cambios de tipo (Neutral → Bajista),
+  no entre variantes del mismo tipo (`regime.change_level: category`).
 - `make train-regime` termina con código 1 si alguna moneda no se pudo
   entrenar o reentrenar (en ese caso queda el modelo anterior y lo dice), y
   con 130 si lo cortás con Ctrl+C (sale enseguida y no guarda nada a medias).
-- Pendiente de tu decisión: cómo ordenar y nombrar los estados (hoy solo por
-  retorno medio; con datos de prueba "Crash" y "Euforia" duran unas 2 horas y
-  el régimen de 1 hora sale "inestable" seguido), el máximo de estados y qué
-  cuenta como cambio para la inestabilidad.
 
 ## Configuración
 

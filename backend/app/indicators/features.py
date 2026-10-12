@@ -7,13 +7,16 @@ quedarse con las primeras ``k`` filas (los tests lo verifican). Hay que pasarles
 solo velas **cerradas**: si el ``DataFrame`` trae la columna ``closed`` con
 alguna vela sin cerrar, se lanza ``ValueError``.
 
-Las cuatro features, en el orden de ``FEATURE_COLUMNS``:
+Las cuatro features, en el orden de ``FEATURE_COLUMNS`` (con
+``smoothing_window = N``; con ``N = 1`` son las de la especificación literal):
 
-- ``log_return``: ``ln(close[t] / close[t-1])``. ``NaN`` en la primera vela.
+- ``log_return``: retorno logarítmico **acumulado de las últimas N velas**,
+  ``ln(close[t] / close[t-N])`` (suma de los retornos de cada vela). Con N = 1
+  es ``ln(close[t] / close[t-1])``.
 - ``realized_vol``: desvío **muestral** (ddof = 1) de ``log_return`` en las
   últimas ``realized_vol_window`` velas, incluida *t*. Si los retornos de la
   ventana son todos iguales vale exactamente 0.
-- ``range_pct``: ``(high - low) / close`` de la vela.
+- ``range_pct``: promedio de ``(high - low) / close`` en las últimas N velas.
 - ``volume_z``: z-score de ``log1p(volume[t])`` contra la media y el desvío
   muestral (ddof = 1) de ``log1p(volume)`` en las últimas
   ``volume_zscore_window`` velas, incluida *t*. Se usa ``log1p`` porque el
@@ -21,15 +24,24 @@ Las cuatro features, en el orden de ``FEATURE_COLUMNS``:
   demás); el logaritmo lo lleva a una escala donde "mucho más que lo normal" y
   "mucho menos" pesan parecido, y ``log1p`` admite volumen 0. Si la ventana es
   constante (desvío 0, por ejemplo volumen 0 en todas las velas) el z-score
-  vale 0: el volumen está exactamente en su nivel habitual.
+  vale 0: el volumen está exactamente en su nivel habitual. Después se promedia
+  en las últimas N velas.
+
+Por qué el suavizado (decisión del usuario, ``regime.features.smoothing_window``,
+24 por defecto): vela por vela, una sola vela grande ya parece un "Crash" o una
+"Euforia" y el régimen cambia cada pocas horas. Con el resumen de las últimas 24
+velas (cuánto subió o bajó en el día, rango y volumen promedio) el régimen
+describe el clima del día y dura del orden de un día. La volatilidad realizada
+ya es una medida de ventana y no se vuelve a suavizar.
 
 Cada ventana se calcula por separado (media y desvío en dos pasadas sobre las
 velas de la ventana, sin sumas acumuladas), así no arrastra errores de redondeo
 y el resultado de una vela no depende de cuántas velas haya antes o después.
 
-Calentamiento: las primeras ``warmup_bars(...) = max(realized_vol_window,
-volume_zscore_window - 1)`` filas tienen algún ``NaN`` (con 24 y 168: 167
-velas). ``feature_matrix`` las descarta y devuelve la matriz lista para el HMM.
+Calentamiento: las primeras ``warmup_bars(...) = max(realized_vol_window, N,
+volume_zscore_window + N - 2)`` filas tienen algún ``NaN`` (con 24, 168 y N = 24:
+190 velas; con N = 1: 167). ``feature_matrix`` las descarta y devuelve la matriz
+lista para el HMM.
 
 La estandarización (media 0, desvío 1) **no** se hace acá: la hace
 ``FeatureScaler`` (``app.regime.types``), ajustado solo con la ventana de
@@ -37,16 +49,19 @@ entrenamiento y aplicado igual hacia adelante.
 
 Funciones:
 
-- ``compute_features(df, realized_vol_window=24, volume_zscore_window=168)``:
-  ``DataFrame`` con índice igual al de ``df`` y columnas ``FEATURE_COLUMNS``.
-- ``warmup_bars(realized_vol_window, volume_zscore_window)``: cuántas filas
-  iniciales quedan con ``NaN``.
-- ``feature_matrix(df, realized_vol_window=24, volume_zscore_window=168)``:
-  ``(X, index)`` con ``X`` de forma ``(T, 4)`` en float64, sin el calentamiento.
+- ``compute_features(df, realized_vol_window=24, volume_zscore_window=168,
+  smoothing_window=1)``: ``DataFrame`` con índice igual al de ``df`` y columnas
+  ``FEATURE_COLUMNS``.
+- ``warmup_bars(realized_vol_window, volume_zscore_window, smoothing_window=1)``:
+  cuántas filas iniciales quedan con ``NaN``.
+- ``feature_matrix(df, realized_vol_window=24, volume_zscore_window=168,
+  smoothing_window=1)``: ``(X, index)`` con ``X`` de forma ``(T, 4)`` en float64,
+  sin el calentamiento.
 
 Validaciones (``ValueError`` en español): faltan columnas, índice que no es
 ``DatetimeIndex`` ordenado y sin duplicados, precios no finitos o <= 0, volumen
-no finito o negativo, velas sin cerrar, ventanas menores a 2.
+no finito o negativo, velas sin cerrar, ventanas menores a 2 (el suavizado
+admite 1).
 
 ``FEATURE_COLUMNS`` se toma de ``app.regime.types``, que es un módulo hoja
 (solo depende de numpy), así la capa de indicadores no arrastra el resto del
@@ -72,6 +87,11 @@ def _require_window(window: int, name: str) -> int:
     if w < 2:
         raise ValueError(f"{name} tiene que ser un entero mayor o igual a 2 (llegó {window!r})")
     return w
+
+
+def _require_smoothing(window: int) -> int:
+    """Valida el suavizado: entero >= 1 (1 = sin suavizar)."""
+    return require_period(window, "smoothing_window")
 
 
 def _validate_candles(df: pd.DataFrame) -> None:
@@ -128,23 +148,51 @@ def _rolling_mean_std(values: np.ndarray, window: int) -> tuple[np.ndarray, np.n
     return mean, std
 
 
-def warmup_bars(realized_vol_window: int = 24, volume_zscore_window: int = 168) -> int:
+def _rolling_sum_mean(values: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray]:
+    """Suma y media de la ventana que termina en cada fila (``NaN`` si falta algún dato).
+
+    Igual que ``_rolling_mean_std``: cada ventana se reduce por separado sobre
+    una copia contigua, así el valor de una vela no depende de cuántas velas
+    haya antes o después. Con ``window == 1`` devuelve los mismos valores.
+    """
+    n = len(values)
+    total = np.full(n, np.nan)
+    if window == 1:
+        return values.copy(), values.copy()
+    if n < window:
+        return total, total.copy()
+    windows = np.ascontiguousarray(sliding_window_view(values, window))
+    total[window - 1 :] = windows.sum(axis=1)
+    return total, total / window
+
+
+def warmup_bars(
+    realized_vol_window: int = 24, volume_zscore_window: int = 168, smoothing_window: int = 1
+) -> int:
     """Cantidad de filas iniciales de ``compute_features`` con algún ``NaN``.
 
     ``realized_vol`` necesita ``realized_vol_window`` retornos (el primero sale
-    de la segunda vela) y ``volume_z`` necesita ``volume_zscore_window`` velas.
+    de la segunda vela), el retorno acumulado necesita ``smoothing_window``
+    retornos, el rango promedio ``smoothing_window`` velas y ``volume_z``
+    necesita ``volume_zscore_window`` velas más ``smoothing_window - 1`` para
+    el promedio.
     """
     rv = _require_window(realized_vol_window, "realized_vol_window")
     vz = _require_window(volume_zscore_window, "volume_zscore_window")
-    return max(rv, vz - 1)
+    sm = _require_smoothing(smoothing_window)
+    return max(rv, sm, vz + sm - 2)
 
 
 def compute_features(
-    df: pd.DataFrame, realized_vol_window: int = 24, volume_zscore_window: int = 168
+    df: pd.DataFrame,
+    realized_vol_window: int = 24,
+    volume_zscore_window: int = 168,
+    smoothing_window: int = 1,
 ) -> pd.DataFrame:
     """Las cuatro features del HMM por vela, causales (ver el docstring del módulo)."""
     rv = _require_window(realized_vol_window, "realized_vol_window")
     vz = _require_window(volume_zscore_window, "volume_zscore_window")
+    sm = _require_smoothing(smoothing_window)
     _validate_candles(df)
 
     high = df["high"].to_numpy(dtype="float64")
@@ -169,17 +217,26 @@ def compute_features(
     volume_z[has_std] = 0.0  # ventana constante: volumen en su nivel habitual
     volume_z[positive] = (log_volume[positive] - vol_mean[positive]) / vol_std[positive]
 
+    # La volatilidad realizada se calcula sobre los retornos de cada vela; recién
+    # después se resumen retorno, rango y volumen en las últimas ``sm`` velas.
+    return_sum, _ = _rolling_sum_mean(log_return, sm)
+    _, range_mean = _rolling_sum_mean(range_pct, sm)
+    _, volume_z_mean = _rolling_sum_mean(volume_z, sm)
+
     columns = {
-        "log_return": log_return,
+        "log_return": return_sum,
         "realized_vol": realized_vol,
-        "range_pct": range_pct,
-        "volume_z": volume_z,
+        "range_pct": range_mean,
+        "volume_z": volume_z_mean,
     }
     return pd.DataFrame({name: columns[name] for name in FEATURE_COLUMNS}, index=df.index)
 
 
 def feature_matrix(
-    df: pd.DataFrame, realized_vol_window: int = 24, volume_zscore_window: int = 168
+    df: pd.DataFrame,
+    realized_vol_window: int = 24,
+    volume_zscore_window: int = 168,
+    smoothing_window: int = 1,
 ) -> tuple[np.ndarray, pd.DatetimeIndex]:
     """Matriz ``(T, 4)`` float64 para el HMM, sin las filas de calentamiento.
 
@@ -187,7 +244,7 @@ def feature_matrix(
     las velas se validan antes (precios > 0, volumen >= 0, todo finito), las
     únicas filas con ``NaN`` son exactamente las ``warmup_bars(...)`` primeras.
     """
-    features = compute_features(df, realized_vol_window, volume_zscore_window)
+    features = compute_features(df, realized_vol_window, volume_zscore_window, smoothing_window)
     values = features.to_numpy(dtype="float64")
     keep = np.isfinite(values).all(axis=1)
     X = np.ascontiguousarray(values[keep])

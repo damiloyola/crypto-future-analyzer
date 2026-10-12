@@ -182,8 +182,13 @@ regime:
   features:
     realized_vol_window: 24    # velas para la volatilidad realizada
     volume_zscore_window: 168  # velas para el z-score del volumen (1 semana)
+    # Decisión del usuario: el régimen mira el "resumen" de las últimas N velas
+    # (retorno acumulado, rango promedio y volumen promedio) en vez de cada vela
+    # suelta. Con 1 vela, una sola vela grande ya cuenta como Crash/Euforia y el
+    # régimen salta cada pocas horas. 1 = sin suavizar (la especificación literal).
+    smoothing_window: 24
   n_states_min: 3
-  n_states_max: 7
+  n_states_max: 5              # decisión del usuario: 5 tipos con nombres claros
   selection_criterion: "bic"   # el número de estados se elige solo, por BIC
   covariance_type: "full"
   n_restarts: 5                # inicializaciones por cada número de estados
@@ -192,7 +197,7 @@ regime:
   random_seed: 42
   retrain_every_days: 7
   # true = si el modelo tiene más de retrain_every_days días, se reentrena solo
-  # antes de analizar (tarda alrededor de un minuto).
+  # antes de analizar (tarda menos de un minuto por moneda).
   auto_retrain: true
   models_dir: "data/models"
   synthetic_models_dir: "data/models/sintetico"  # modo --offline: nunca pisa los reales

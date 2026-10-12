@@ -402,3 +402,71 @@ def test_invalid_windows_raise(bad: object):
         feature_matrix(df, volume_zscore_window=bad)  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         warmup_bars(bad, 168)  # type: ignore[arg-type]
+
+
+# --- suavizado (decisión del usuario: resumen de las últimas 24 velas) --------
+
+
+@pytest.mark.parametrize("sm", [2, 5, 24])
+def test_smoothed_values_match_definition(sm: int):
+    df = random_walk_candles(21, n=400)
+    raw = compute_features(df, 24, 168, smoothing_window=1)
+    smooth = compute_features(df, 24, 168, smoothing_window=sm)
+    close = df["close"].to_numpy()
+    # Retorno acumulado de N velas = ln(close[t] / close[t-N]).
+    expected_ret = np.full(len(df), np.nan)
+    expected_ret[sm:] = np.log(close[sm:] / close[:-sm])
+    np.testing.assert_allclose(smooth["log_return"], expected_ret, rtol=1e-12, atol=1e-12)
+    # Rango y volumen: promedios de las últimas N velas; la volatilidad no se toca.
+    np.testing.assert_allclose(
+        smooth["range_pct"], raw["range_pct"].rolling(sm).mean(), rtol=1e-12, atol=1e-15
+    )
+    np.testing.assert_allclose(
+        smooth["volume_z"], raw["volume_z"].rolling(sm).mean(), rtol=1e-12, atol=1e-12
+    )
+    pd.testing.assert_series_equal(smooth["realized_vol"], raw["realized_vol"])
+
+
+def test_smoothing_one_is_the_literal_spec():
+    df = random_walk_candles(3, n=300)
+    pd.testing.assert_frame_equal(
+        compute_features(df, 24, 168), compute_features(df, 24, 168, smoothing_window=1)
+    )
+
+
+@pytest.mark.parametrize(("rv", "vz", "sm"), [(24, 168, 24), (24, 168, 1), (5, 3, 8), (10, 4, 2)])
+def test_smoothed_warmup_and_causality(rv: int, vz: int, sm: int):
+    df = random_walk_candles(5, n=320)
+    full = compute_features(df, rv, vz, sm)
+    warm = warmup_bars(rv, vz, sm)
+    assert leading_nan_rows(full) == warm
+    assert np.isfinite(full.iloc[warm:].to_numpy()).all()
+    # Causal: calcular sobre un prefijo da exactamente lo mismo, bit a bit.
+    for k in (1, warm - 1, warm, warm + 1, 250, 320):
+        if k < 1:
+            continue
+        pd.testing.assert_frame_equal(compute_features(df.iloc[:k], rv, vz, sm), full.iloc[:k])
+    # Cambiar el futuro no cambia el pasado.
+    changed = df.copy()
+    changed.iloc[200:, changed.columns.get_loc("close")] *= 3.0
+    changed.iloc[200:, changed.columns.get_loc("high")] *= 3.0
+    changed.iloc[200:, changed.columns.get_loc("low")] *= 3.0
+    changed.iloc[200:, changed.columns.get_loc("volume")] *= 50.0
+    pd.testing.assert_frame_equal(compute_features(changed, rv, vz, sm).iloc[:200], full.iloc[:200])
+
+
+def test_feature_matrix_with_config_smoothing(settings: AppSettings):
+    f = settings.regime.features
+    assert f.smoothing_window == 24  # decisión del usuario
+    df = random_walk_candles(9, n=600)
+    X, index = feature_matrix(df, f.realized_vol_window, f.volume_zscore_window, f.smoothing_window)
+    warm = warmup_bars(f.realized_vol_window, f.volume_zscore_window, f.smoothing_window)
+    assert warm == 190
+    assert X.shape == (600 - warm, 4) and index.equals(df.index[warm:])
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, True, None])
+def test_invalid_smoothing_raises(bad: object):
+    df = random_walk_candles(1, n=50)
+    with pytest.raises(ValueError):
+        compute_features(df, 24, 168, smoothing_window=bad)  # type: ignore[arg-type]

@@ -12,10 +12,10 @@
   Si el retorno es <= 0 queda más abajo (más "crash"); si es > 0, más arriba
   (más "euforia"). Esa tolerancia es numérica (1e-12): con modelos entrenados
   los retornos medios casi nunca empatan, así que en la práctica el orden (y
-  el nombre) sale solo del retorno medio, sin mirar el signo ni la
-  volatilidad. Por eso puede pasar que "Crash" no sea el estado más volátil o
-  que un estado "Alcista" tenga retorno medio apenas negativo; cambiarlo es una
-  decisión pendiente del usuario (ver el README, Hito 3).
+  el nombre) sale solo del retorno medio. Como la feature de retorno es el
+  retorno acumulado de las últimas ``regime.features.smoothing_window`` velas
+  (decisión del usuario), ese orden refleja la tendencia del día y no una vela
+  suelta; ``return_window`` lo vuelve a pasar a retorno por vela para mostrarlo.
 
 - ``stationary_distribution(transmat)``: distribución estacionaria de la cadena
   (la fracción de tiempo que, a la larga, se pasa en cada estado). Es la
@@ -154,14 +154,21 @@ def label_states(
     hmm: Any,
     scaler: FeatureScaler,
     labels_for_n: Sequence[RegimeLabel],
+    return_window: int = 1,
 ) -> tuple[StateInfo, ...]:
     """Etiqueta los estados de un ``GaussianHMM`` entrenado.
 
     ``hmm.means_`` está en espacio estandarizado; se pasa a unidades reales con
     el escalador para tener retorno logarítmico medio por vela, volatilidad
-    realizada media y rango medio de cada estado. Devuelve una tupla de
-    ``StateInfo`` indexada por el índice interno del HMM.
+    realizada media y rango medio de cada estado. ``return_window`` es la
+    cantidad de velas que suma la feature de retorno
+    (``regime.features.smoothing_window``): el retorno medio se divide por eso
+    para que ``StateInfo.mean_return`` sea siempre **por vela** (el orden de los
+    estados no cambia). Devuelve una tupla de ``StateInfo`` indexada por el
+    índice interno del HMM.
     """
+    if isinstance(return_window, bool) or int(return_window) != return_window or return_window < 1:
+        raise LabelingError(f"return_window tiene que ser un entero >= 1 (llegó {return_window!r})")
     means_z = np.asarray(hmm.means_, dtype=float)
     transmat = np.asarray(hmm.transmat_, dtype=float)
     n_states = means_z.shape[0]
@@ -173,7 +180,7 @@ def label_states(
         raise LabelingError("la matriz de transición no coincide con la cantidad de estados")
 
     raw = scaler.inverse_transform(means_z)
-    mean_return = raw[:, _feature_index(scaler, "log_return")]
+    mean_return = raw[:, _feature_index(scaler, "log_return")] / int(return_window)
     mean_volatility = raw[:, _feature_index(scaler, "realized_vol")]
     mean_range = raw[:, _feature_index(scaler, "range_pct")]
 

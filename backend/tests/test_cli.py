@@ -618,6 +618,7 @@ def test_regime_section_shows_both_timeframes(btc_text, btc_json):
     block = _regime_block(btc_text)
     assert "1h · el que se usa para operar" in block
     assert "1d · contexto diario" in block
+    assert "Últimos " in block and "cambios de régimen" in block or "cambio de régimen" in block
     for label in ("Régimen actual", "Confianza", "Empezó", "Estabilidad", "Modelo"):
         assert block.count(label) == 2, label
     assert "Retorno medio por vela" in block and "% del tiempo" in block
@@ -649,6 +650,16 @@ def test_regime_json_structure(btc_json):
         assert len(g["states"]) == g["model"]["n_states"]
         assert isinstance(g["confirmed"], bool) and isinstance(g["unstable"], bool)
     assert btc_json["regime"]["1h"]["role"] == "main"
+    for tf in ("1h", "1d"):
+        hs = btc_json["regime"][tf]["history_summary"]
+        assert set(hs) == {
+            "bars",
+            "days",
+            "regime_changes",
+            "avg_regime_hours",
+            "unstable_pct",
+            "low_confidence_pct",
+        }
     assert btc_json["regime"]["1d"]["role"] == "context"
 
 

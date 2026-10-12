@@ -59,7 +59,7 @@ def _raw_config() -> dict:
             "tope duro",
         ),
         (lambda c: c["exchanges"]["nexo"].update(allow_orders=True), "fase 1"),
-        (lambda c: c["regime"]["labels"].pop(7), "7 estados"),
+        (lambda c: c["regime"]["labels"].pop(5), "5 estados"),
         (lambda c: c["indicators"].update(rsi_peroid=14), "Extra inputs"),
         (lambda c: c["indicators"]["macd"].update(fast=30), "fast tiene que ser menor"),
         (lambda c: c["indicators"].update(rsi_oversold=80), "rsi_oversold"),

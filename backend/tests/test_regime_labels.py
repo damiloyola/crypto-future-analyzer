@@ -265,3 +265,28 @@ def test_transmat_by_rank_matches_labels(settings):
     order = [s.index for s in model.states_by_rank()]
     assert order == [1, 2, 0]
     np.testing.assert_allclose(model.transmat_by_rank(), A[np.ix_(order, order)])
+
+
+def test_return_window_reports_per_candle_return():
+    """Con la feature de retorno acumulada en N velas, StateInfo informa el retorno POR vela."""
+    from types import SimpleNamespace
+
+    from app.config import RegimeLabel
+    from app.regime.labels import LabelingError, label_states
+    from app.regime.types import FeatureScaler
+
+    means = np.array([[0.024, 0.01, 0.02, 0.0], [-0.048, 0.02, 0.03, 0.0]])
+    hmm = SimpleNamespace(means_=means, transmat_=np.array([[0.9, 0.1], [0.2, 0.8]]))
+    scaler = FeatureScaler(mean=np.zeros(4), scale=np.ones(4))
+    names = [
+        RegimeLabel(name="Bajista", category="bajista"),
+        RegimeLabel(name="Alcista", category="alcista"),
+    ]
+    one = label_states(hmm, scaler, names, return_window=1)
+    day = label_states(hmm, scaler, names, return_window=24)
+    assert [s.rank for s in one] == [s.rank for s in day]  # el orden no cambia
+    assert day[0].mean_return == pytest.approx(0.001)
+    assert day[1].mean_return == pytest.approx(-0.002)
+    assert day[0].mean_volatility == one[0].mean_volatility
+    with pytest.raises(LabelingError):
+        label_states(hmm, scaler, names, return_window=0)

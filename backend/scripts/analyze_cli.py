@@ -968,18 +968,33 @@ def _render_one_regime(tf: str, g: dict[str, Any], style: Style, tz: ZoneInfo) -
         )
     window, limit = g["instability_window"], g["instability_max_changes"]
     changes = g["changes_in_window"]
+    word = "cambio" if changes == 1 else "cambios"
     if g["unstable"]:
         stability = Cell(
-            f"RÉGIMEN INESTABLE: {changes} cambios en las últimas {window} velas (más de "
+            f"RÉGIMEN INESTABLE: {changes} {word} en las últimas {window} velas (más de "
             f"{limit}); conviene operar más chico",
             "alert",
         )
     else:
         stability = Cell(
-            f"estable: {changes} cambios en las últimas {window} velas (inestable si son más "
+            f"estable: {changes} {word} en las últimas {window} velas (inestable si son más "
             f"de {limit})"
         )
     rows.append(("Estabilidad", stability))
+    hs = g.get("history_summary")
+    if hs:
+        n = hs["regime_changes"]
+        every = hs["avg_regime_hours"]
+        every_text = f"{fmt_num(every / 24, 1)} días" if every >= 72 else f"{fmt_num(every, 0)} h"
+        rows.append(
+            (
+                f"Últimos {fmt_num(hs['days'], 0)} días",
+                f"{n} {'cambio' if n == 1 else 'cambios'} de régimen "
+                f"(cada tramo dura ~{every_text}); "
+                f"inestable el {fmt_num(hs['unstable_pct'], 0)} % del tiempo; confianza baja el "
+                f"{fmt_num(hs['low_confidence_pct'], 0)} %",
+            )
+        )
     m = g["model"]
     model_text = (
         f"del {fmt_time(m['trained_at'], tz)}, {m['n_states']} estados (elegidos por BIC), "

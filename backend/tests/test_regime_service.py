@@ -25,7 +25,7 @@ from hmmlearn.hmm import GaussianHMM
 from app.config import AppSettings
 from app.data.synthetic import SyntheticMarketData
 from app.exchanges.base import Timeframe
-from app.indicators.features import feature_matrix
+from app.indicators.features import feature_matrix, warmup_bars
 from app.regime import service
 from app.regime.service import (
     CATEGORY_NAMES,
@@ -326,7 +326,9 @@ def test_short_training_history_is_warned(settings, market, tmp_path):
 def test_short_training_warning_threshold(four_state_status):
     s, status = four_state_status
     model = status.model
-    expected = s.regime.training_days * 24 - 167
+    f = s.regime.features
+    warm = warmup_bars(f.realized_vol_window, f.volume_zscore_window, f.smoothing_window)
+    expected = s.regime.training_days * 24 - warm
     enough = dataclasses.replace(model, n_samples=int(0.8 * expected) + 1)
     few = dataclasses.replace(model, n_samples=int(0.8 * expected) - 1)
     assert service.short_training_warning(enough, s.regime, "1h") is None
@@ -400,7 +402,8 @@ def test_history_covers_display_days_after_burn_in(
     days = cfg.inference_days if timeframe == "1h" else cfg.context_inference_days
     df = market.candles_frame("BTC", timeframe)
     df = df[df["closed"] & (df.index >= pd.Timestamp(FIXED_NOW - timedelta(days=days)))]
-    X, _ = feature_matrix(df, cfg.features.realized_vol_window, cfg.features.volume_zscore_window)
+    f = cfg.features
+    X, _ = feature_matrix(df, f.realized_vol_window, f.volume_zscore_window, f.smoothing_window)
     assert r.bars_analyzed == len(X) - cfg.burn_in_bars
     for b in r.history:
         assert 0.0 <= b.state_prob <= 1.0
@@ -481,9 +484,12 @@ def test_insufficient_history_says_so(settings, tmp_path):
         regime("BTC", "1h", small_settings(settings, tmp_path), short)
     reason = info.value.reason
     assert "no hay suficiente historia" in reason and "velas de 1 hora" in reason
-    # 100 para entrenar + 167 de calentamiento, dicho en palabras simples.
-    assert "hacen falta al menos 267" in reason
-    assert "las primeras 167 solo sirven para calcular los indicadores" in reason
+    # 100 para entrenar + el calentamiento de las features, en palabras simples.
+    f = small_settings(settings, tmp_path).regime.features
+    warm = warmup_bars(f.realized_vol_window, f.volume_zscore_window, f.smoothing_window)
+    assert warm == 190  # 168 de volumen + 24 de suavizado - 2
+    assert f"hacen falta al menos {warm + 100}" in reason
+    assert f"las primeras {warm} solo sirven para calcular los indicadores" in reason
     assert "calentamiento" not in reason and "((" not in reason
 
 
@@ -821,3 +827,30 @@ def test_synthetic_long_history_keeps_recent_candles(settings):
     assert jumps.max() < 0.3
     again = SyntheticMarketData(now=FIXED_NOW, min_history_days=days).candles_frame("AVAX", "1d")
     assert again.equals(daily)  # determinista
+
+
+# --- resumen de la historia (para ver de un vistazo si el régimen se porta bien) ---
+
+
+@pytest.mark.parametrize("tf", ["1h", "1d"])
+def test_history_summary_matches_history(reports, tf):
+    r = reports[tf]
+    hs = r.history_summary()
+    assert hs is not None
+    bars = r.history
+    cats = [b.category for b in bars if b.category is not None]
+    assert hs["bars"] == len(bars)
+    pairs = zip(cats, cats[1:], strict=False)
+    assert hs["regime_changes"] == sum(1 for a, b in pairs if a != b)
+    hours = len(bars) * r.timeframe_minutes / 60
+    assert hs["days"] == pytest.approx(hours / 24)
+    assert hs["avg_regime_hours"] == pytest.approx(hours / (hs["regime_changes"] + 1))
+    assert hs["unstable_pct"] == pytest.approx(100 * sum(b.unstable for b in bars) / len(bars))
+    low = sum(b.confidence < r.low_confidence_threshold for b in bars)
+    assert hs["low_confidence_pct"] == pytest.approx(100 * low / len(bars))
+    assert r.to_dict(include_history=False)["history_summary"] == pytest.approx(hs)
+
+
+def test_history_summary_none_without_history(reports):
+    empty = dataclasses.replace(reports["1h"], history=())
+    assert empty.history_summary() is None

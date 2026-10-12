@@ -70,7 +70,7 @@ def test_offline_trains_and_prints_everything(tmp_path):
     assert out.count("Regímenes, del más bajista al más alcista:") == 2
     assert out.count("Probabilidad de pasar de un régimen a otro") == 2
     assert "Retorno medio por vela" in out and "Duración típica" in out
-    assert "las primeras 167 solo sirven para calcular los indicadores" in out
+    assert "las primeras 190 solo sirven para calcular los indicadores" in out
     assert "tardó" in out and "Guardado en" in out
     assert " h " in out and " días " in out  # duraciones en horas (1h) y días (1d)
     assert LEAKS.search(out) is None

@@ -80,6 +80,8 @@ def small_cfg(settings) -> RegimeConfig:
             "max_iter": 50,
             "min_training_samples": 200,
             "labels": labels_with_two(settings.regime),
+            # La matriz de estos tests ya son las features (sin suavizar).
+            "features": settings.regime.features.model_copy(update={"smoothing_window": 1}),
         }
     )
 
@@ -358,7 +360,7 @@ def test_max_states_choice_is_noted(small_cfg):
     X, _ = sample_source(3, 1500, seed=15)
     model = train_regime_model(X, hourly_index(len(X)), "BTC", "1h", cfg)
     assert model.n_states == 3
-    assert any("cantidad máxima de estados" in n for n in model.notes)
+    assert any("máximo de estados permitido" in n and "no es un problema" in n for n in model.notes)
 
 
 # --- parámetros libres y huella de config -------------------------------------

@@ -62,6 +62,13 @@ El frontend solo muestra lo que devuelve la API; no calcula riesgo.
   manteniendo el riesgo; si no alcanza, achicar la posición hasta el tope de
   apalancamiento (el riesgo baja); si el riesgo queda debajo de
   `min_operable_risk_usd`, "No operar". Mostrar cada ajuste con su motivo.
+- **Régimen (Hito 3):** features resumidas en las últimas 24 velas
+  (`regime.features.smoothing_window: 24`; vela por vela daba Crash/Euforia de
+  2 h e "inestable" la mitad del tiempo), máximo 5 estados (Crash, Bajista,
+  Neutral, Alcista, Euforia), reentrenamiento automático semanal al analizar,
+  inestabilidad y confirmación por cambio de **tipo** (`change_level:
+  category`). Confianza = probabilidad del estado más probable en la última
+  vela (con 5 estados cada tipo es un solo estado).
 - Al usuario hay que explicarle todo en palabras simples (hace mucho que no
   opera futuros) y hacerle las preguntas con opciones (AskUserQuestion).
 
@@ -71,7 +78,7 @@ El contenedor de desarrollo no llega a las APIs. `make cli SYMBOL=BTC
 ARGS="--offline"` usa datos sintéticos (`app/data/synthetic.py`) por el mismo
 camino de código; los tests usan fixtures (`backend/tests/fixtures/README.md`).
 En `--offline` los modelos de régimen van a `regime.synthetic_models_dir` y
-nunca pisan a los reales; la primera corrida entrena (unos 2 minutos por
-moneda con la config real). Los tests del régimen usan configs chicas
+nunca pisan a los reales; la primera corrida entrena (alrededor de 1 minuto y
+cuarto por moneda con la config real). Los tests del régimen usan configs chicas
 (`settings.regime.model_copy(update=...)`) para entrenar en menos de un
 segundo.
