@@ -24,7 +24,8 @@ Reglas
 - ``check_leverage(leverage, profile)``: apalancamiento resultante mayor al tope
   del perfil (el efectivo, con el override manual si lo hay).
 - ``check_daily_limits(trades_today, pnl_today_usd, profile)``: se alcanzó el
-  límite de operaciones o de pérdida del día.
+  límite de operaciones o de pérdida del día. ``daily_loss_limit_reached`` dice
+  si llegó solo el de pérdida (con la misma tolerancia que la regla).
 - ``check_high_volatility_event(flag)``: evento de alta volatilidad marcado a
   mano por el usuario.
 - ``check_min_operable_risk(risk_usd, profile)``: con los ajustes, el riesgo
@@ -48,8 +49,9 @@ Formato de números
 Este módulo también tiene los formateadores que usan los mensajes de ``risk``
 (coma decimal y punto de miles, como se lee en Argentina): ``fmt_num``,
 ``fmt_usd``, ``fmt_leverage``, ``fmt_multiplier``, ``fmt_percent``,
-``fmt_score``, ``fmt_score_beside`` (un score que no llega a un umbral nunca se
-ve redondeado a ese umbral), ``fmt_price`` (con ``price_decimals``, los mismos
+``fmt_score``, ``fmt_score_beside`` y ``fmt_percent_beside`` (un valor que no
+llega a un umbral, o lo pasa apenas, nunca se ve redondeado a ese umbral),
+``fmt_price`` (con ``price_decimals``, los mismos
 decimales que la consola) y ``fmt_ratio``. Y ``json_safe``, que deja un
 resultado listo para JSON (NaN e infinitos pasan a ``None``; los escalares de
 numpy, a ``bool``/``int``/``float`` de Python).
@@ -172,6 +174,17 @@ def fmt_score_beside(value: float, threshold: float) -> str:
     """
     v, decimals = score_beside_threshold(float(value), float(threshold), 1)
     return fmt_num(v, decimals, sign=True)
+
+
+def fmt_percent_beside(value_pct: float, threshold_pct: float) -> str:
+    """Porcentaje que se compara con ``threshold_pct``, sin redondearlo al umbral.
+
+    ``2.004`` contra ``2`` -> ``"2,004 %"`` (``fmt_percent`` diría ``"2 %"`` y el
+    mensaje quedaría "difiere 2 %, más que el 2 %"); lejos del umbral es igual
+    que ``fmt_percent``. Usa ``scoring.components.score_beside_threshold``.
+    """
+    v, decimals = score_beside_threshold(float(value_pct), float(threshold_pct), 2)
+    return fmt_percent(v, decimals)
 
 
 def price_decimals(reference: float) -> int:
@@ -465,7 +478,7 @@ def check_daily_limits(
             problems.append(
                 f"ya hiciste {trades_today} operaciones hoy y el máximo es {max_trades}"
             )
-    if loss >= max_loss * (1.0 - REL_TOL):
+    if daily_loss_limit_reached(loss, max_loss):
         problems.append(f"hoy perdiste {fmt_usd(loss)} y el límite es {fmt_usd(max_loss)}")
     if problems:
         return _fail(DAILY_LIMITS, "; ".join(problems) + ".", "Esperá a mañana.")
@@ -477,6 +490,16 @@ def check_daily_limits(
             f"pérdida {fmt_usd(loss)} de {fmt_usd(max_loss)} permitidos."
         ),
     )
+
+
+def daily_loss_limit_reached(loss_usd: float, max_loss_usd: float) -> bool:
+    """``True`` si la pérdida del día (positiva) ya llegó al límite de pérdida.
+
+    Es la misma comparación que usa ``check_daily_limits`` (con ``REL_TOL``: una
+    pérdida que cae justo en el límite por coma flotante cuenta como alcanzado).
+    Sirve para separar el límite de pérdida del de cantidad de operaciones.
+    """
+    return loss_usd >= max_loss_usd * (1.0 - REL_TOL)
 
 
 # --- evento de alta volatilidad -----------------------------------------------------

@@ -160,7 +160,7 @@ make cli SYMBOL=BTC                                         # plan con el perfil
 make cli SYMBOL=SOL ARGS="--nexo-price 187,45"              # niveles sobre el precio que ves en Nexo
 make cli SYMBOL=ETH ARGS="--max-leverage 30"                # tope a mano, de 1x a 50x (más de 25x: advertencia roja)
 make cli SYMBOL=BTC ARGS='--high-vol-event "Dato de CPI"'   # evento de alta volatilidad: No operar
-make cli SYMBOL=BTC ARGS="--trades-today 2 --pnl-today -30" # cómo te fue hoy (límites del día)
+make cli SYMBOL=BTC ARGS="--trades-today 2 --pnl-today -30" # cómo te fue hoy (el riesgo baja a lo que queda del límite)
 make cli SYMBOL=BTC ARGS="--json"                           # el plan va en "plan" y el score en "score"
 ```
 
@@ -172,34 +172,42 @@ Cómo se arma, en pocas palabras (todos los números están en `config.yaml`):
   o 1h, con un colchón de media vela (0,5 ATR de 15m). Los niveles a menos de
   una vela normal (1 ATR) se saltean.
 - **Objetivos**: TP1 en el siguiente soporte o resistencia (también salteando
-  los que están a menos de 1 ATR); TP2 en 1,5 veces lo que arriesgás, corrido
-  lo justo para que, pagadas las comisiones, ganes al menos lo que pide tu
-  perfil o el régimen (1,5 o 2 por cada 1 que arriesgás); TP3, un "R" más allá.
-  Si el TP2 queda más lejos de lo que se mueve el precio en un día normal (ATR
-  diario), No operar; los objetivos así se marcan "poco probable intradía".
+  los que están a menos de 1 ATR; si ese nivel queda en el TP2 o más lejos, no
+  hay TP1 y el primer objetivo es el TP2); TP2 en 1,5 veces lo que arriesgás,
+  corrido lo justo para que, pagadas las comisiones, ganes al menos lo que pide
+  tu perfil o el régimen (1,5 o 2 por cada 1 que arriesgás); TP3, un "R" más
+  allá. Si el TP2 queda más lejos de lo que se mueve el precio en un día normal
+  (ATR diario), No operar; los objetivos así se marcan "poco probable
+  intradía". Si faltan las velas diarias para saberlo, también No operar.
 - **Tamaño**: primero el riesgo en dólares (50 USD en el perfil agresivo, con
   las comisiones adentro), de ahí el tamaño, y el apalancamiento sale solo
   (tamaño / margen). Si pasa tu tope o la liquidación queda cerca del stop, la
   app sube el margen; si no alcanza, achica la posición; si el riesgo queda
   debajo del mínimo, No operar. Si la posición queda más chica que el margen
   (menos de 1x, pasa con stops muy lejos), el margen baja solo a 1x. Cada
-  ajuste (también los del régimen) se muestra con su motivo.
+  ajuste (también los del régimen) se muestra con su motivo. En Euforia, si no
+  hay dato de funding, se toma como muy alto (riesgo × 0,5 para los longs).
+- **Límite de pérdida del día**: el riesgo se achica a lo que te queda del
+  límite (por ejemplo, si perdiste 80 de tus 100 USD, la operación arriesga 20
+  en vez de 50), así un stop no te hace pasar el límite. Si lo que queda es
+  menos que el mínimo operable (15 USD en el perfil agresivo), No operar hasta
+  mañana. El tope vale también para los niveles de referencia de un plan
+  bloqueado (por ejemplo, si ya hiciste todas las operaciones del día).
 - **No operar** también si: 4h y 1h van en direcciones opuestas, el régimen lo
   bloquea (por ejemplo, long en Crash), el score no llega al mínimo que pide el
   régimen (por ejemplo, +50 para un long con el régimen Bajista), llegaste al
-  límite de operaciones o de pérdida del día, o marcaste un evento de alta
-  volatilidad. Se listan todas las reglas que fallan, cada una con una
-  sugerencia, y los niveles se muestran igual como "referencia, no operar" para
-  que veas por qué.
-- **Avisos que no bloquean**: si el precio de Nexo que cargaste difiere más de
-  2 % del de Binance (¿error de tipeo?), el plan te pide revisarlo y no
-  recomienda la entrada alternativa; si con lo que ya perdiste hoy esta
-  operación te haría pasar el límite del día al tocar el stop, también avisa.
+  límite de operaciones o de pérdida del día, marcaste un evento de alta
+  volatilidad, o el precio de Nexo que cargaste difiere más de 2 % del de
+  Binance (¿error de tipeo?: se muestran los dos precios y hay que corregirlo).
+  Se listan todas las reglas que fallan, cada una con una sugerencia, y los
+  niveles se muestran igual como "referencia, no operar" para que veas por qué.
 - **Entrada alternativa**: una orden límite en el soporte (long) o la
-  resistencia (short) más cercano de 15m, con su propio stop, tamaño, ajustes,
-  liquidación y comisiones.
-- **Stop por tiempo**: si en 24 h no tocó el TP1 ni el stop, cerrá (la hora se
-  muestra en tu zona horaria). También estima el funding de esas 24 h.
+  resistencia (short) más cercano de 15m, salteando los que están a menos de
+  1 ATR del precio (pegados al precio sería casi lo mismo que entrar a
+  mercado), con su propio stop, tamaño, ajustes, liquidación y comisiones.
+- **Stop por tiempo**: si en 24 h no tocó el TP1 (o el TP2, si no hay TP1) ni
+  el stop, cerrá (la hora se muestra en tu zona horaria). También estima el
+  funding de esas 24 h (aparte del riesgo).
 
 ## Configuración
 

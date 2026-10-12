@@ -565,6 +565,23 @@ async def test_execution_price_manual_threshold_comes_from_config(settings):
     assert len(ep.warnings) == 1 and "difiere 0,03 %" in ep.warnings[0]
 
 
+@pytest.mark.parametrize(("reference", "manual"), [(3.0, 3.06), (3.0, 2.94), (0.07, 0.0686)])
+async def test_execution_price_manual_exactly_at_the_max_diff_does_not_warn(
+    settings, reference, manual
+):
+    # Justo 2 % de diferencia: la cuenta da 2,0000000000000018 % por coma
+    # flotante, pero solo "más que" el máximo es sospechoso.
+    assert settings.exchanges.nexo.manual_price_max_diff_pct == 2.0
+    market = FakeSource("binance", price=reference)
+    ep = await get_execution_price("XRP", market, FakeNexo(), settings, manual_price=manual)
+    assert abs(ep.diff_pct) > 2.0  # el ruido está
+    assert ep.warnings == []
+    # Apenas más que el máximo sí avisa.
+    market = FakeSource("binance", price=3.0)
+    ep = await get_execution_price("XRP", market, FakeNexo(), settings, manual_price=3.0601)
+    assert len(ep.warnings) == 1 and "difiere 2,00 %" in ep.warnings[0]
+
+
 @pytest.mark.parametrize("bad", [0, -5, float("nan"), float("inf")])
 async def test_execution_price_manual_must_be_positive(settings, bad):
     with pytest.raises(ValueError, match="mayor que 0"):

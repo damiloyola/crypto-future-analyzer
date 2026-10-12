@@ -13,6 +13,7 @@ from app.risk.regime_adjustments import (
     LOW_CONFIDENCE,
     MIN_OPERABLE_RISK,
     REGIME_BLOCKED,
+    REGIME_FUNDING_ASSUMED_HIGH,
     REGIME_FUNDING_NORMAL,
     REGIME_FUNDING_UNKNOWN,
     REGIME_MIN_RR,
@@ -181,8 +182,38 @@ def test_euforia_long_with_normal_funding_keeps_risk(settings, agresivo):
 
 
 @pytest.mark.parametrize("funding", [None, float("nan")])
-def test_euforia_long_without_funding_does_not_apply_and_says_so(settings, agresivo, funding):
+def test_euforia_long_without_funding_takes_it_as_very_high(settings, agresivo, funding):
+    # Decisión del usuario: sin dato de funding se toma como muy alto (× 0,5).
+    assert settings.regime_adjustments.assume_funding_very_high_if_missing is True
     r = apply_regime_adjustments("long", 60, regime("euforia"), funding, agresivo, settings)
+    assert r.risk_multiplier == pytest.approx(0.5)
+    assert r.risk_usd == pytest.approx(25.0)
+    assert r.adjustments == (
+        Adjustment(
+            REGIME_FUNDING_ASSUMED_HIGH,
+            "Riesgo × 0,5: régimen Euforia (subida exagerada) y no hay dato de funding, así "
+            "que se toma como muy alto (por las dudas, el lado prudente).",
+            0.5,
+        ),
+    )
+
+
+def test_euforia_short_without_funding_is_not_touched(settings, agresivo):
+    # El × 0,5 por funding es solo para los longs en Euforia.
+    r = apply_regime_adjustments("short", -60, regime("euforia"), None, agresivo, settings)
+    assert r.risk_multiplier == 1.0
+    assert REGIME_FUNDING_ASSUMED_HIGH not in codes(r)
+
+
+@pytest.mark.parametrize("funding", [None, float("nan")])
+def test_euforia_long_without_funding_does_not_apply_if_the_config_says_so(
+    settings, agresivo, funding
+):
+    cfg = settings.regime_adjustments.model_copy(
+        update={"assume_funding_very_high_if_missing": False}
+    )
+    s = settings.model_copy(update={"regime_adjustments": cfg})
+    r = apply_regime_adjustments("long", 60, regime("euforia"), funding, agresivo, s)
     assert r.risk_multiplier == 1.0
     assert codes(r) == [REGIME_FUNDING_UNKNOWN]
     assert r.adjustments[0].risk_multiplier == 1.0

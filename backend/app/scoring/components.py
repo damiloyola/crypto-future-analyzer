@@ -18,24 +18,30 @@ Componentes
         debajo (vale +1 en ``ob``, 0 en ``n`` y -1 en ``os``). En sobrecompra el
         aporte alcista "se recorta": baja en línea recta de +1 en ``ob`` a 0 en
         100. En sobreventa, espejado: de -1 en ``os`` a 0 en 0.
-      * MACD (``macd_score``): ``0,5 × signo(macd - señal) + 0,5 × signo(macd)``.
+      * MACD (``macd_score``): ``macd_signal_weight × signo(macd - señal) +
+        macd_zero_weight × signo(macd)`` (con la config, 0,5 y 0,5).
     - **Derivados** (``derivatives_component``): suma de tres partes, recortada
       a [-1, +1]. ``f`` es el funding en % **por 8 h** (``funding_pct_per_8h``
       lo normaliza con el intervalo que informa el exchange: los umbrales de la
       config están en "% cada 8 h").
 
-      * Funding (``funding_part``): ``f >= funding_very_high_pct`` -1;
-        ``f >= funding_high_pct`` -0,5; ``f <= funding_low_pct`` +0,5; si no, 0.
+      Cuánto suma o resta cada parte también sale de la config (entre
+      paréntesis, los valores de ``config.yaml``).
+
+      * Funding (``funding_part``): ``f >= funding_very_high_pct`` resta
+        ``funding_very_high_part`` (1); ``f >= funding_high_pct`` resta
+        ``funding_high_part`` (0,5); ``f <= funding_low_pct`` suma
+        ``funding_low_part`` (0,5); si no, 0.
       * Interés abierto (``open_interest_part``, decisión del usuario): solo
         cuenta con el OI subiendo (``>= oi_rising_pct``) y un funding que ya
         marca un lado sobrecargado. ``f >= funding_high_pct``: longs
-        sobrecargados con el OI subiendo, riesgo de caída (-0,5);
-        ``f <= funding_low_pct``: shorts sobrecargados con el OI subiendo
-        (+0,5). Con el funding normal (por ejemplo +0,01 %) la suba del OI no
-        cuenta (0). Sin funding no se puede interpretar.
+        sobrecargados con el OI subiendo, riesgo de caída (resta ``oi_part``,
+        0,5); ``f <= funding_low_pct``: shorts sobrecargados con el OI subiendo
+        (suma ``oi_part``). Con el funding normal (por ejemplo +0,01 %) la suba
+        del OI no cuenta (0). Sin funding no se puede interpretar.
       * Ratio long/short de cuentas (``long_short_part``):
-        ``>= long_short_crowded_long`` -0,5; ``<= long_short_crowded_short``
-        +0,5.
+        ``>= long_short_crowded_long`` resta ``long_short_part`` (0,5);
+        ``<= long_short_crowded_short`` lo suma.
     - **Sentimiento** (``sentiment_component``): Fear & Greed (``fear_greed_part``)
       en modo ``"contrarian"`` (el miedo suma al long, la codicia resta, a pleno
       desde los extremos ``fear_greed_extreme_fear`` / ``extreme_greed``) o
@@ -205,9 +211,13 @@ def rsi_score(rsi: float, neutral: float, overbought: float, oversold: float) ->
     return (r - neutral) / (neutral - oversold)
 
 
-def macd_score(macd: float, signal: float) -> float:
-    """``0,5 × signo(macd - señal) + 0,5 × signo(macd)``: -1, -0,5, 0, +0,5 o +1."""
-    return 0.5 * _sign(macd - signal) + 0.5 * _sign(macd)
+def macd_score(macd: float, signal: float, cfg: MomentumScoringConfig) -> float:
+    """``macd_signal_weight × signo(macd - señal) + macd_zero_weight × signo(macd)``.
+
+    Con la config (0,5 y 0,5) da -1, -0,5, 0, +0,5 o +1. La config valida que
+    los dos pesos no sumen más de 1 (el sub-puntaje queda en [-1, +1]).
+    """
+    return cfg.macd_signal_weight * _sign(macd - signal) + cfg.macd_zero_weight * _sign(macd)
 
 
 def _rsi_text(tf: str, rsi: float, score: float, cfg: MomentumScoringConfig) -> str:
@@ -264,7 +274,7 @@ def momentum_component(
         if macd is None or signal is None:
             missing.append(f"MACD {tf}")
         else:
-            s = macd_score(macd, signal)
+            s = macd_score(macd, signal, cfg)
             scores.append(s)
             details.append(_macd_text(tf, macd, signal, s))
     if not scores:
@@ -296,13 +306,14 @@ def funding_pct_per_8h(rate: float, interval_hours: float) -> float:
 
 
 def funding_part(f_pct_8h: float, cfg: DerivativesScoringConfig) -> float:
-    """-1 si el funding es muy alto, -0,5 si es alto, +0,5 si es negativo, si no 0."""
+    """Resta ``funding_very_high_part`` si el funding es muy alto, ``funding_high_part``
+    si es alto, suma ``funding_low_part`` si es negativo; si no, 0."""
     if f_pct_8h >= cfg.funding_very_high_pct:
-        return -1.0
+        return -cfg.funding_very_high_part + 0.0  # sin "-0.0"
     if f_pct_8h >= cfg.funding_high_pct:
-        return -0.5
+        return -cfg.funding_high_part + 0.0
     if f_pct_8h <= cfg.funding_low_pct:
-        return 0.5
+        return cfg.funding_low_part
     return 0.0
 
 
@@ -311,67 +322,74 @@ def open_interest_part(
 ) -> float:
     """Aporte del OI: solo cuenta si sube y el funding ya marca un lado sobrecargado.
 
-    Con ``oi_change_pct >= oi_rising_pct``: -0,5 si ``f_pct_8h >=
-    funding_high_pct`` (longs sobrecargados), +0,5 si ``f_pct_8h <=
+    Con ``oi_change_pct >= oi_rising_pct``: resta ``oi_part`` si ``f_pct_8h >=
+    funding_high_pct`` (longs sobrecargados), suma ``oi_part`` si ``f_pct_8h <=
     funding_low_pct`` (shorts sobrecargados) y 0 con el funding normal. Con el
     OI quieto o bajando, 0. ``f_pct_8h`` es el funding en % por 8 h.
     """
     if oi_change_pct < cfg.oi_rising_pct:
         return 0.0
     if f_pct_8h >= cfg.funding_high_pct:
-        return -0.5
+        return -cfg.oi_part + 0.0  # sin "-0.0"
     if f_pct_8h <= cfg.funding_low_pct:
-        return 0.5
+        return cfg.oi_part
     return 0.0
 
 
 def long_short_part(ratio: float, cfg: DerivativesScoringConfig) -> float:
-    """-0,5 con exceso de cuentas en long; +0,5 con exceso en short; si no, 0."""
+    """Resta ``cfg.long_short_part`` con exceso de cuentas en long, la suma con
+    exceso en short; si no, 0."""
     if ratio >= cfg.long_short_crowded_long:
-        return -0.5
+        return -cfg.long_short_part + 0.0  # sin "-0.0"
     if ratio <= cfg.long_short_crowded_short:
-        return 0.5
+        return cfg.long_short_part
     return 0.0
 
 
-def _funding_text(rate: float, interval: float, f: float, part: float) -> str:
+# Los textos se eligen por los umbrales (no por el tamaño de la parte, que se
+# puede poner en 0 en la config sin que el texto pase a decir "normal").
+
+
+def _funding_text(
+    rate: float, interval: float, f: float, part: float, cfg: DerivativesScoringConfig
+) -> str:
     per_8h = f"{fmt_num(f, 4)} % cada {fmt_num(FUNDING_REFERENCE_HOURS)} h"
     if math.isclose(interval, FUNDING_REFERENCE_HOURS):
         head = f"Funding {per_8h}"
     else:
         head = f"Funding {fmt_num(rate * 100.0, 4)} % cada {fmt_num(interval)} h (= {per_8h})"
-    if part <= -1.0:
+    if f >= cfg.funding_very_high_pct:
         why = "muy alto, demasiados longs pagando por mantenerse, riesgo de caída"
-    elif part < 0:
+    elif f >= cfg.funding_high_pct:
         why = "alto, longs sobrecargados, riesgo de caída"
-    elif part > 0:
+    elif f <= cfg.funding_low_pct:
         why = "negativo, shorts sobrecargados, puede rebotar"
     else:
         why = "normal"
     return f"{head}: {why} {_contrib(part)}."
 
 
-def _oi_text(oi: float, part: float, cfg: DerivativesScoringConfig) -> str:
+def _oi_text(oi: float, f: float, part: float, cfg: DerivativesScoringConfig) -> str:
     head = f"Interés abierto {fmt_num(oi, 1, signed=True)} % en {cfg.oi_lookback_hours} h"
     if oi < cfg.oi_rising_pct:
         return (
             f"{head}: no sube {fmt_num(cfg.oi_rising_pct, 1)} % o más, no indica nada "
             f"{_contrib(part)}."
         )
-    if part < 0:
+    if f >= cfg.funding_high_pct:
         text = "con funding alto: longs sobrecargados con el OI subiendo, riesgo de caída"
-    elif part > 0:
+    elif f <= cfg.funding_low_pct:
         text = "con funding negativo: shorts sobrecargados con el OI subiendo, riesgo de suba"
     else:
         text = "con funding normal: ningún lado está sobrecargado, así que la suba del OI no cuenta"
     return f"{head} {text} {_contrib(part)}."
 
 
-def _long_short_text(ratio: float, part: float) -> str:
+def _long_short_text(ratio: float, part: float, cfg: DerivativesScoringConfig) -> str:
     head = f"Ratio long/short de cuentas {fmt_num(ratio, 2)}"
-    if part < 0:
+    if ratio >= cfg.long_short_crowded_long:
         why = "demasiadas cuentas en long, riesgo de caída"
-    elif part > 0:
+    elif ratio <= cfg.long_short_crowded_short:
         why = "demasiadas cuentas en short, riesgo de suba"
     else:
         why = "equilibrado"
@@ -416,7 +434,7 @@ def derivatives_component(
         f = funding_pct_per_8h(rate, interval)
         p = funding_part(f, cfg)
         parts.append(p)
-        details.append(_funding_text(rate, interval, f, p))
+        details.append(_funding_text(rate, interval, f, p, cfg))
     if oi is None:
         missing.append("interés abierto")
     elif f is None:
@@ -428,13 +446,13 @@ def derivatives_component(
     else:
         p = open_interest_part(oi, f, cfg)
         parts.append(p)
-        details.append(_oi_text(oi, p, cfg))
+        details.append(_oi_text(oi, f, p, cfg))
     if ratio is None:
         missing.append("ratio long/short")
     else:
         p = long_short_part(ratio, cfg)
         parts.append(p)
-        details.append(_long_short_text(ratio, p))
+        details.append(_long_short_text(ratio, p, cfg))
 
     if not parts:
         return ComponentReading(

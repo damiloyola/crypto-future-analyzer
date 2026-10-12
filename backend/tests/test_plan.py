@@ -27,11 +27,16 @@ from app.indicators.pipeline import analyze_all
 from app.risk.fees import fee_rates_from_config, funding_cost_usd, net_rr
 from app.risk.liquidation import mmr_from_config
 from app.risk.plan import (
+    DAILY_LOSS_CAP,
     ENTRY_LIMIT,
     ENTRY_MARKET,
     FLAG_TP1_BEYOND_TP2,
     FLAG_UNLIKELY_INTRADAY,
+    PRICE_CHECK,
     REGIME_RULE,
+    SOURCE_DAILY_LIMIT,
+    SOURCE_POSITION,
+    SOURCE_REGIME,
     STATUS_LONG,
     STATUS_NO_TRADE,
     STATUS_SHORT,
@@ -48,7 +53,15 @@ from app.risk.plan import (
     plan_inputs_from_analysis,
 )
 from app.risk.profiles import get_profile
-from app.risk.rules import DAILY_LIMITS, DIRECTION, HIGH_VOLATILITY_EVENT, MIN_RR
+from app.risk.rules import (
+    DAILY_LIMITS,
+    DIRECTION,
+    HIGH_VOLATILITY_EVENT,
+    MIN_OPERABLE_RISK,
+    MIN_RR,
+    fmt_num,
+    fmt_price,
+)
 from app.risk.rules import TIMEFRAME_CONFLICT as TF_CONFLICT
 from app.scoring import compute_score, inputs_from_analysis
 from app.scoring.components import funding_pct_per_8h
@@ -344,12 +357,64 @@ def test_missing_tp1_does_not_block(settings):
     assert plan.time_stop.target_name == "TP2"
 
 
-def test_tp1_beyond_tp2_is_flagged_and_time_stop_uses_tp2(settings):
+def test_tp1_beyond_tp2_is_dropped_and_time_stop_uses_tp2(settings):
+    # Decisión del usuario: la resistencia de 61.400 queda más lejos que el TP2
+    # (~61.005): no hay TP1, quedan TP2 y TP3 y el stop por tiempo mira el TP2.
+    assert settings.trade_plan.take_profit.drop_tp1_beyond_tp2 is True
     plan = plan_for(settings, levels_15m=(59500.0, 61400.0), levels_1h=(58800.0,))
+    assert plan.status == STATUS_LONG
+    tp2 = plan.take_profit("TP2")
+    assert tp2.price < 61400.0
+    assert plan.take_profit("TP1") is None
+    assert [tp.name for tp in plan.take_profits] == ["TP2", "TP3"]
+    assert plan.tp1_missing_reason == (
+        "No hay TP1: la siguiente resistencia (15m, en 61.400) queda más lejos que el TP2 "
+        f"({fmt_price(tp2.price, ENTRY)}); el primer objetivo es el TP2."
+    )
+    assert plan.time_stop.target_name == "TP2"
+    assert plan.to_dict()["tp1_missing_reason"] == plan.tp1_missing_reason
+
+
+def test_tp1_beyond_tp2_is_dropped_in_a_short_too(settings):
+    plan = plan_for(settings, score=-45.0, levels_15m=(60500.0, 58600.0), levels_1h=(61200.0,))
+    assert plan.status == STATUS_SHORT and plan.stop.price == 60550.0
+    tp2 = plan.take_profit("TP2")
+    assert 58600.0 < tp2.price < ENTRY
+    assert plan.take_profit("TP1") is None
+    assert plan.tp1_missing_reason.startswith(
+        "No hay TP1: el siguiente soporte (15m, en 58.600) queda más lejos que el TP2"
+    )
+    assert plan.time_stop.target_name == "TP2"
+
+
+def test_tp1_exactly_at_tp2_is_dropped(settings):
+    # TP2 fijo en 1,5R (sin el corrimiento por comisiones): 60.000 + 1,5 × 550 = 60.825.
+    s = with_take_profit(settings, tp2_ensure_min_rr=False)
+    plan = build_trade_plan(
+        make_inputs(s, levels_15m=(59500.0, 60825.0), levels_1h=(58800.0,)), s, now=NOW
+    )
+    assert plan.take_profit("TP2").price == pytest.approx(60825.0)
+    assert plan.take_profit("TP1") is None
+    assert "queda en el mismo precio que el TP2" in plan.tp1_missing_reason
+
+
+def test_tp1_beyond_tp2_is_only_flagged_if_the_config_says_so(settings):
+    s = with_take_profit(settings, drop_tp1_beyond_tp2=False)
+    plan = build_trade_plan(
+        make_inputs(s, levels_15m=(59500.0, 61400.0), levels_1h=(58800.0,)), s, now=NOW
+    )
     tp1, tp2 = plan.take_profit("TP1"), plan.take_profit("TP2")
     assert tp1.price > tp2.price
     assert FLAG_TP1_BEYOND_TP2 in tp1.flags
+    assert plan.tp1_missing_reason is None
     assert plan.time_stop.target_name == "TP2"
+
+
+def test_tp1_before_tp2_is_kept(settings):
+    plan = plan_for(settings)
+    tp1, tp2 = plan.take_profit("TP1"), plan.take_profit("TP2")
+    assert tp1.price < tp2.price and FLAG_TP1_BEYOND_TP2 not in tp1.flags
+    assert plan.time_stop.target_name == "TP1"
 
 
 @pytest.mark.parametrize("side_score", [45.0, -45.0])
@@ -501,8 +566,28 @@ def test_daily_range_from_usd_or_pct(settings):
     assert by_pct.daily_range_usd == pytest.approx(1200.0)
 
 
-def test_missing_daily_range_does_not_block_but_warns(settings):
-    plan = plan_for(settings, daily_pct=None)
+@pytest.mark.parametrize("score", [45.0, -45.0])
+def test_missing_daily_range_blocks(settings, score):
+    # Decisión del usuario: sin velas diarias no se sabe si el TP2 es alcanzable hoy.
+    assert settings.trade_plan.block_if_daily_range_missing is True
+    plan = plan_for(settings, score=score, daily_pct=None)
+    assert plan.status == STATUS_NO_TRADE and plan.is_reference
+    assert failing_codes(plan) == [TP2_DAILY_RANGE]
+    rule = plan.blocking_rules[0]
+    assert rule.message == (
+        "No operar: no se puede saber si el objetivo (TP2) es alcanzable hoy: faltan velas "
+        "diarias para medir lo que se mueve el precio en un día normal."
+    )
+    assert rule.suggestion == "Volvé a intentar cuando se puedan bajar las velas diarias."
+    assert plan.headline.startswith("No operar: no se puede saber si el objetivo (TP2)")
+    # La regla ya lo dice: no se repite como aviso.
+    assert not any("rango típico del día" in w for w in plan.warnings)
+    assert len(plan.take_profits) == 3  # los niveles quedan como referencia
+
+
+def test_missing_daily_range_only_warns_if_the_config_says_so(settings):
+    s = with_trade_plan(settings, block_if_daily_range_missing=False)
+    plan = build_trade_plan(make_inputs(s, daily_pct=None), s, now=NOW)
     assert plan.status == STATUS_LONG
     rule = next(r for r in plan.rules if r.code == TP2_DAILY_RANGE)
     assert rule.ok and rule.message.startswith("No hay dato del rango típico del día")
@@ -587,25 +672,76 @@ def test_funding_estimate_without_data_or_disabled(settings):
 
 
 def test_alternative_entry_long_at_nearest_15m_support(settings):
-    # El soporte de 59.950 está a 0,5 ATR: no sirve para el stop, pero sí para entrar.
+    plan = plan_for(settings, levels_15m=(59800.0, 59500.0, 60600.0))
+    assert plan.stop.price == 59750.0
+    alt = plan.alternative
+    assert alt.available and alt.kind == ENTRY_LIMIT and alt.timeframe == "15m"
+    assert alt.level_kind == "soporte" and alt.level_price == 59800.0
+    assert alt.distance_pct == pytest.approx(-200 / 60000 * 100)
+    assert alt.skipped == ()
+    ap = alt.plan
+    assert ap.entry_kind == ENTRY_LIMIT and ap.entry_price == 59800.0
+    assert ap.alternative is None  # la alternativa no tiene su propia alternativa
+    # Su propio stop: el soporte de 59.500 (a 3 ATR de 59.800) menos el colchón.
+    assert ap.stop.price == 59450.0
+    assert ap.headline.startswith("LONG con orden límite en 59.800")
+    d = alt.to_dict()
+    assert d["entry"] == 59800.0 and d["stop"] == 59450.0 and d["status"] == STATUS_LONG
+    assert d["tp2"] == ap.take_profit("TP2").price
+    assert d["max_loss_usd"] == pytest.approx(ap.position.risk_usd)
+    assert d["skipped_levels"] == [] and d["min_distance_atr"] == 1.0
+
+
+def test_alternative_entry_skips_levels_closer_than_one_atr(settings):
+    # Decisión del usuario: el soporte de 59.950 está a 0,5 ATR del precio (casi lo
+    # mismo que entrar a mercado): se saltea, como para el stop.
+    assert settings.trade_plan.alt_entry_min_distance_atr == 1.0
     plan = plan_for(settings, levels_15m=(59950.0, 59500.0, 60600.0))
     assert plan.stop.price == 59450.0
     alt = plan.alternative
-    assert alt.available and alt.kind == ENTRY_LIMIT and alt.timeframe == "15m"
-    assert alt.level_kind == "soporte" and alt.level_price == 59950.0
-    assert alt.distance_pct == pytest.approx(-50 / 60000 * 100)
-    ap = alt.plan
-    assert ap.entry_kind == ENTRY_LIMIT and ap.entry_price == 59950.0
-    assert ap.alternative is None  # la alternativa no tiene su propia alternativa
-    # Su propio stop: el soporte de 59.500 está a 4,5 ATR de 59.950 (más cerca).
-    assert ap.stop.price == 59450.0
-    assert ap.stop.distance_pct < plan.stop.distance_pct
-    assert ap.take_profit("TP2").price < plan.take_profit("TP2").price
-    assert ap.headline.startswith("LONG con orden límite en 59.950")
-    d = alt.to_dict()
-    assert d["entry"] == 59950.0 and d["stop"] == 59450.0 and d["status"] == STATUS_LONG
-    assert d["tp2"] == ap.take_profit("TP2").price
-    assert d["max_loss_usd"] == pytest.approx(ap.position.risk_usd)
+    assert alt.level_price == 59500.0
+    assert [(sk.price, sk.timeframe) for sk in alt.skipped] == [(59950.0, "15m")]
+    assert alt.skipped[0].distance_atr == pytest.approx(0.5)
+    assert alt.plan.entry_price == 59500.0
+    assert alt.to_dict()["skipped_levels"] == [
+        {"price": 59950.0, "timeframe": "15m", "distance_atr": pytest.approx(0.5)}
+    ]
+    # Con el mínimo en 0 se vuelve a usar el nivel pegado.
+    s = with_trade_plan(settings, alt_entry_min_distance_atr=0.0)
+    loose = build_trade_plan(make_inputs(s, levels_15m=(59950.0, 59500.0, 60600.0)), s, now=NOW)
+    assert loose.alternative.level_price == 59950.0 and loose.alternative.skipped == ()
+
+
+def test_alternative_entry_short_skips_levels_closer_than_one_atr(settings):
+    plan = plan_for(settings, score=-45.0, levels_15m=(59500.0, 60080.0, 60600.0))
+    alt = plan.alternative
+    assert alt.level_kind == "resistencia" and alt.level_price == 60600.0
+    assert [sk.price for sk in alt.skipped] == [60080.0]
+
+
+def test_alternative_entry_when_every_level_is_too_close(settings):
+    plan = plan_for(settings, levels_15m=(59950.0, 59920.0, 60600.0))
+    alt = plan.alternative
+    assert alt.available is False and alt.plan is None and alt.level_price is None
+    assert [sk.price for sk in alt.skipped] == [59950.0, 59920.0]
+    assert alt.reason == (
+        "No hay orden límite: todos los soportes de 15m debajo del precio están a menos de "
+        "1 ATR (tan cerca que sería casi lo mismo que entrar a mercado)."
+    )
+    short = plan_for(settings, score=-45.0, levels_15m=(59500.0, 60050.0))
+    assert short.alternative.reason.startswith(
+        "No hay orden límite: todas las resistencias de 15m arriba del precio"
+    )
+
+
+def test_alternative_entry_without_atr(settings):
+    plan = plan_for(settings, atr=None)
+    alt = plan.alternative
+    assert alt.available is False
+    assert alt.reason == (
+        "No hay ATR de 15m: no se puede saber qué soportes están demasiado cerca del precio "
+        "para una orden límite."
+    )
 
 
 def test_alternative_entry_short_at_nearest_15m_resistance(settings):
@@ -625,19 +761,18 @@ def test_alternative_entry_without_level(settings):
 
 
 def test_headline_points_to_the_alternative_when_only_it_passes(settings):
-    # Entrada a mercado con el stop lejos (la de 15m está a menos de 1 ATR): el TP2
-    # no entra en el día. Con la orden límite en el soporte de 15m el stop queda
-    # más cerca y sí entra.
-    kwargs = {"levels_15m": (59920.0, 60600.0), "levels_1h": (58500.0, 61500.0)}
-    free = plan_for(settings, daily_pct=None, **kwargs)
-    d_main = free.take_profit("TP2").distance_pct / 100 * ENTRY
-    d_alt = free.alternative.plan.take_profit("TP2").distance_pct / 100 * 59920.0
-    assert d_alt < d_main
-    plan = plan_for(settings, daily_pct=None, daily_usd=(d_main + d_alt) / 2, **kwargs)
+    # Entrada a mercado con el stop lejos (debajo del soporte de 59.000): el TP2 no
+    # entra en el día. Con la orden límite en ese soporte el stop queda debajo del
+    # de 58.800, más cerca, y sí entra.
+    kwargs = _alternative_only_kwargs(settings)
+    plan = plan_for(settings, **kwargs)
+    assert plan.stop.price == 58950.0
     assert plan.status == STATUS_NO_TRADE and failing_codes(plan) == [TP2_DAILY_RANGE]
+    assert plan.alternative.level_price == 59000.0
+    assert plan.alternative.plan.stop.price == 58750.0
     assert plan.alternative.plan.status == STATUS_LONG
     assert plan.headline.endswith(
-        "Con una orden límite en 59.920 el plan sí cumple las reglas (mirá la entrada alternativa)."
+        "Con una orden límite en 59.000 el plan sí cumple las reglas (mirá la entrada alternativa)."
     )
 
 
@@ -684,6 +819,18 @@ def test_regime_multipliers_reduce_the_risk_with_reasons(settings):
     assert regime_adj[0].message == (
         "Riesgo × 0,5: confianza del régimen baja (40 %, menos de 60 %)."
     )
+
+
+def test_euforia_long_without_funding_halves_the_risk(settings):
+    # Decisión del usuario: sin dato de funding se toma como muy alto (× 0,5).
+    plan = plan_for(settings, regime=fake_regime("euforia"), funding_pct_8h=None)
+    assert plan.risk_multiplier == pytest.approx(0.5)
+    assert plan.adjusted_risk_usd == pytest.approx(25.0)
+    adj = next(a for a in plan.adjustments if a.source == SOURCE_REGIME and a.risk_multiplier < 1)
+    assert "no hay dato de funding, así que se toma como muy alto" in adj.message
+    # Con el funding normal no se toca.
+    normal = plan_for(settings, regime=fake_regime("euforia"), funding_pct_8h=0.01)
+    assert normal.risk_multiplier == 1.0 and normal.adjusted_risk_usd == 50.0
 
 
 def test_regime_min_score_and_min_rr_are_applied(settings):
@@ -957,39 +1104,325 @@ def test_time_stop_uses_tp1_when_tp2_is_missing(settings):
 
 
 def _alternative_only_kwargs(settings) -> dict:
-    """Plan a mercado bloqueado por el rango del día y alternativa que sí cumple."""
-    kwargs = {"levels_15m": (59920.0, 60600.0), "levels_1h": (58500.0, 61500.0)}
-    free = plan_for(settings, daily_pct=None, **kwargs)
+    """Plan a mercado bloqueado por el rango del día y alternativa que sí cumple.
+
+    Un rango del día enorme deja pasar a los dos; después se pone justo entre la
+    distancia al TP2 de cada uno.
+    """
+    kwargs = {"levels_15m": (59000.0, 58800.0, 60600.0), "levels_1h": (58500.0, 61500.0)}
+    free = plan_for(settings, daily_pct=50.0, **kwargs)
+    assert free.status == STATUS_LONG and free.alternative.plan.status == STATUS_LONG
     d_main = free.take_profit("TP2").distance_pct / 100 * ENTRY
-    d_alt = free.alternative.plan.take_profit("TP2").distance_pct / 100 * 59920.0
+    d_alt = free.alternative.plan.take_profit("TP2").distance_pct / 100 * 59000.0
+    assert d_alt < d_main
     return {**kwargs, "daily_pct": None, "daily_usd": (d_main + d_alt) / 2}
 
 
-def test_suspect_entry_price_is_warned_and_the_alternative_is_not_recommended(settings):
-    kwargs = _alternative_only_kwargs(settings)
-    # Precio de Nexo mal tipeado (10 veces el real): difiere 900 % del de referencia.
-    plan = plan_for(settings, price_diff_pct=900.0, **kwargs)
+@pytest.mark.parametrize("score", [45.0, -45.0])
+def test_suspect_nexo_price_blocks_until_corrected(settings, score):
+    # Decisión del usuario: precio de Nexo mal tipeado (10 veces el real, difiere
+    # 900 % del de referencia): "No operar" hasta corregirlo.
+    assert settings.trade_plan.block_if_price_suspect is True
+    plan = plan_for(settings, score=score, price_diff_pct=900.0, reference_price=6000.0)
+    assert plan.status == STATUS_NO_TRADE and plan.is_reference
     assert plan.price_suspect is True and plan.price_diff_pct == 900.0
+    assert failing_codes(plan) == [PRICE_CHECK]
+    rule = plan.blocking_rules[0]
+    assert plan.rules[0] is rule  # es la primera regla: sin el precio bien, nada sirve
+    assert rule.message == (
+        "No operar: el precio de Nexo que cargaste (60.000,00) difiere 900 % del de "
+        "referencia (6.000,00), más que el 2 % que se acepta: puede ser un error de tipeo."
+    )
+    assert rule.suggestion == (
+        "Revisá el precio en Nexo y volvé a cargarlo bien: con un precio mal cargado, todo el "
+        "plan (stop, objetivos y tamaño) sale mal. Si de verdad es ese, esperá a que los dos "
+        "precios se acerquen."
+    )
+    assert plan.headline == rule.message  # es el único motivo
+    # La regla ya lo dice: no se repite como aviso.
+    assert not any(w.startswith("Revisá el precio") for w in plan.warnings)
+    entry = plan.to_dict()["entry"]
+    assert entry["price_suspect"] is True and entry["diff_vs_reference_pct"] == 900.0
+    assert entry["reference_price"] == 6000.0
+
+
+def test_suspect_price_also_blocks_the_alternative(settings):
+    kwargs = _alternative_only_kwargs(settings)
+    plan = plan_for(settings, price_diff_pct=900.0, **kwargs)
+    alt_rule = next(r for r in plan.alternative.plan.blocking_rules if r.code == PRICE_CHECK)
+    # Habla del precio de Nexo (el actual), no del nivel de la orden límite (59.000).
+    assert alt_rule.message == plan.blocking_rules[0].message
+    assert plan.alternative.plan.reference_price == pytest.approx(6000.0)
+    assert "sí cumple las reglas" not in plan.headline
+
+
+def test_suspect_price_reference_is_deduced_from_the_difference(settings):
+    # Sin el precio de referencia (backtest armado a mano) se deduce de la diferencia.
+    plan = plan_for(settings, price_diff_pct=-50.0)
+    assert plan.reference_price == pytest.approx(120000.0)
+    assert "difiere 50 % del de referencia (120.000,00)" in plan.blocking_rules[0].message
+
+
+def test_nexo_price_from_the_connector_is_not_said_to_be_typed(settings):
+    plan = plan_for(settings, price_diff_pct=5.0, reference_price=57142.86, price_source="nexo")
+    assert plan.blocking_rules[0].message.startswith(
+        "No operar: el precio de Nexo (60.000,00) difiere 5 % del de referencia (57.142,86)"
+    )
+
+
+def test_nexo_price_within_tolerance_passes_the_price_rule(settings):
+    kwargs = _alternative_only_kwargs(settings)
+    ok = plan_for(settings, price_diff_pct=-1.5, reference_price=60913.71, **kwargs)
+    assert ok.price_suspect is False
+    rule = next(r for r in ok.rules if r.code == PRICE_CHECK)
+    assert rule.ok and rule.message == (
+        "El precio de Nexo (60.000,00) difiere 1,5 % del de referencia (60.913,71): dentro "
+        "del 2 % que se acepta."
+    )
+    assert not any(w.startswith("Revisá el precio") for w in ok.warnings)
+    assert ok.headline.endswith("sí cumple las reglas (mirá la entrada alternativa).")
+    # Sin precio de Nexo comparado no hay regla del precio.
+    assert PRICE_CHECK not in [r.code for r in plan_for(settings).rules]
+
+
+@pytest.mark.parametrize(("reference", "nexo"), [(3.0, 3.06), (3.0, 2.94)])
+def test_nexo_price_exactly_at_the_max_diff_is_accepted(settings, reference, nexo):
+    # Binance 3,00 y Nexo 3,06: justo 2 %, pero la cuenta da 2,0000000000000018 %
+    # por coma flotante. La decisión bloquea solo "más que" el máximo.
+    assert settings.exchanges.nexo.manual_price_max_diff_pct == 2.0
+    diff = (nexo - reference) / reference * 100  # como registry._diff_pct
+    assert abs(diff) > 2.0  # el ruido está
+    kwargs = {"entry": nexo, "levels_15m": (2.85, 3.2), "levels_1h": (2.8, 3.3), "atr": 0.005}
+    plan = plan_for(settings, price_diff_pct=diff, reference_price=reference, **kwargs)
+    assert plan.price_suspect is False
+    rule = next(r for r in plan.rules if r.code == PRICE_CHECK)
+    assert rule.ok and rule.message == (
+        f"El precio de Nexo ({fmt_num(nexo, 4, trim=False)}) difiere 2 % del de referencia "
+        "(3,0000): dentro del 2 % que se acepta."
+    )
+    # Con el bloqueo apagado tampoco se avisa.
+    s = with_trade_plan(settings, block_if_price_suspect=False)
+    warn_only = build_trade_plan(
+        make_inputs(s, price_diff_pct=diff, reference_price=reference, **kwargs), s, now=NOW
+    )
+    assert not any(w.startswith("Revisá el precio") for w in warn_only.warnings)
+    # Apenas más que el máximo sí es sospechoso.
+    above = plan_for(settings, price_diff_pct=2.0001, **kwargs)
+    assert above.price_suspect is True and PRICE_CHECK in failing_codes(above)
+
+
+def test_blocking_price_message_never_rounds_the_difference_to_the_limit(settings):
+    # 2,004 % redondeado a dos decimales es "2 %": el mensaje decía "difiere 2 %
+    # del de referencia, más que el 2 % que se acepta".
+    plan = plan_for(settings, price_diff_pct=2.004)
+    rule = next(r for r in plan.rules if r.code == PRICE_CHECK)
+    assert not rule.ok
+    assert rule.message == (
+        "No operar: el precio de Nexo que cargaste (60.000,00) difiere 2,004 % del de "
+        "referencia (58.821,22), más que el 2 % que se acepta: puede ser un error de tipeo."
+    )
+    # Lo mismo en el aviso, con el bloqueo apagado.
+    s = with_trade_plan(settings, block_if_price_suspect=False)
+    warn_only = build_trade_plan(make_inputs(s, price_diff_pct=-2.004), s, now=NOW)
+    warning = next(w for w in warn_only.warnings if w.startswith("Revisá el precio"))
+    assert "60.000,00 difiere 2,004 % del precio de referencia (61.226,99), más que el 2 %" in (
+        warning
+    )
+
+
+def test_price_rule_prices_have_the_same_decimals_as_the_prices_section(settings):
+    # La consola muestra "186,60" en la sección de precios: la regla no dice "186,6".
+    plan = plan_for(
+        settings,
+        entry=186.6,
+        levels_15m=(180.0, 195.0),
+        levels_1h=(175.0, 200.0),
+        atr=0.5,
+        price_diff_pct=5.0,
+        reference_price=177.7,
+    )
+    rule = next(r for r in plan.rules if r.code == PRICE_CHECK)
+    assert "el precio de Nexo que cargaste (186,60) difiere 5 % del de referencia (177,70)" in (
+        rule.message
+    )
+
+
+def test_suspect_price_only_warns_if_the_config_says_so(settings):
+    s = with_trade_plan(settings, block_if_price_suspect=False)
+    kwargs = _alternative_only_kwargs(settings)
+    plan = build_trade_plan(make_inputs(s, price_diff_pct=900.0, **kwargs), s, now=NOW)
+    assert plan.price_suspect is True
+    assert PRICE_CHECK not in [r.code for r in plan.rules]
+    assert failing_codes(plan) == [TP2_DAILY_RANGE]
     assert plan.alternative.plan.status == STATUS_LONG  # la alternativa "pasaría"...
     assert "sí cumple las reglas" not in plan.headline  # ...pero no se recomienda
     warning = next(w for w in plan.warnings if w.startswith("Revisá el precio de entrada"))
-    assert "difiere 900 % del precio de referencia (6.000)" in warning
+    assert "difiere 900 % del precio de referencia (6.000,00)" in warning
     assert "no lo uses hasta cargarlo bien" in warning
-    assert plan.alternative.plan.price_suspect is True
-    entry = plan.to_dict()["entry"]
-    assert entry["price_suspect"] is True and entry["diff_vs_reference_pct"] == 900.0
-    # Dentro de la tolerancia de la config (2 %) no hay aviso y se recomienda.
-    ok = plan_for(settings, price_diff_pct=-1.5, **kwargs)
-    assert ok.price_suspect is False
-    assert not any(w.startswith("Revisá el precio") for w in ok.warnings)
-    assert ok.headline.endswith("sí cumple las reglas (mirá la entrada alternativa).")
 
 
-def test_daily_loss_warning_when_this_trade_could_pass_the_limit(settings):
-    # Perdiste 99 de 100 USD: la regla todavía se cumple (bloquea al llegar), pero
-    # si esta operación toca el stop el día cerraría con 149 USD. Se avisa.
-    plan = plan_for(settings, trades_today=1, pnl_today_usd=-99.0)
-    assert plan.status == STATUS_LONG
+@pytest.mark.parametrize("score", [45.0, -45.0])
+def test_risk_is_capped_to_what_is_left_of_the_daily_loss_limit(settings, score):
+    # Decisión del usuario: perdiste 80 de 100 USD, quedan 20: el riesgo baja de 50 a 20.
+    assert settings.trade_plan.cap_risk_to_daily_remaining is True
+    plan = plan_for(settings, score=score, trades_today=1, pnl_today_usd=-80.0)
+    assert plan.status in (STATUS_LONG, STATUS_SHORT)
+    assert plan.requested_risk_usd == 50.0 and plan.regime_risk_usd == 50.0
+    assert plan.adjusted_risk_usd == pytest.approx(20.0)
+    assert plan.risk_capped_by_day is True and plan.daily_remaining_usd == pytest.approx(20.0)
+    assert plan.position.risk_usd == pytest.approx(20.0)
+    cap = next(a for a in plan.adjustments if a.code == DAILY_LOSS_CAP)
+    assert cap.source == SOURCE_DAILY_LIMIT
+    assert cap.risk_multiplier == pytest.approx(0.4)
+    assert cap.message == (
+        "Riesgo bajado de 50 a 20 USD: hoy ya perdiste 80 de tus 100 USD de límite del día "
+        "(así, si esta operación toca el stop, no pasás el límite)."
+    )
+    assert "arriesgás 20 USD (comisiones incluidas)" in plan.headline
+    assert plan.day_state["loss_if_stopped_usd"] == pytest.approx(100.0)
+    risk = plan.to_dict()["risk"]
+    assert risk["after_regime_usd"] == 50.0 and risk["after_adjustments_usd"] == pytest.approx(20)
+    assert risk["capped_by_daily_limit"] is True
+    assert risk["daily_remaining_usd"] == pytest.approx(20.0)
+    # El aviso que solo avisaba ya no hace falta.
+    assert not any(w.startswith("Ojo con el límite del día") for w in plan.warnings)
+
+
+def test_daily_cap_comes_after_the_regime_multipliers(settings):
+    # Confianza baja: 50 × 0,5 = 25; quedan 20 del día: baja de 25 a 20.
+    plan = plan_for(
+        settings, regime=fake_regime("alcista", confidence=0.4), pnl_today_usd=-80.0, daily_pct=10
+    )
+    sources = [a.source for a in plan.adjustments]
+    assert sources[:2] == [SOURCE_REGIME, SOURCE_DAILY_LIMIT]
+    assert all(src == SOURCE_POSITION for src in sources[2:])
+    assert plan.regime_risk_usd == pytest.approx(25.0) and plan.risk_multiplier == 0.5
+    assert plan.adjusted_risk_usd == pytest.approx(20.0)
+    cap = next(a for a in plan.adjustments if a.code == DAILY_LOSS_CAP)
+    assert cap.message.startswith("Riesgo bajado de 25 a 20 USD")
+    # Si el régimen ya dejó el riesgo debajo de lo que queda, no se toca.
+    calm = plan_for(settings, regime=fake_regime("alcista", confidence=0.4), pnl_today_usd=-60.0)
+    assert calm.adjusted_risk_usd == pytest.approx(25.0) and not calm.risk_capped_by_day
+    assert DAILY_LOSS_CAP not in [a.code for a in calm.adjustments]
+
+
+def test_daily_cap_is_not_applied_when_there_is_room(settings):
+    # 40 + 50 = 90: entra en el límite, el riesgo no cambia.
+    plan = plan_for(settings, trades_today=1, pnl_today_usd=-40.0)
+    assert plan.adjusted_risk_usd == 50.0 and plan.risk_capped_by_day is False
+    assert plan.daily_remaining_usd == pytest.approx(60.0)
+    assert DAILY_LOSS_CAP not in [a.code for a in plan.adjustments]
+    # Un día ganador no agranda el riesgo.
+    win = plan_for(settings, pnl_today_usd=+300.0)
+    assert win.adjusted_risk_usd == 50.0 and win.daily_remaining_usd == 100.0
+
+
+@pytest.mark.parametrize("score", [45.0, -45.0])
+def test_daily_cap_below_min_operable_risk_blocks(settings, score):
+    # Perdiste 99 de 100: queda 1 USD, menos que el mínimo operable (15).
+    plan = plan_for(settings, score=score, trades_today=1, pnl_today_usd=-99.0)
+    assert plan.status == STATUS_NO_TRADE and plan.is_reference
+    assert failing_codes(plan) == [MIN_OPERABLE_RISK]
+    rule = plan.blocking_rules[0]
+    assert rule.message == (
+        "No operar: hoy ya perdiste 99 de tus 100 USD de límite del día; lo que te queda (1 USD) "
+        "es menos que el mínimo operable de 15 USD."
+    )
+    assert rule.suggestion == "Esperá a mañana."
+    assert plan.headline == (
+        "No operar: hoy ya perdiste 99 de tus 100 USD de límite del día; lo que te queda (1 USD) "
+        "es menos que el mínimo operable de 15 USD."
+    )
+    assert plan.adjusted_risk_usd == pytest.approx(1.0)
+    assert plan.position.risk_usd == pytest.approx(1.0)  # los niveles, como referencia
+
+
+def test_daily_cap_floor_is_listed_even_without_a_stop(settings):
+    plan = plan_for(settings, pnl_today_usd=-99.0, levels_15m=(60600.0,), levels_1h=(61500.0,))
+    assert plan.stop is None
+    assert failing_codes(plan) == [STOP_RULE, MIN_OPERABLE_RISK]
+    assert plan.blocking_rules[1].message.startswith("No operar: hoy ya perdiste 99")
+
+
+def test_daily_limit_already_reached_is_blocked_by_the_daily_rule(settings):
+    # Ya en el límite: lo dice la regla de límites del día; el riesgo no se toca.
+    hit = plan_for(settings, pnl_today_usd=-100.0)
+    assert failing_codes(hit) == [DAILY_LIMITS]
+    assert hit.adjusted_risk_usd == 50.0 and hit.risk_capped_by_day is False
+    assert hit.daily_remaining_usd == 0.0
+    assert not any(w.startswith("Ojo con el límite del día") for w in hit.warnings)
+
+
+def test_daily_cap_floor_wins_over_the_regime_floor(settings):
+    # Neutral (× 0,75) + confianza baja (× 0,5) + inestable (× 0,5): 9,38 USD, menos
+    # que el mínimo (15). Y hoy ya perdiste 95: quedan 5. El motivo que manda es el
+    # del día (aunque el régimen se aclare, quedan 5 USD): "Esperá a mañana".
+    regime = fake_regime("neutral", confidence=0.3, unstable=True)
+    plan = plan_for(settings, score=50.0, regime=regime, pnl_today_usd=-95.0)
+    assert plan.regime_adjustment.risk_below_min
+    assert plan.regime_risk_usd == pytest.approx(9.375)
+    assert plan.adjusted_risk_usd == pytest.approx(5.0) and plan.risk_capped_by_day
+    assert failing_codes(plan) == [MIN_OPERABLE_RISK]
+    rule = plan.blocking_rules[0]
+    message = (
+        "No operar: hoy ya perdiste 95 de tus 100 USD de límite del día; lo que te queda (5 USD) "
+        "es menos que el mínimo operable de 15 USD."
+    )
+    assert rule.message == message and rule.suggestion == "Esperá a mañana."
+    assert plan.headline == message
+    # Los multiplicadores del régimen se siguen viendo en los ajustes.
+    cap = next(a for a in plan.adjustments if a.code == DAILY_LOSS_CAP)
+    assert cap.message.startswith("Riesgo bajado de 9,38 a 5 USD")
+    assert SOURCE_REGIME in [a.source for a in plan.adjustments]
+    # Sin stop, igual.
+    no_stop = plan_for(settings, score=50.0, regime=regime, pnl_today_usd=-95.0, atr=None)
+    assert failing_codes(no_stop) == [STOP_RULE, MIN_OPERABLE_RISK]
+    assert no_stop.blocking_rules[1].message == message
+
+
+def test_reference_plan_is_capped_when_only_the_trade_count_blocks(settings):
+    # Ya hiciste 3 de 3 operaciones y perdiste 95 de 100: lo bloquea la cantidad
+    # de operaciones, pero el plan de referencia no arriesga más de los 5 USD que
+    # quedan del día (antes mostraba "Pérdida máxima 50 USD").
+    assert get_profile("agresivo", settings).max_trades_per_day == 3
+    plan = plan_for(settings, trades_today=3, pnl_today_usd=-95.0)
+    assert plan.status == STATUS_NO_TRADE and plan.is_reference
+    assert failing_codes(plan) == [DAILY_LIMITS, MIN_OPERABLE_RISK]
+    assert plan.headline.startswith("No operar: ya hiciste 3 operaciones hoy y el máximo es 3")
+    assert plan.adjusted_risk_usd == pytest.approx(5.0) and plan.risk_capped_by_day is True
+    assert plan.position.risk_usd == pytest.approx(5.0)
+    assert plan.blocking_rules[1].message.startswith("No operar: hoy ya perdiste 95")
+    # Con lugar para el mínimo, solo la cantidad de operaciones bloquea (riesgo 20).
+    room = plan_for(settings, trades_today=3, pnl_today_usd=-80.0)
+    assert failing_codes(room) == [DAILY_LIMITS]
+    assert room.adjusted_risk_usd == pytest.approx(20.0) and room.risk_capped_by_day
+    # Con el tope apagado, vuelve el aviso (también si bloquea la cantidad).
+    s = with_trade_plan(settings, cap_risk_to_daily_remaining=False)
+    off = build_trade_plan(make_inputs(s, trades_today=3, pnl_today_usd=-95.0), s, now=NOW)
+    assert off.adjusted_risk_usd == 50.0 and not off.risk_capped_by_day
+    assert any(w.startswith("Ojo con el límite del día") for w in off.warnings)
+    # Con el límite de pérdida alcanzado, el riesgo no se toca (lo dice la regla).
+    hit = plan_for(settings, trades_today=3, pnl_today_usd=-100.0)
+    assert failing_codes(hit) == [DAILY_LIMITS]
+    assert hit.adjusted_risk_usd == 50.0 and hit.risk_capped_by_day is False
+
+
+def test_daily_cap_with_fees_outside_the_risk_says_so(settings):
+    s = with_trade_plan(settings, fees_included_in_risk=False)
+    plan = build_trade_plan(make_inputs(s, pnl_today_usd=-80.0), s, now=NOW)
+    cap = next(a for a in plan.adjustments if a.code == DAILY_LOSS_CAP)
+    assert cap.message.endswith(
+        "(así, si esta operación toca el stop, solo las comisiones quedan por encima del límite)."
+    )
+    assert plan.position.price_loss_at_stop_usd == pytest.approx(20.0)
+
+
+def test_daily_loss_warning_only_without_the_cap(settings):
+    # Con el tope apagado vuelve el aviso: perdiste 99 de 100 y esta operación
+    # arriesga 50, así que si toca el stop el día cerraría con 149.
+    s = with_trade_plan(settings, cap_risk_to_daily_remaining=False)
+    plan = build_trade_plan(make_inputs(s, trades_today=1, pnl_today_usd=-99.0), s, now=NOW)
+    assert plan.status == STATUS_LONG and plan.adjusted_risk_usd == 50.0
     assert any(
         w
         == (
@@ -999,13 +1432,6 @@ def test_daily_loss_warning_when_this_trade_could_pass_the_limit(settings):
         for w in plan.warnings
     )
     assert plan.day_state["loss_if_stopped_usd"] == pytest.approx(149.0)
-    # 40 + 50 = 90: entra en el límite, sin aviso.
-    calm = plan_for(settings, trades_today=1, pnl_today_usd=-40.0)
-    assert not any(w.startswith("Ojo con el límite del día") for w in calm.warnings)
-    # Ya en el límite: lo dice la regla (no se repite como aviso).
-    hit = plan_for(settings, pnl_today_usd=-100.0)
-    assert DAILY_LIMITS in failing_codes(hit)
-    assert not any(w.startswith("Ojo con el límite del día") for w in hit.warnings)
 
 
 def test_day_state_is_returned_as_data(settings):
@@ -1024,6 +1450,8 @@ def test_day_state_is_returned_as_data(settings):
         "pnl_today_usd": -40.0,
         "loss_today_usd": 40.0,
         "max_daily_loss_usd": 100.0,
+        "daily_remaining_usd": 60.0,
+        "risk_capped_by_day": False,
         "loss_if_stopped_usd": pytest.approx(40.0 + plan.position.risk_usd),
         "high_volatility_event": True,
         "event_description": "CPI",
@@ -1113,6 +1541,7 @@ def test_plan_inputs_from_analysis_fallbacks(settings, offline_market):
     assert inputs.funding_pct_8h == funding_pct_per_8h(snap.funding.rate, default)
     # Sin precio de Nexo no hay diferencia contra la referencia.
     assert inputs.price_diff_pct is None
+    assert inputs.reference_price == snap.execution_price.binance_price
 
 
 def test_plan_inputs_carry_the_manual_price_difference(settings):
@@ -1126,5 +1555,8 @@ def test_plan_inputs_carry_the_manual_price_difference(settings):
     )
     assert inputs.price_diff_pct == pytest.approx(snap.execution_price.diff_pct)
     assert inputs.price_diff_pct == pytest.approx(900.0, rel=1e-3)
+    assert inputs.reference_price == pytest.approx(snap.execution_price.binance_price)
     plan = build_trade_plan(inputs, settings, now=NOW)
-    assert plan.price_suspect and any(w.startswith("Revisá el precio") for w in plan.warnings)
+    assert plan.price_suspect and plan.rules[0].code == PRICE_CHECK and not plan.rules[0].ok
+    assert plan.status == STATUS_NO_TRADE
+    assert fmt_price(snap.execution_price.binance_price) in plan.rules[0].message

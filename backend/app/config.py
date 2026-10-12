@@ -261,6 +261,11 @@ class MomentumScoringConfig(_Strict):
             raise ValueError(
                 "scoring.momentum: tiene que cumplirse rsi_oversold < rsi_neutral < rsi_overbought"
             )
+        if self.macd_signal_weight + self.macd_zero_weight > 1.0 + 1e-9:
+            raise ValueError(
+                "scoring.momentum: macd_signal_weight + macd_zero_weight no puede pasar de 1 "
+                "(el MACD aporta como mucho ±1)"
+            )
         return self
 
 

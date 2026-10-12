@@ -33,12 +33,14 @@ from app.risk.rules import (
     check_min_operable_risk,
     check_rr,
     check_timeframe_conflict,
+    daily_loss_limit_reached,
     direction_from_score,
     failed_rules,
     fmt_leverage,
     fmt_multiplier,
     fmt_num,
     fmt_percent,
+    fmt_percent_beside,
     fmt_price,
     fmt_ratio,
     fmt_score,
@@ -269,6 +271,18 @@ def test_both_daily_limits_in_one_message(agresivo):
     assert "4 operaciones" in r.message and "120,50 USD" in r.message
 
 
+def test_daily_loss_limit_reached_matches_the_rule(agresivo):
+    # Solo el límite de pérdida, con la misma tolerancia que check_daily_limits.
+    assert not daily_loss_limit_reached(99.0, 100.0)
+    assert daily_loss_limit_reached(100.0, 100.0)
+    assert daily_loss_limit_reached(100.0 - 1e-12, 100.0)  # ruido de coma flotante
+    assert daily_loss_limit_reached(120.0, 100.0)
+    for trades, pnl in ((3, -95.0), (1, -100.0 + 1e-12), (0, -99.0)):
+        loss_hit = daily_loss_limit_reached(max(0.0, -pnl), 100.0)
+        rule = check_daily_limits(trades, pnl, agresivo)
+        assert ("hoy perdiste" in rule.message) is loss_hit
+
+
 @pytest.mark.parametrize("trades", [-1, 1.5, True, "2"])
 def test_daily_limits_invalid_trades(agresivo, trades):
     with pytest.raises(ValueError):
@@ -389,6 +403,18 @@ def test_score_messages_do_not_round_the_score_to_the_threshold(settings):
     # Lejos del umbral queda como siempre (un decimal).
     assert "el score (+12,3) está entre" in check_direction(12.34, th).message
     assert fmt_score_beside(45.0, 50.0) == "+45"
+
+
+def test_percent_beside_a_limit_never_looks_like_the_limit():
+    # "difiere 2 %, más que el 2 %" no se entiende: con más decimales sí.
+    assert fmt_percent(2.004) == "2 %"
+    assert fmt_percent_beside(2.004, 2.0) == "2,004 %"
+    assert fmt_percent_beside(1.996, 2.0) == "1,996 %"
+    assert fmt_percent_beside(2.0000001, 2.0) == "2,0001 %"  # pegado: un paso al costado
+    # Lejos del límite (o justo en él) es igual que fmt_percent.
+    assert fmt_percent_beside(900.0, 2.0) == "900 %"
+    assert fmt_percent_beside(2.5, 2.0) == "2,5 %"
+    assert fmt_percent_beside(2.0, 2.0) == "2 %"
 
 
 def test_price_uses_the_reference_decimals():

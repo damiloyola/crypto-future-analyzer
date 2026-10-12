@@ -22,7 +22,8 @@
 - ``get_execution_price(...)``: precio sobre el que se calculan los niveles
   finales. Decisión del usuario: se usa Binance salvo que pegue a mano el precio
   de Nexo. Si lo pega, se compara con Binance y se avisa si difiere más que
-  ``exchanges.nexo.manual_price_max_diff_pct`` (posible error de tipeo). Los
+  ``exchanges.nexo.manual_price_max_diff_pct`` (posible error de tipeo; justo
+  en el máximo no, aunque la cuenta dé 2,0000000000000018 %). Los
   avisos nombran la fuente real del precio de referencia: si Binance falló y el
   dato vino de Bybit, dicen "Bybit (respaldo)".
 - ``failure_reason``: motivo corto para la UI (``"HTTP 451"``, ``"sin
@@ -70,6 +71,12 @@ if TYPE_CHECKING:
 M = TypeVar("M")
 
 DATA_SOURCE_NAMES = ("binance", "bybit")
+
+# Tolerancia relativa para comparar la diferencia de precios con el máximo
+# aceptado: 3,00 contra 3,06 da 2,0000000000000018 % por coma flotante y no
+# tiene que contar como "más que el 2 %". Es la misma que ``risk.rules.REL_TOL``
+# (no se importa: ``exchanges`` es la capa de abajo). No es una regla de riesgo.
+_DIFF_REL_TOL = 1e-9
 
 
 def nexo_unavailable_warning(reference_label: str = "Binance") -> str:
@@ -480,7 +487,7 @@ async def get_execution_price(
                 price, "manual_nexo", None, None, warnings, FetchMeta("manual", clock())
             )
         diff = _diff_pct(price, ticker.price)
-        if abs(diff) > nexo_cfg.manual_price_max_diff_pct:
+        if abs(diff) > nexo_cfg.manual_price_max_diff_pct * (1.0 + _DIFF_REL_TOL):
             warnings.append(
                 f"El precio de Nexo que cargaste difiere {_fmt_pct(abs(diff))} % del de "
                 f"{reference_label(ticker.meta)}: revisá que esté bien escrito"

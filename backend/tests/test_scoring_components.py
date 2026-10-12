@@ -160,7 +160,23 @@ def test_rsi_score_rejects_unordered_thresholds():
     ],
 )
 def test_macd_score(macd, signal, expected):
-    assert macd_score(macd, signal) == pytest.approx(expected)
+    assert macd_score(macd, signal, MOM) == pytest.approx(expected)
+
+
+def test_macd_weights_come_from_the_config():
+    # Arriba de la señal pero debajo de 0: con 0,5 / 0,5 da 0.
+    assert macd_score(-1.0, -2.0, MOM) == 0.0
+    cfg = MOM.model_copy(update={"macd_signal_weight": 0.7, "macd_zero_weight": 0.3})
+    assert macd_score(-1.0, -2.0, cfg) == pytest.approx(0.4)
+    assert macd_score(1.0, 0.5, cfg) == pytest.approx(1.0)
+    r = momentum_component({}, {"15m": -1.0}, {"15m": -2.0}, cfg)
+    assert r.value == pytest.approx(0.4)
+    assert r.details[0] == "MACD 15m arriba de su señal y debajo de 0 (+0,4)."
+
+
+def test_macd_weights_cannot_add_up_to_more_than_one():
+    with pytest.raises(ValueError, match="macd_signal_weight"):
+        MomentumScoringConfig(timeframes=["15m"], macd_signal_weight=0.6, macd_zero_weight=0.5)
 
 
 def test_momentum_is_the_mean_of_rsi_and_macd_in_both_timeframes():
@@ -275,6 +291,44 @@ def test_open_interest_part_thresholds_come_from_the_config():
 )
 def test_long_short_part(ratio, expected):
     assert long_short_part(ratio, DER) == expected
+
+
+def test_derivative_part_sizes_come_from_the_config():
+    custom = DER.model_copy(
+        update={
+            "funding_very_high_part": 0.8,
+            "funding_high_part": 0.3,
+            "funding_low_part": 0.2,
+            "oi_part": 0.25,
+            "long_short_part": 0.4,
+        }
+    )
+    assert funding_part(0.2, custom) == pytest.approx(-0.8)
+    assert funding_part(0.06, custom) == pytest.approx(-0.3)
+    assert funding_part(-0.05, custom) == pytest.approx(0.2)
+    assert funding_part(0.01, custom) == 0.0
+    assert open_interest_part(5.0, 0.06, custom) == pytest.approx(-0.25)
+    assert open_interest_part(5.0, -0.05, custom) == pytest.approx(0.25)
+    assert long_short_part(3.0, custom) == pytest.approx(-0.4)
+    assert long_short_part(0.5, custom) == pytest.approx(0.4)
+    r = derivatives_component(
+        0.0006, 8, 5.0, 3.0, custom, default_interval_hours=8
+    )  # funding 0,06 % (alto) + OI subiendo + muchos longs
+    assert r.value == pytest.approx(-0.3 - 0.25 - 0.4)
+    assert (
+        r.details[0]
+        == "Funding 0,06 % cada 8 h: alto, longs sobrecargados, riesgo de caída (-0,3)."
+    )
+
+
+def test_part_set_to_zero_keeps_the_text_by_threshold():
+    # Con la parte en 0 el funding sigue siendo "muy alto" (el texto no dice "normal").
+    custom = DER.model_copy(update={"funding_very_high_part": 0.0, "long_short_part": 0.0})
+    assert funding_part(0.2, custom) == 0.0
+    assert str(funding_part(0.2, custom)) == "0.0"  # sin "-0.0"
+    r = derivatives_component(0.002, 8, None, 3.0, custom, default_interval_hours=8)
+    assert r.details[0].startswith("Funding 0,2 % cada 8 h: muy alto")
+    assert "demasiadas cuentas en long" in r.details[1]
 
 
 def _der(**kw):

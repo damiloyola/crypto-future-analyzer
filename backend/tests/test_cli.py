@@ -1132,11 +1132,32 @@ def test_day_state_is_shown_and_in_the_json():
     assert "Hoy: " not in _plan_block(render_text(json.loads(out)))
 
 
-def test_daily_limit_warning_in_the_plan_block():
+def test_daily_loss_limit_caps_the_risk_in_the_plan_block():
+    # Perdiste 80 de 100: el riesgo baja de 50 a 20 y se dice por qué.
+    code, out, err = run("SOL", "--offline", "--json", "--now", FIXED_NOW_ISO, "--pnl-today", "-80")
+    assert code == 0, err
+    report = json.loads(out)
+    risk = report["plan"]["risk"]
+    assert risk["capped_by_daily_limit"] is True
+    assert risk["after_adjustments_usd"] == pytest.approx(20.0)
+    assert risk["max_loss_usd"] <= 20.0 + 1e-9
+    block = _plan_block(render_text(report))
+    assert (
+        "Riesgo bajado de 50 a 20 USD: hoy ya perdiste 80 de tus 100 USD de límite del día"
+    ) in block
+    assert "→ 20,00 USD (lo que te queda del límite de pérdida del día)" in block
+    assert "Ojo con el límite del día" not in block
+
+
+def test_daily_loss_limit_almost_reached_blocks_the_plan():
     code, out, err = run("SOL", "--offline", "--now", FIXED_NOW_ISO, "--pnl-today", "-99")
     assert code == 0, err
     block = _plan_block(out)
-    assert "Ojo con el límite del día: hoy ya perdiste 99 USD" in block
+    assert (
+        "✗ No operar: hoy ya perdiste 99 de tus 100 USD de límite del día; lo que te queda "
+        "(1 USD) es menos que el mínimo operable de 15 USD."
+    ) in block
+    assert "→ Esperá a mañana." in block
 
 
 def test_levels_table_explains_r_rr_and_atr(sol_json):
@@ -1170,7 +1191,43 @@ def test_alternative_block_shows_its_adjustments_liquidation_fees_and_time_stop(
     assert "el régimen" not in alt_block.split("Ajustes de esta entrada:")[1]
 
 
-def test_mistyped_nexo_price_is_warned_in_the_plan():
+def test_alternative_block_shows_the_skipped_levels(sol_json):
+    report = json.loads(json.dumps(sol_json))
+    alt = report["plan"]["alternative"]
+    if not alt["available"]:
+        pytest.skip("con estos datos no hay entrada alternativa")
+    near = alt["level_price"] * 0.999
+    alt["skipped_levels"] = [{"price": near, "timeframe": "15m", "distance_atr": 0.25}]
+    block = _plan_block(render_text(report))
+    alt_block = block[block.index("Entrada alternativa (orden límite)") :]
+    d = price_decimals(report["plan"]["entry"]["price"])
+    assert (
+        f"Se salteó {'la' if alt['level_kind'] == 'resistencia' else 'el'} {alt['level_kind']} "
+        f"{fmt_num(near, d)} (15m) por estar a 0,25 ATR: tan cerca del precio que sería casi lo "
+        "mismo que entrar a mercado."
+    ) in alt_block
+
+
+def test_requested_risk_row_shows_regime_and_daily_cap(sol_json):
+    report = json.loads(json.dumps(sol_json))
+    risk = report["plan"]["risk"]
+    risk.update(
+        {
+            "requested_usd": 50.0,
+            "risk_multiplier": 0.5,
+            "after_regime_usd": 25.0,
+            "capped_by_daily_limit": True,
+            "after_adjustments_usd": 20.0,
+        }
+    )
+    line = next(x for x in render_text(report).splitlines() if "Riesgo pedido" in x)
+    assert line.split("Riesgo pedido", 1)[1].strip() == (
+        "50,00 USD del perfil × 0,5 = 25,00 USD (ajustes por régimen) → 20,00 USD (lo que te "
+        "queda del límite de pérdida del día)"
+    )
+
+
+def test_mistyped_nexo_price_blocks_the_plan():
     price = synthetic_price("XRP") * 10  # un cero de más
     code, out, err = run(
         "XRP", "--offline", "--json", "--now", FIXED_NOW_ISO, "--nexo-price", f"{price:.4f}"
@@ -1178,10 +1235,16 @@ def test_mistyped_nexo_price_is_warned_in_the_plan():
     assert code == 0, err
     report = json.loads(out)
     plan = report["plan"]
+    assert plan["status"] == "NO_OPERAR"
     assert plan["entry"]["price_suspect"] is True
-    assert any(w.startswith("Revisá el precio de entrada") for w in plan["warnings"])
+    assert plan["entry"]["reference_price"] == pytest.approx(report["prices"]["reference_price"])
+    assert plan["rules"][0]["code"] == "price_check" and plan["rules"][0]["ok"] is False
+    assert plan["headline"].startswith("No operar: el precio de Nexo que cargaste (")
+    assert "difiere 900 % del de referencia" in plan["headline"]
     assert "sí cumple las reglas" not in plan["headline"]
-    assert "Revisá el precio de entrada" in _plan_block(render_text(report))
+    block = _plan_block(render_text(report))
+    assert "✗ No operar: el precio de Nexo que cargaste" in block
+    assert "→ Revisá el precio en Nexo y volvé a cargarlo bien" in block
 
 
 def test_plan_headline_prices_match_the_table(sol_json):

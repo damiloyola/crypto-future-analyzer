@@ -26,8 +26,10 @@ Reglas (``config.yaml > regime_adjustments``):
   ``risk_multiplier``. Con ``only_if_funding_very_high`` el multiplicador solo
   corre si el funding (por 8 h, en % "humano") es **igual o mayor** que
   ``scoring.derivatives.funding_very_high_pct`` (el borde cuenta, del lado
-  conservador). Si no hay dato de funding, ese multiplicador no se aplica y se
-  avisa.
+  conservador). Si no hay dato de funding y
+  ``assume_funding_very_high_if_missing`` (decisión del usuario), se toma como
+  muy alto y el multiplicador se aplica, diciéndolo en el motivo (lado
+  prudente); con ese parámetro en ``false`` no se aplica y se avisa.
 - Confianza baja: ``confidence < low_confidence.threshold`` -> riesgo ×
   ``low_confidence.risk_multiplier``. Si la confianza no es un número finito se
   toma como baja.
@@ -89,6 +91,7 @@ REGIME_MIN_SCORE = "regime_min_score"
 REGIME_MIN_RR = "regime_min_rr"
 REGIME_RISK = "regime_risk"
 REGIME_FUNDING_UNKNOWN = "regime_funding_unknown"
+REGIME_FUNDING_ASSUMED_HIGH = "regime_funding_assumed_high"
 REGIME_FUNDING_NORMAL = "regime_funding_normal"
 LOW_CONFIDENCE = "low_confidence"
 UNSTABLE = "unstable"
@@ -302,7 +305,16 @@ def apply_regime_adjustments(
             if rule.only_if_funding_very_high:
                 funding = _finite_or_none(funding_rate_pct_8h)
                 limit = float(settings.scoring.derivatives.funding_very_high_pct)
-                if funding is None:
+                if funding is None and cfg.assume_funding_very_high_if_missing:
+                    adjustments.append(
+                        Adjustment(
+                            REGIME_FUNDING_ASSUMED_HIGH,
+                            f"Riesgo × {mult}: régimen {label} y no hay dato de funding, así "
+                            "que se toma como muy alto (por las dudas, el lado prudente).",
+                            rule.risk_multiplier,
+                        )
+                    )
+                elif funding is None:
                     adjustments.append(
                         Adjustment(
                             REGIME_FUNDING_UNKNOWN,

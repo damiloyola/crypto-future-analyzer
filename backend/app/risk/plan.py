@@ -24,6 +24,17 @@ Pasos de ``build_trade_plan`` (todos los números salen de ``config.yaml``)
 2. **Ajustes por régimen** (``regime_adjustments.apply_regime_adjustments``):
    bloqueos (long en Crash), score mínimo, R:R mínimo (el mayor entre el del
    perfil y el del régimen) y multiplicadores de riesgo, cada uno con su motivo.
+   **Límite de pérdida del día** (decisión del usuario,
+   ``cap_risk_to_daily_remaining``): después de los multiplicadores, el riesgo
+   se achica a lo que queda del límite, ``max_daily_loss_usd - max(0,
+   -pnl_today_usd)``, con su motivo ("Riesgo bajado de 50 a 20 USD: hoy ya
+   perdiste 80 de tus 100 USD de límite..."). Si así queda debajo de
+   ``min_operable_risk_usd``, "No operar" (si el régimen ya lo había dejado
+   debajo, el motivo que se muestra es el del día: aunque el régimen se aclare,
+   no se puede operar hasta mañana). Si el límite de pérdida ya se alcanzó, lo
+   bloquea la regla de límites del día (y el riesgo no se toca: los niveles
+   quedan como referencia); si esa regla falla solo por la cantidad de
+   operaciones, el riesgo se achica igual.
 3. **Stop por estructura** (``stops.structural_stop``): el soporte (long) o la
    resistencia (short) más cercano de ``trade_plan.stop_timeframes`` ∓
    ``stop_atr_buffer`` × ATR del timeframe de entrada, salteando los que están
@@ -32,8 +43,10 @@ Pasos de ``build_trade_plan`` (todos los números salen de ``config.yaml``)
 
    - TP1: el siguiente soporte/resistencia a favor (mismos timeframes que el
      stop), salteando los que están a menos de ``tp1_min_distance_atr`` ATR.
-     Si no hay ninguno, no hay TP1 (se dice por qué). Si queda más lejos que el
-     TP2 se marca "más lejos que el TP2".
+     Si no hay ninguno, no hay TP1 (se dice por qué). Si queda en el TP2 o más
+     lejos, con ``drop_tp1_beyond_tp2`` (decisión del usuario) no hay TP1 (se
+     dice por qué y el stop por tiempo mira el TP2); sin esa opción se marca
+     "más lejos que el TP2".
    - TP2: el más lejano entre ``tp2_r`` × R y, con ``tp2_ensure_min_rr``, el
      precio justo para que el R:R **neto de comisiones** (``fees.net_rr``) llegue
      al mínimo efectivo. Con comisiones ``f_in``/``f_out`` y
@@ -43,7 +56,9 @@ Pasos de ``build_trade_plan`` (todos los números salen de ``config.yaml``)
    - TP3: el más lejano entre ``tp3_r`` × R y TP2 + (``tp3_r`` - ``tp2_r``) × R.
    - Cada TP más lejos que el rango típico del día (ATR diario) lleva la marca
      "poco probable intradía" (``flag_tp_beyond_daily_range``); si es el TP2 y
-     ``block_if_tp2_beyond_daily_range``, no se opera.
+     ``block_if_tp2_beyond_daily_range``, no se opera. Sin dato del rango
+     típico del día (faltan velas diarias), con ``block_if_daily_range_missing``
+     tampoco se opera: no se puede saber si el TP2 es alcanzable hoy.
    - En un short con el stop absurdamente lejos el TP2 daría un precio de cero
      o menos: no hay TP2 (``tp2_missing_reason`` dice por qué) y no se opera.
 
@@ -63,31 +78,39 @@ Pasos de ``build_trade_plan`` (todos los números salen de ``config.yaml``)
    no tocó el TP1 ni el stop, se cierra (si no hay TP1, o queda más lejos que el
    TP2, se mira el TP2; si no hay ninguno de los dos, no hay stop por tiempo).
 10. **Reglas**: se evalúan TODAS y se guardan con ``ok`` (no se corta en la
-    primera): dirección, régimen, score mínimo, 4h contra 1h, límites del día,
-    evento de alta volatilidad, stop, R:R a TP2 con comisiones, TP2 dentro del
-    rango del día, apalancamiento, liquidación y riesgo mínimo operable (este
-    último aparece aunque no haya stop si el régimen ya dejó el riesgo debajo
-    del mínimo). Si alguna falla, el estado es ``NO_OPERAR`` y, si los niveles
-    se pudieron calcular, se devuelven igual marcados como referencia
-    (``is_reference=True``: "referencia, no operar") para que se vea por qué.
+    primera): precio de Nexo (solo si se comparó con el de referencia),
+    dirección, régimen, score mínimo, 4h contra 1h, límites del día, evento de
+    alta volatilidad, stop, R:R a TP2 con comisiones, TP2 dentro del rango del
+    día, apalancamiento, liquidación y riesgo mínimo operable (este último
+    aparece aunque no haya stop si el régimen o el límite del día ya dejaron
+    el riesgo debajo del mínimo). Si alguna falla, el estado es ``NO_OPERAR``
+    y, si los niveles se pudieron calcular, se devuelven igual marcados como
+    referencia (``is_reference=True``: "referencia, no operar") para que se vea
+    por qué.
 
-Avisos que no bloquean (``warnings``):
+**Precio de Nexo sospechoso** (decisión del usuario, ``block_if_price_suspect``):
+si el precio de Nexo difiere del de referencia más que
+``exchanges.nexo.manual_price_max_diff_pct`` (posible error de tipeo; justo en
+el máximo, con tolerancia de coma flotante, no), la regla del precio falla ("No
+operar" hasta corregirlo, con los dos precios y la diferencia) y el titular no
+recomienda la entrada alternativa. Con la opción en ``false`` solo se avisa.
 
-- Precio de entrada sospechoso: el de Nexo cargado a mano difiere del de
-  referencia más que ``exchanges.nexo.manual_price_max_diff_pct`` (posible
-  error de tipeo). El aviso va en el plan y el titular no dice que la entrada
-  alternativa "sí cumple las reglas".
-- Límite del día: si con la pérdida de hoy más la de esta operación (si toca el
-  stop) se pasaría de ``max_daily_loss_usd``. Hoy solo avisa; la regla bloquea
-  recién cuando la pérdida del día ya llegó al límite.
+Con esas decisiones apagadas, en vez de bloquear se avisa (``warnings``): el
+precio sospechoso (``block_if_price_suspect: false``), la falta del rango típico
+del día (``block_if_daily_range_missing: false``) y, con
+``cap_risk_to_daily_remaining: false``, que esta operación haría pasar el
+límite del día si toca el stop.
 
 Los soportes y resistencias con precio no finito o no positivo (armados a mano)
 se ignoran.
 
 Entrada alternativa: el soporte (long) o la resistencia (short) más cercano del
 timeframe de entrada (``timeframes.entry``, 15m) del lado a favor, como orden
-límite. Se calcula con la misma función (su stop, objetivos y tamaño propios);
-el plan principal es siempre la entrada a mercado.
+límite, salteando los que están a menos de ``alt_entry_min_distance_atr`` ×
+ATR(15m) del precio actual (decisión del usuario, como el stop y el TP1: un
+nivel pegado al precio es casi lo mismo que entrar a mercado). Se calcula con
+la misma función (su stop, objetivos y tamaño propios); el plan principal es
+siempre la entrada a mercado.
 
 Unidades: en el plan los ``*_pct`` son **porcentaje humano** (``1.5`` = 1,5 %),
 como en ``config.yaml`` y la API. Ojo: ``sizing``, ``liquidation`` y
@@ -138,13 +161,16 @@ from app.risk.rules import (
     check_min_operable_risk,
     check_rr,
     check_timeframe_conflict,
+    daily_loss_limit_reached,
     direction_from_score,
     fmt_num,
     fmt_percent,
+    fmt_percent_beside,
     fmt_price,
     fmt_ratio,
     fmt_usd,
     json_safe,
+    price_decimals,
 )
 from app.risk.sizing import Side, ensure_finite, ensure_positive
 from app.risk.stops import SkippedLevel, StopNotFound, StructuralStop, structural_stop
@@ -169,9 +195,13 @@ ENTRY_MARKET = "market"
 ENTRY_LIMIT = "limit"
 
 # Códigos de las reglas propias del plan (las demás están en ``rules``).
+PRICE_CHECK = "price_check"
 REGIME_RULE = "regime"
 STOP_RULE = "stop"
 TP2_DAILY_RANGE = "tp2_daily_range"
+
+# Código del ajuste por el límite de pérdida del día.
+DAILY_LOSS_CAP = "daily_loss_cap"
 
 # De dónde sale cada objetivo.
 TP_NEXT_LEVEL = "next_level"
@@ -185,6 +215,7 @@ FLAG_TP1_BEYOND_TP2 = "más lejos que el TP2"
 
 # Origen de los ajustes.
 SOURCE_REGIME = "regime"
+SOURCE_DAILY_LIMIT = "daily_limit"
 SOURCE_POSITION = "position"
 
 # Tendencias que se comparan para el conflicto de timeframes (la regla del
@@ -240,7 +271,10 @@ class PlanInputs:
       liquidación "modelo Nexo" (por omisión la billetera mensual del perfil).
     - ``price_diff_pct``: cuánto difiere el precio de entrada (el de Nexo) del
       de referencia, en % humano con signo (``None`` si no se comparó). Si pasa
-      de ``exchanges.nexo.manual_price_max_diff_pct`` el plan lo avisa.
+      de ``exchanges.nexo.manual_price_max_diff_pct``, "No operar" hasta
+      corregirlo (``trade_plan.block_if_price_suspect``; si no, solo se avisa).
+    - ``reference_price``: el precio de referencia con el que se comparó (para
+      mostrar los dos precios); si falta se deduce de ``price_diff_pct``.
     """
 
     symbol: str
@@ -264,6 +298,7 @@ class PlanInputs:
     funding_interval_hours: float | None = None
     wallet_equity_usd: float | None = None
     price_diff_pct: float | None = None
+    reference_price: float | None = None
 
 
 def plan_inputs_from_analysis(
@@ -293,8 +328,9 @@ def plan_inputs_from_analysis(
     - Funding: ``snapshot.funding`` pasado a % por 8 h con el intervalo que
       informa el exchange (o ``fees.funding_interval_hours``).
     - ``regime``: el ``RegimeReport`` de 1h o ``None``.
-    - ``price_diff_pct``: la diferencia del precio de Nexo contra el de
-      referencia (``snapshot.execution_price.diff_pct``).
+    - ``price_diff_pct`` / ``reference_price``: la diferencia del precio de
+      Nexo contra el de referencia y ese precio
+      (``snapshot.execution_price.diff_pct`` y ``.binance_price``).
     """
     entry = float(snapshot.current_price)
     timeframes = dict.fromkeys([*settings.trade_plan.stop_timeframes, settings.timeframes.entry])
@@ -326,6 +362,7 @@ def plan_inputs_from_analysis(
 
     execution = snapshot.execution_price
     diff = None if execution is None else clean_number(execution.diff_pct)
+    reference = None if execution is None else clean_number(execution.binance_price)
 
     return PlanInputs(
         symbol=snapshot.symbol,
@@ -348,6 +385,7 @@ def plan_inputs_from_analysis(
         available_margin_usd=available_margin_usd,
         funding_interval_hours=interval,
         price_diff_pct=diff,
+        reference_price=reference,
     )
 
 
@@ -522,6 +560,8 @@ class AlternativeEntry:
 
     ``plan`` es el plan completo calculado con la misma función (sin su propia
     alternativa); ``None`` si no hay nivel, con el motivo en ``reason``.
+    ``skipped``: los niveles salteados por estar a menos de
+    ``trade_plan.alt_entry_min_distance_atr`` ATR del precio actual.
     """
 
     kind: str  # ENTRY_LIMIT
@@ -531,6 +571,8 @@ class AlternativeEntry:
     distance_pct: float | None  # % humano desde el precio actual, con signo
     plan: TradePlan | None
     reason: str | None = None
+    skipped: tuple[SkippedLevel, ...] = ()
+    min_distance_atr: float | None = None
 
     @property
     def available(self) -> bool:
@@ -551,6 +593,8 @@ class AlternativeEntry:
             "level_price": self.level_price,
             "distance_pct": self.distance_pct,
             "reason": self.reason,
+            "min_distance_atr": self.min_distance_atr,
+            "skipped_levels": _skipped_dict(self.skipped),
         }
         p = self.plan
         if p is not None:
@@ -615,16 +659,20 @@ class TradePlan:
     - ``position``: el ``PositionFit`` final (margen, tamaño, apalancamiento,
       liquidación); ``regime_adjustment``: el ``RegimeAdjustmentResult``;
       ``regime_summary``: el régimen usado, listo para mostrar.
-    - ``requested_risk_usd`` (el del perfil), ``adjusted_risk_usd`` (con los
-      multiplicadores del régimen) y la pérdida máxima real en
-      ``position.risk_usd`` (comisiones incluidas).
+    - ``requested_risk_usd`` (el del perfil), ``regime_risk_usd`` (con los
+      multiplicadores del régimen), ``adjusted_risk_usd`` (además achicado a lo
+      que queda del límite del día, el que se usa para la posición) y la
+      pérdida máxima real en ``position.risk_usd`` (comisiones incluidas).
+      ``daily_remaining_usd``: lo que quedaba del límite de pérdida del día
+      antes de esta operación; ``risk_capped_by_day``: si se achicó por eso.
     - ``tp2_missing_reason``: por qué no hay TP2 (stop absurdamente lejos en
       un short), o ``None``.
     - ``day_state``: el estado del día que se usó (operaciones y resultado de
       hoy, evento marcado, margen disponible), como datos para la API.
-    - ``price_diff_pct`` / ``price_suspect``: diferencia del precio de entrada
-      contra el de referencia y si pasa de
-      ``exchanges.nexo.manual_price_max_diff_pct`` (posible error de tipeo).
+    - ``price_diff_pct`` / ``price_suspect`` / ``reference_price``: diferencia
+      del precio de Nexo contra el de referencia, si pasa de
+      ``exchanges.nexo.manual_price_max_diff_pct`` (posible error de tipeo) y
+      el precio de referencia.
     """
 
     symbol: str
@@ -646,8 +694,8 @@ class TradePlan:
     min_rr_reason: str | None
     position: PositionFit | None
     requested_risk_usd: float  # riesgo del perfil, antes de ajustar
-    adjusted_risk_usd: float | None  # después de los multiplicadores del régimen
-    risk_multiplier: float | None
+    adjusted_risk_usd: float | None  # después del régimen y del límite del día
+    risk_multiplier: float | None  # producto de los multiplicadores del régimen
     fees: FeesPlan | None
     funding: FundingEstimate | None
     time_stop: TimeStop | None
@@ -668,6 +716,10 @@ class TradePlan:
     day_state: dict[str, Any] = field(default_factory=dict)
     price_diff_pct: float | None = None
     price_suspect: bool = False
+    reference_price: float | None = None
+    regime_risk_usd: float | None = None
+    daily_remaining_usd: float | None = None
+    risk_capped_by_day: bool = False
 
     @property
     def ok(self) -> bool:
@@ -745,6 +797,9 @@ class TradePlan:
             {
                 "requested_usd": self.requested_risk_usd,
                 "risk_multiplier": self.risk_multiplier,
+                "after_regime_usd": self.regime_risk_usd,
+                "daily_remaining_usd": self.daily_remaining_usd,
+                "capped_by_daily_limit": self.risk_capped_by_day,
                 "after_adjustments_usd": self.adjusted_risk_usd,
                 "max_loss_usd": None if f is None else f.risk_usd,
                 "price_loss_usd": None if f is None else f.price_loss_at_stop_usd,
@@ -773,6 +828,7 @@ class TradePlan:
                     "kind": self.entry_kind,
                     "price_source": self.price_source,
                     "diff_vs_reference_pct": self.price_diff_pct,
+                    "reference_price": self.reference_price,
                     "price_suspect": self.price_suspect,
                 },
                 "stop": None if self.stop is None else self.stop.to_dict(),
@@ -977,6 +1033,84 @@ def _r_text(multiple: float) -> str:
     return f"{fmt_num(multiple, 2)}R ({fmt_num(multiple, 2)} veces el riesgo)."
 
 
+def _reference_price(entry: float, diff_pct: float, reference_price: float | None) -> float | None:
+    """El precio de referencia: el que vino, o deducido de la diferencia."""
+    ref = clean_number(reference_price)
+    if ref is not None and ref > 0:
+        return ref
+    return entry / (1.0 + diff_pct / 100.0) if diff_pct > -100.0 else None
+
+
+def _price_texts(
+    nexo_price: float,
+    reference: float | None,
+    diff_pct: float,
+    max_diff_pct: float,
+    *,
+    suspect: bool,
+) -> tuple[str, str, str]:
+    """Textos del precio de Nexo, del de referencia (``" (...)"`` o vacío) y de la diferencia.
+
+    Los dos precios van con los decimales fijos del de Nexo, como la sección de
+    precios de la consola (``186,60``, no ``186,6``). Si es sospechosa, la
+    diferencia nunca se ve redondeada al máximo aceptado: ``2.004`` contra ``2``
+    se muestra ``2,004 %``, así el mensaje no dice "difiere 2 %, más que el 2 %".
+    Si no lo es, va con el redondeo de siempre ("difiere 2 %, dentro del 2 %"
+    se lee bien, y el ruido de coma flotante no aparece como "2,0001 %").
+    """
+    decimals = price_decimals(nexo_price)
+    nexo_txt = fmt_num(nexo_price, decimals, trim=False)
+    ref_txt = "" if reference is None else f" ({fmt_num(reference, decimals, trim=False)})"
+    diff = abs(diff_pct)
+    diff_txt = fmt_percent_beside(diff, max_diff_pct) if suspect else fmt_percent(diff)
+    return nexo_txt, ref_txt, diff_txt
+
+
+def _price_rule(
+    nexo_price: float,
+    price_source: str,
+    diff_pct: float,
+    reference: float | None,
+    max_diff_pct: float,
+    *,
+    suspect: bool,
+) -> RuleResult:
+    """Regla del precio de Nexo contra el de referencia (decisión del usuario).
+
+    Si difiere más que ``max_diff_pct`` puede ser un error de tipeo: todo el
+    plan (stop, objetivos y tamaño) saldría mal, así que "No operar" hasta
+    corregirlo. Se muestran los dos precios (ver ``_price_texts``) y la
+    diferencia.
+    """
+    who = " que cargaste" if price_source == "manual_nexo" else ""
+    nexo_txt, ref_txt, diff_txt = _price_texts(
+        nexo_price, reference, diff_pct, max_diff_pct, suspect=suspect
+    )
+    if not suspect:
+        return RuleResult(
+            code=PRICE_CHECK,
+            ok=True,
+            message=(
+                f"El precio de Nexo ({nexo_txt}) difiere {diff_txt} del de "
+                f"referencia{ref_txt}: dentro del {fmt_percent(max_diff_pct)} que se acepta."
+            ),
+        )
+    return RuleResult(
+        code=PRICE_CHECK,
+        ok=False,
+        message=(
+            f"{NO_TRADE}: el precio de Nexo{who} ({nexo_txt}) difiere {diff_txt} del de "
+            f"referencia{ref_txt}, más que el {fmt_percent(max_diff_pct)} que se acepta: puede "
+            "ser un error de tipeo."
+        ),
+        suggestion=(
+            "Revisá el precio en Nexo y volvé a cargarlo bien: con un precio mal cargado, todo "
+            "el plan (stop, objetivos y tamaño) sale mal. Si de verdad es ese, esperá a que los "
+            "dos precios se acerquen."
+        ),
+    )
+
+
 def _regime_rule(adj: RegimeAdjustmentResult, side: Side) -> RuleResult:
     """Regla del régimen: bloqueo por tipo de régimen (por ejemplo, long en Crash)."""
     plural = "longs" if side == "long" else "shorts"
@@ -1053,8 +1187,13 @@ def _daily_range_rule(
     daily_usd: float | None,
     entry: float,
     block_enabled: bool,
+    block_if_missing: bool,
 ) -> RuleResult:
-    """El TP2 tiene que entrar en el rango típico del día (decisión del usuario)."""
+    """El TP2 tiene que entrar en el rango típico del día (decisión del usuario).
+
+    Sin dato del rango (faltan velas diarias), con ``block_if_missing`` no se
+    opera: no se puede saber si el objetivo es alcanzable hoy.
+    """
     if tp2 is None:
         return RuleResult(
             code=TP2_DAILY_RANGE,
@@ -1064,13 +1203,23 @@ def _daily_range_rule(
             ),
             suggestion=_TP2_MISSING_TIP,
         )
+    if daily_usd is None and block_if_missing:
+        return RuleResult(
+            code=TP2_DAILY_RANGE,
+            ok=False,
+            message=(
+                f"{NO_TRADE}: no se puede saber si el objetivo (TP2) es alcanzable hoy: faltan "
+                "velas diarias para medir lo que se mueve el precio en un día normal."
+            ),
+            suggestion="Volvé a intentar cuando se puedan bajar las velas diarias.",
+        )
     if daily_usd is None:
         return RuleResult(
             code=TP2_DAILY_RANGE,
             ok=True,
             message=(
                 "No hay dato del rango típico del día: no se pudo controlar si el TP2 se "
-                "alcanza en el día."
+                "alcanza en el día (la config no bloquea por esto)."
             ),
         )
     daily_pct = daily_usd / entry * 100.0
@@ -1135,19 +1284,59 @@ def _regime_floor_rule(adj: RegimeAdjustmentResult, profile: EffectiveProfile) -
     return RuleResult(MIN_OPERABLE_RISK, False, adj.block_reasons[-1], suggestion)
 
 
+def _daily_cap_floor_rule(
+    loss_today: float, max_daily_loss: float, remaining: float, profile: EffectiveProfile
+) -> RuleResult:
+    """Lo que queda del límite de pérdida del día no llega al mínimo operable."""
+    return RuleResult(
+        code=MIN_OPERABLE_RISK,
+        ok=False,
+        message=(
+            f"{NO_TRADE}: hoy ya perdiste {fmt_usd(loss_today, unit=False)} de tus "
+            f"{fmt_usd(max_daily_loss)} de límite del día; lo que te queda ({fmt_usd(remaining)}) "
+            f"es menos que el mínimo operable de {fmt_usd(profile.min_operable_risk_usd)}."
+        ),
+        suggestion="Esperá a mañana.",
+    )
+
+
+def _risk_floor_rule(
+    adj: RegimeAdjustmentResult,
+    profile: EffectiveProfile,
+    daily_cap_rule: RuleResult | None,
+) -> RuleResult | None:
+    """El piso de riesgo que ya se cruzó antes de los niveles, o ``None``.
+
+    Si se cruzaron los dos, manda el del límite del día: es el que de verdad
+    limita (el riesgo ya quedó en lo que queda del día, menos que lo que dejó
+    el régimen) y aunque el régimen se aclare no se puede operar hasta mañana.
+    Los multiplicadores del régimen igual se ven en los ajustes.
+    """
+    if daily_cap_rule is not None:
+        return daily_cap_rule
+    if adj.risk_below_min:
+        return _regime_floor_rule(adj, profile)
+    return None
+
+
 def _min_risk_rule(
-    adj: RegimeAdjustmentResult, fit: PositionFit, profile: EffectiveProfile
+    adj: RegimeAdjustmentResult,
+    fit: PositionFit,
+    profile: EffectiveProfile,
+    daily_cap_rule: RuleResult | None = None,
 ) -> RuleResult:
     """Riesgo mínimo operable, con el motivo más claro.
 
-    Falla si el régimen ya dejó el riesgo debajo del mínimo (aunque con las
-    comisiones aparte la pérdida total lo pase) o si el riesgo final de la
-    posición, en los términos del perfil (``PositionFit.floor_risk_usd``),
-    quedó debajo.
+    Falla si lo que queda del límite del día no llega (``daily_cap_rule``), si
+    el régimen ya dejó el riesgo debajo del mínimo (aunque con las comisiones
+    aparte la pérdida total lo pase) o si el riesgo final de la posición, en
+    los términos del perfil (``PositionFit.floor_risk_usd``), quedó debajo. Si
+    fallan el del día y el del régimen, manda el del día (ver
+    ``_risk_floor_rule``).
     """
-    if adj.risk_below_min:
-        # El piso se cruzó por los multiplicadores del régimen.
-        return _regime_floor_rule(adj, profile)
+    floor_rule = _risk_floor_rule(adj, profile, daily_cap_rule)
+    if floor_rule is not None:
+        return floor_rule
     base = check_min_operable_risk(fit.floor_risk_usd, profile)
     if base.ok:
         return base
@@ -1345,7 +1534,14 @@ def _build(
     *,
     entry_kind: str,
     with_alternative: bool,
+    market_price: float | None = None,
 ) -> TradePlan:
+    """El plan con ``inputs.entry_price`` como entrada.
+
+    ``market_price``: el precio actual cuando la entrada es otra (la orden
+    límite de la entrada alternativa); la regla del precio de Nexo habla de ese
+    precio, no del nivel de la orden.
+    """
     entry = _validate(inputs, now)
     profile = inputs.profile
     tp_cfg = settings.trade_plan
@@ -1359,21 +1555,41 @@ def _build(
     adjustments: list[PlanAdjustment] = []
     warnings: list[str] = list(profile.warnings)
 
-    # Precio de entrada sospechoso (el de Nexo muy distinto del de referencia):
-    # no bloquea, pero el plan lo avisa y no recomienda la entrada alternativa.
+    # Precio de Nexo comparado con el de referencia. Si difiere demasiado
+    # (posible error de tipeo), "No operar" hasta corregirlo (decisión del
+    # usuario) o, con block_if_price_suspect apagado, solo se avisa. En los dos
+    # casos el titular no recomienda la entrada alternativa.
+    # La diferencia viene con ruido de coma flotante (3,00 contra 3,06 da
+    # 2,0000000000000018 %): justo en el máximo no es sospechosa, como dice la
+    # decisión ("más que" el máximo).
     price_diff = clean_number(inputs.price_diff_pct)
     max_diff = float(settings.exchanges.nexo.manual_price_max_diff_pct)
-    price_suspect = price_diff is not None and abs(price_diff) > max_diff
-    if price_suspect:
-        assert price_diff is not None
-        reference = entry / (1.0 + price_diff / 100.0) if price_diff > -100.0 else None
-        ref_txt = "" if reference is None else f" ({fmt_price(reference)})"
-        warnings.append(
-            f"Revisá el precio de entrada: {fmt_price(entry)} difiere "
-            f"{fmt_percent(abs(price_diff))} del precio de referencia{ref_txt}, más que el "
-            f"{fmt_percent(max_diff)} que se acepta. Si está mal escrito, todo este plan (stop, "
-            "objetivos y tamaño) está mal: no lo uses hasta cargarlo bien."
-        )
+    price_suspect = price_diff is not None and abs(price_diff) > max_diff * (1.0 + REL_TOL)
+    nexo_price = entry if market_price is None else market_price
+    reference_price: float | None = None
+    if price_diff is not None:
+        reference_price = _reference_price(nexo_price, price_diff, inputs.reference_price)
+        if price_suspect and not tp_cfg.block_if_price_suspect:
+            nexo_txt, ref_txt, diff_txt = _price_texts(
+                nexo_price, reference_price, price_diff, max_diff, suspect=True
+            )
+            warnings.append(
+                f"Revisá el precio de entrada: {nexo_txt} difiere {diff_txt} del precio de "
+                f"referencia{ref_txt}, más que el {fmt_percent(max_diff)} que se acepta. Si está "
+                "mal escrito, todo este plan (stop, objetivos y tamaño) está mal: no lo uses "
+                "hasta cargarlo bien."
+            )
+        else:
+            rules.append(
+                _price_rule(
+                    nexo_price,
+                    inputs.price_source,
+                    price_diff,
+                    reference_price,
+                    max_diff,
+                    suspect=price_suspect,
+                )
+            )
 
     # 1) Dirección.
     rules.append(check_direction(score_total, thresholds))
@@ -1399,6 +1615,50 @@ def _build(
     rules.append(
         check_high_volatility_event(inputs.high_volatility_event, inputs.event_description)
     )
+
+    # Límite de pérdida del día (decisión del usuario): el riesgo, ya con los
+    # multiplicadores del régimen, se achica a lo que queda del límite. Si el
+    # límite de pérdida ya se alcanzó lo bloquea la regla de arriba y el riesgo
+    # no se toca (los niveles quedan como referencia). Si la regla falla solo
+    # por la cantidad de operaciones, el tope se aplica igual: el plan de
+    # referencia no puede arriesgar más de lo que queda del día.
+    loss_today = max(0.0, -float(inputs.pnl_today_usd))
+    max_daily_loss = float(profile.max_daily_loss_usd)
+    daily_remaining = max(0.0, max_daily_loss - loss_today)
+    loss_limit_reached = daily_loss_limit_reached(loss_today, max_daily_loss)
+    risk_usd: float | None = None if adj is None else adj.risk_usd
+    capped_by_day = False
+    daily_cap_rule: RuleResult | None = None
+    if (
+        risk_usd is not None
+        and tp_cfg.cap_risk_to_daily_remaining
+        and not loss_limit_reached
+        and risk_usd > daily_remaining * (1.0 + REL_TOL)
+    ):
+        if tp_cfg.fees_included_in_risk:
+            then = "así, si esta operación toca el stop, no pasás el límite"
+        else:
+            then = (
+                "así, si esta operación toca el stop, solo las comisiones quedan por encima "
+                "del límite"
+            )
+        adjustments.append(
+            PlanAdjustment(
+                SOURCE_DAILY_LIMIT,
+                DAILY_LOSS_CAP,
+                f"Riesgo bajado de {fmt_usd(risk_usd, unit=False)} a {fmt_usd(daily_remaining)}: "
+                f"hoy ya perdiste {fmt_usd(loss_today, unit=False)} de tus "
+                f"{fmt_usd(max_daily_loss)} de límite del día ({then}).",
+                daily_remaining / risk_usd,
+            )
+        )
+        risk_usd = daily_remaining
+        capped_by_day = True
+        floor = float(profile.min_operable_risk_usd)
+        if daily_remaining < floor * (1.0 - REL_TOL):
+            daily_cap_rule = _daily_cap_floor_rule(
+                loss_today, max_daily_loss, daily_remaining, profile
+            )
 
     stop_tfs = list(dict.fromkeys(tp_cfg.stop_timeframes))
     levels = _clean_levels(inputs.levels)
@@ -1437,9 +1697,11 @@ def _build(
                 found = result
         if found is None:
             rules.append(_stop_missing_rule(stop_missing or ""))
-            # El piso de riesgo del régimen no depende de los niveles: se lista igual.
-            if adj.risk_below_min:
-                rules.append(_regime_floor_rule(adj, profile))
+            # El piso de riesgo (del límite del día o del régimen) no depende de
+            # los niveles: se lista igual.
+            floor_rule = _risk_floor_rule(adj, profile, daily_cap_rule)
+            if floor_rule is not None:
+                rules.append(floor_rule)
         else:
             rules.append(_stop_rule(found))
             op = "menos" if side == "long" else "más"
@@ -1461,7 +1723,13 @@ def _build(
                 ),
             )
 
-    if found is not None and side is not None and adj is not None and atr is not None:
+    if (
+        found is not None
+        and side is not None
+        and adj is not None
+        and atr is not None
+        and risk_usd is not None
+    ):
         stop = found.stop
         risk_distance = abs(entry - stop)
         sign = 1.0 if side == "long" else -1.0
@@ -1473,7 +1741,7 @@ def _build(
             side,
             entry,
             stop,
-            adj.risk_usd,
+            risk_usd,
             profile,
             settings,
             available_margin_usd=inputs.available_margin_usd,
@@ -1562,45 +1830,65 @@ def _build(
                     f"{fmt_num(take_cfg.tp1_min_distance_atr, 2)} ATR)."
                 )
             extra: tuple[str, ...] = ()
-            if tp2 is not None and abs(level_price - entry) > abs(tp2.price - entry):
-                extra = (FLAG_TP1_BEYOND_TP2,)
-            tp1 = _make_tp(
-                "TP1",
-                side,
-                entry,
-                stop,
-                level_price,
-                q,
-                rates,
-                TP_NEXT_LEVEL,
-                why1,
-                daily_usd,
-                flag_daily,
-                extra_flags=extra,
-                level_timeframe=level_tf,
-                skipped=skipped,
-            )
+            level_distance = abs(level_price - entry)
+            tp2_distance = math.inf if tp2 is None else abs(tp2.price - entry)
+            if tp2 is not None and take_cfg.drop_tp1_beyond_tp2 and level_distance >= tp2_distance:
+                # Decisión del usuario: un TP1 en el TP2 o más lejos no sirve como
+                # primer objetivo; el primero es el TP2 (y el stop por tiempo lo mira).
+                article = "la" if word == "resistencia" else "el"
+                where = (
+                    "en el mismo precio que" if level_distance == tp2_distance else "más lejos que"
+                )
+                tp1_missing = (
+                    f"No hay TP1: {article} siguiente {word} ({level_tf}, en "
+                    f"{fmt_price(level_price, entry)}) queda {where} el TP2 "
+                    f"({fmt_price(tp2.price, entry)}); el primer objetivo es el TP2."
+                )
+            else:
+                if level_distance > tp2_distance:
+                    extra = (FLAG_TP1_BEYOND_TP2,)
+                tp1 = _make_tp(
+                    "TP1",
+                    side,
+                    entry,
+                    stop,
+                    level_price,
+                    q,
+                    rates,
+                    TP_NEXT_LEVEL,
+                    why1,
+                    daily_usd,
+                    flag_daily,
+                    extra_flags=extra,
+                    level_timeframe=level_tf,
+                    skipped=skipped,
+                )
         tps = [tp for tp in (tp1, tp2, tp3) if tp is not None]
 
         # 6-9) Comisiones, reglas de la posición, funding y stop por tiempo.
         fees_plan = _fees_plan(fit, tp2, rates)
         rules.append(_rr_rule(rr_tp2, min_rr, tp2_missing))
         rules.append(
-            _daily_range_rule(tp2, daily_usd, entry, bool(take_cfg.block_if_tp2_beyond_daily_range))
+            _daily_range_rule(
+                tp2,
+                daily_usd,
+                entry,
+                bool(take_cfg.block_if_tp2_beyond_daily_range),
+                bool(tp_cfg.block_if_daily_range_missing),
+            )
         )
         rules.append(check_leverage(fit.leverage, profile))
         rules.append(_liquidation_rule(fit))
-        rules.append(_min_risk_rule(adj, fit, profile))
+        rules.append(_min_risk_rule(adj, fit, profile, daily_cap_rule))
         funding = _funding_estimate(side, fit.size_usd, inputs, settings)
         time_stop = _time_stop(now, settings, tp1, tp2)
 
-    # Límite de pérdida del día: la regla bloquea cuando ya se llegó; si todavía
-    # no, pero esta operación lo pasaría si toca el stop, se avisa (no bloquea).
-    loss_today = max(0.0, -float(inputs.pnl_today_usd))
-    max_daily_loss = float(profile.max_daily_loss_usd)
+    # Sin el tope por el límite del día (cap_risk_to_daily_remaining apagado),
+    # si esta operación lo pasaría al tocar el stop, se avisa (no bloquea).
     loss_if_stopped = None if fit is None else loss_today + fit.risk_usd
     if (
-        daily_rule.ok
+        not tp_cfg.cap_risk_to_daily_remaining
+        and not loss_limit_reached
         and loss_if_stopped is not None
         and loss_if_stopped > max_daily_loss * (1.0 + REL_TOL)
     ):
@@ -1618,7 +1906,7 @@ def _build(
                 f"Los niveles se calcularon con el precio de {used}, no con el de Nexo: si en "
                 "Nexo el precio es distinto, cargalo a mano."
             )
-        if daily_usd is None:
+        if daily_usd is None and not tp_cfg.block_if_daily_range_missing:
             warnings.append(
                 "No hay dato del rango típico del día: no se puede marcar qué objetivos son "
                 "poco probables en el día."
@@ -1654,6 +1942,8 @@ def _build(
         "pnl_today_usd": float(inputs.pnl_today_usd),
         "loss_today_usd": loss_today,
         "max_daily_loss_usd": max_daily_loss,
+        "daily_remaining_usd": daily_remaining,
+        "risk_capped_by_day": capped_by_day,
         "loss_if_stopped_usd": loss_if_stopped,
         "high_volatility_event": inputs.high_volatility_event,
         "event_description": inputs.event_description,
@@ -1681,7 +1971,7 @@ def _build(
         min_rr_reason=None if adj is None else adj.min_rr_reason,
         position=fit,
         requested_risk_usd=float(profile.risk_per_trade_usd),
-        adjusted_risk_usd=None if adj is None else adj.risk_usd,
+        adjusted_risk_usd=risk_usd,
         risk_multiplier=None if adj is None else adj.risk_multiplier,
         fees=fees_plan,
         funding=funding,
@@ -1703,16 +1993,41 @@ def _build(
         day_state=json_safe(day_state),
         price_diff_pct=price_diff,
         price_suspect=price_suspect,
+        reference_price=reference_price,
+        regime_risk_usd=None if adj is None else adj.risk_usd,
+        daily_remaining_usd=daily_remaining,
+        risk_capped_by_day=capped_by_day,
     )
 
 
 def _alternative(
     inputs: PlanInputs, settings: AppSettings, now: datetime, side: Side, entry: float
 ) -> AlternativeEntry:
-    """Orden límite en el S/R más cercano a favor del timeframe de entrada."""
+    """Orden límite en el S/R más cercano a favor del timeframe de entrada.
+
+    Se saltean los niveles a menos de ``trade_plan.alt_entry_min_distance_atr``
+    × ATR del timeframe de entrada (decisión del usuario, como el stop y el
+    TP1): uno pegado al precio actual es casi lo mismo que entrar a mercado.
+    """
     tf = settings.timeframes.entry
     kind = "soporte" if side == "long" else "resistencia"
     where = "debajo" if side == "long" else "arriba"
+    plural = _plural_word(kind)
+    min_atr = float(settings.trade_plan.alt_entry_min_distance_atr)
+
+    def unavailable(reason: str, skipped: tuple[SkippedLevel, ...] = ()) -> AlternativeEntry:
+        return AlternativeEntry(
+            kind=ENTRY_LIMIT,
+            timeframe=tf,
+            level_kind=kind,
+            level_price=None,
+            distance_pct=None,
+            plan=None,
+            reason=reason,
+            skipped=skipped,
+            min_distance_atr=min_atr,
+        )
+
     # Sin los niveles con precio no finito o no positivo (un "inf" no es una entrada).
     sr = _clean_levels({tf: inputs.levels.get(tf)})[tf]
     candidates = (
@@ -1723,18 +2038,43 @@ def _alternative(
         ]
     )
     if not candidates:
-        return AlternativeEntry(
-            kind=ENTRY_LIMIT,
-            timeframe=tf,
-            level_kind=kind,
-            level_price=None,
-            distance_pct=None,
-            plan=None,
-            reason=f"No hay {_plural_word(kind)} de {tf} {where} del precio para una orden límite.",
+        return unavailable(f"No hay {plural} de {tf} {where} del precio para una orden límite.")
+
+    skipped: list[SkippedLevel] = []
+    if min_atr > 0:
+        atr = clean_number(inputs.entry_atr)
+        if atr is None or atr <= 0:
+            return unavailable(
+                f"No hay ATR de {tf}: no se puede saber qué {plural} están demasiado cerca del "
+                "precio para una orden límite."
+            )
+        far: list[float] = []
+        for price in candidates:
+            distance_atr = abs(price - entry) / atr
+            if distance_atr < min_atr:
+                skipped.append(SkippedLevel(price, tf, distance_atr))
+            else:
+                far.append(price)
+        skipped.sort(key=lambda sk: sk.distance_atr)
+        candidates = far
+    if not candidates:
+        article = "todas las" if plural == "resistencias" else "todos los"
+        return unavailable(
+            f"No hay orden límite: {article} {plural} de {tf} {where} del precio están a menos "
+            f"de {fmt_num(min_atr, 2)} ATR (tan cerca que sería casi lo mismo que entrar a "
+            "mercado).",
+            tuple(skipped),
         )
     level = max(candidates) if side == "long" else min(candidates)
     alt_inputs = dataclasses.replace(inputs, entry_price=level)
-    plan = _build(alt_inputs, settings, now, entry_kind=ENTRY_LIMIT, with_alternative=False)
+    plan = _build(
+        alt_inputs,
+        settings,
+        now,
+        entry_kind=ENTRY_LIMIT,
+        with_alternative=False,
+        market_price=entry,
+    )
     return AlternativeEntry(
         kind=ENTRY_LIMIT,
         timeframe=tf,
@@ -1742,15 +2082,22 @@ def _alternative(
         level_price=level,
         distance_pct=(level - entry) / entry * 100.0,
         plan=plan,
+        skipped=tuple(skipped),
+        min_distance_atr=min_atr,
     )
 
 
 __all__ = [
+    "DAILY_LOSS_CAP",
     "ENTRY_LIMIT",
     "ENTRY_MARKET",
     "FLAG_TP1_BEYOND_TP2",
     "FLAG_UNLIKELY_INTRADAY",
+    "PRICE_CHECK",
     "REGIME_RULE",
+    "SOURCE_DAILY_LIMIT",
+    "SOURCE_POSITION",
+    "SOURCE_REGIME",
     "STATUS_LONG",
     "STATUS_NO_TRADE",
     "STATUS_SHORT",

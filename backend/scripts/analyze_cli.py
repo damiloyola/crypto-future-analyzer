@@ -9,8 +9,10 @@ Uso::
 Opciones:
 
 - ``--nexo-price 61234.5``: precio de Nexo pegado a mano. Se usa para los
-  cálculos y se compara con Binance (aviso si difiere más que
-  ``exchanges.nexo.manual_price_max_diff_pct``). Sin esto se usa Binance.
+  cálculos y se compara con Binance: si difiere más que
+  ``exchanges.nexo.manual_price_max_diff_pct`` (¿error de tipeo?), el plan da
+  "No operar" hasta corregirlo (``trade_plan.block_if_price_suspect``). Sin
+  esto se usa Binance.
   Acepta ``96000.5``, ``96000,5``, ``96.000,50`` (formato argentino) y
   ``96,000.50`` (formato de EE. UU.). Un solo separador seguido de exactamente
   tres cifras (``96.000``, ``2,615``) es ambiguo (¿miles o decimales?) y se
@@ -26,8 +28,10 @@ Opciones:
   (la descripción es opcional; poné la moneda antes): el plan da "No operar".
 - ``--trades-today 2`` y ``--pnl-today -30``: operaciones y resultado (USD) de
   hoy, para el límite diario del perfil (hasta el Hito 5 no se llevan solos).
-  Si se pasan, el plan muestra cómo va el día; el JSON los trae en
-  ``plan.day_state``.
+  El riesgo se achica a lo que queda del límite de pérdida del día (con su
+  motivo en "Ajustes"; ``trade_plan.cap_risk_to_daily_remaining``) y, si eso
+  queda debajo del mínimo operable, "No operar". Si se pasan, el plan muestra
+  cómo va el día; el JSON los trae en ``plan.day_state``.
 - ``--offline``: datos sintéticos, sin red (``data.synthetic``). Muestra un
   cartel grande porque los números no son reales. ``--seed`` y ``--now``
   permiten repetir exactamente la misma corrida.
@@ -78,8 +82,9 @@ con colores ANSI solo si la salida es una terminal):
    objetivo), funding estimado y stop por tiempo en ``app.user_timezone``; de
    dónde sale cada nivel (con una línea que explica R, R:R y ATR); los
    ajustes con su motivo; las reglas que no se cumplen (✗) con la sugerencia;
-   los avisos y un resumen de la entrada alternativa (con sus propios ajustes,
-   liquidación, comisiones y stop por tiempo). Usa el régimen de 1h si está
+   los avisos y un resumen de la entrada alternativa (con los niveles que se
+   saltearon por estar pegados al precio, sus propios ajustes, liquidación,
+   comisiones y stop por tiempo). Usa el régimen de 1h si está
    disponible. Si no se opera pero los niveles se pudieron calcular, se
    muestran como "referencia, no operar".
 
@@ -1408,14 +1413,21 @@ def _plan_position_rows(
     )
     rows.append(("Pérdida máxima", Cell(loss_text, "bold")))
     mult = _finite(risk["risk_multiplier"])
-    if mult is not None and abs(mult - 1.0) > 1e-12:
-        rows.append(
-            (
-                "Riesgo pedido",
-                f"{fmt_usd(risk['requested_usd'])} del perfil × {_multiplier_text(mult)} = "
-                f"{fmt_usd(risk['after_adjustments_usd'])} (ajustes por régimen)",
+    by_regime = mult is not None and abs(mult - 1.0) > 1e-12
+    by_day = bool(risk.get("capped_by_daily_limit"))
+    if by_regime or by_day:
+        text = f"{fmt_usd(risk['requested_usd'])} del perfil"
+        if by_regime:
+            text += (
+                f" × {_multiplier_text(mult or 0.0)} = {fmt_usd(risk['after_regime_usd'])} "
+                "(ajustes por régimen)"
             )
-        )
+        if by_day:
+            text += (
+                f" → {fmt_usd(risk['after_adjustments_usd'])} (lo que te queda del límite de "
+                "pérdida del día)"
+            )
+        rows.append(("Riesgo pedido", text))
     if risk.get("reduced_by_position"):
         rows.append(("", Cell("La posición se achicó: arriesgás menos que lo pedido.", "yellow")))
     fee_text = (
@@ -1467,6 +1479,13 @@ def _render_alternative(alt: dict[str, Any], entry: Any, style: Style) -> list[s
         f"({_signed_pct_from(alt['level_price'], entry)} del precio actual)"
     )
     lines.append(f"    Orden límite {where}. Si el precio no llega, no entrás.")
+    word = _with_article(alt["level_kind"])
+    for sk in alt.get("skipped_levels") or []:
+        lines.append(
+            f"    Se salteó {word} {fmt_num(sk['price'], d)} ({sk['timeframe']}) por estar a "
+            f"{fmt_num(sk['distance_atr'], 2)} ATR: tan cerca del precio que sería casi lo mismo "
+            "que entrar a mercado."
+        )
     status = alt["status"]
     state = Cell(_STATUS_TEXT.get(status, status), _STATUS_COLOR.get(status))
     rows: list[tuple[str, Cell | str]] = [("Estado", state)]
