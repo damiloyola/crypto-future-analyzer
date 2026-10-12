@@ -278,7 +278,10 @@ scoring:
     # "contrarian": miedo extremo suma al long y codicia extrema resta.
     # "trend": al revés (acompaña el sentimiento).
     fear_greed_mode: "contrarian"
-    news_share: 0.5    # parte del componente que aportan las noticias (0 a 1)
+    # Decisión del usuario: las noticias NO mueven el score (para saber si una
+    # noticia es buena o mala hay que leerla, y eso lo hace la IA, que no toca
+    # números). El sentimiento usa solo Fear & Greed; la IA comenta las noticias.
+    news_share: 0.0
   direction_thresholds:
     long: 30           # score >= +30, candidato a long
     short: -30         # score <= -30, candidato a short
@@ -294,9 +297,20 @@ trade_plan:
   # siguiente. Así el ruido normal no te saca y el apalancamiento no se dispara.
   min_stop_distance_atr: 1.0
   take_profit:
-    tp1: "next_level"   # siguiente S/R
-    tp2_r: 1.5
+    tp1: "next_level"   # siguiente S/R en la dirección de la operación
+    # Decisión del usuario: igual que con el stop, los niveles más cerca de la
+    # entrada que esta cantidad de ATR(15m) se saltean para el TP1.
+    tp1_min_distance_atr: 1.0
+    tp2_r: 1.5          # TP2 a 1,5 veces el riesgo (como mínimo, ver abajo)
     tp3_r: 2.5
+    # Decisión del usuario: con el TP2 fijo en 1,5R, las comisiones hacen que
+    # el R:R neto siempre quede apenas debajo de 1,5 y la regla bloquearía todo.
+    # true = el TP2 se corre lo justo para que, pagadas las comisiones, el R:R
+    # llegue al mínimo que pidan el perfil o el régimen.
+    tp2_ensure_min_rr: true
+    # true = si ese TP2 queda más lejos que el rango típico del día (ATR
+    # diario), no se opera: el objetivo no es realista para una operación del día.
+    block_if_tp2_beyond_daily_range: true
   flag_tp_beyond_daily_range: true  # TP más lejos que el ATR diario = "poco probable intradía"
   time_stop_hours: 24
   # true = el riesgo por operación (ej. 50 USD) ya incluye las comisiones de

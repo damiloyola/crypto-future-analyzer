@@ -72,6 +72,13 @@ El frontend solo muestra lo que devuelve la API; no calcula riesgo.
   también resume 24 velas = **24 días** (regímenes de 2 a 4 semanas,
   calentamiento de 190 días): el usuario lo confirmó; es solo informativo
   (`regime_adjustments.apply_context_regime: false`).
+- **Plan (Hito 4):** TP1 = próximo S/R salteando los que están a menos de 1
+  ATR(15m) (`take_profit.tp1_min_distance_atr`); TP2 = el mayor entre 1,5R y lo
+  justo para que el R:R **neto de comisiones** llegue al mínimo del perfil o
+  del régimen (`tp2_ensure_min_rr`), y si ese TP2 queda más lejos que el ATR
+  diario no se opera (`block_if_tp2_beyond_daily_range`); el R:R literal "a
+  TP2 con comisiones >= 1,5" bloqueaba siempre. Las noticias **no** entran al
+  score (`scoring.sentiment.news_share: 0`): solo Fear & Greed; la IA las comenta.
 - Al usuario hay que explicarle todo en palabras simples (hace mucho que no
   opera futuros) y hacerle las preguntas con opciones (AskUserQuestion).
 

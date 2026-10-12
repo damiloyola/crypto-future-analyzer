@@ -303,8 +303,17 @@ class ScoringConfig(_Strict):
 
 class TakeProfitConfig(_Strict):
     tp1: Literal["next_level"] = "next_level"
-    tp2_r: float = 1.5
-    tp3_r: float = 2.5
+    tp1_min_distance_atr: float = Field(1.0, ge=0)
+    tp2_r: float = Field(1.5, gt=0)
+    tp3_r: float = Field(2.5, gt=0)
+    tp2_ensure_min_rr: bool = True
+    block_if_tp2_beyond_daily_range: bool = True
+
+    @model_validator(mode="after")
+    def _ordered(self) -> TakeProfitConfig:
+        if self.tp3_r <= self.tp2_r:
+            raise ValueError("trade_plan.take_profit: tp3_r tiene que ser mayor que tp2_r")
+        return self
 
 
 class PlanLiquidationConfig(_Strict):
