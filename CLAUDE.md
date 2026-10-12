@@ -56,6 +56,11 @@ El frontend solo muestra lo que devuelve la API; no calcula riesgo.
 - **Stop:** se saltean los soportes/resistencias a menos de 1 ATR(15m) de la
   entrada (`trade_plan.min_stop_distance_atr`, `risk.stops.structural_stop`).
 - **Noticias:** a las altcoins se les suman las de BTC; corte de 48 h.
+- **Apalancamiento por encima del tope del perfil (Hito 4):** ajustar solo.
+  Primero subir el margen hasta `margen × trade_plan.liquidation.max_margin_multiplier`
+  manteniendo el riesgo; si no alcanza, achicar la posición hasta el tope de
+  apalancamiento (el riesgo baja); si el riesgo queda debajo de
+  `min_operable_risk_usd`, "No operar". Mostrar cada ajuste con su motivo.
 - Al usuario hay que explicarle todo en palabras simples (hace mucho que no
   opera futuros) y hacerle las preguntas con opciones (AskUserQuestion).
 
