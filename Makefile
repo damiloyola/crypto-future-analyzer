@@ -48,8 +48,8 @@ lint: ## Lint del backend
 format: ## Formatea el backend
 	cd $(BACKEND) && .venv/bin/ruff format . && .venv/bin/ruff check --fix .
 
-cli: ## Imprime datos e indicadores de una moneda (Hito 2). Ej: make cli SYMBOL=ETH
-	cd $(BACKEND) && .venv/bin/python -m scripts.analyze_cli $(SYMBOL)
+cli: ## Datos e indicadores de una moneda (Hito 2). Ej: make cli SYMBOL=ETH ARGS="--offline"
+	cd $(BACKEND) && .venv/bin/python -m scripts.analyze_cli $(SYMBOL) $(ARGS)
 
 train-regime: ## Entrena los modelos de régimen (Hito 3)
 	cd $(BACKEND) && .venv/bin/python -m scripts.train_regime $(SYMBOL)

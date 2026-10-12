@@ -1,0 +1,23 @@
+[
+  {
+    "symbol": "AVAXUSDT",
+    "adjustedFundingRateCap": "0.02000000",
+    "adjustedFundingRateFloor": "-0.02000000",
+    "fundingIntervalHours": 4,
+    "disclaimer": false
+  },
+  {
+    "symbol": "1000PEPEUSDT",
+    "adjustedFundingRateCap": "0.03000000",
+    "adjustedFundingRateFloor": "-0.03000000",
+    "fundingIntervalHours": 4,
+    "disclaimer": false
+  },
+  {
+    "symbol": "TRUMPUSDT",
+    "adjustedFundingRateCap": "0.02000000",
+    "adjustedFundingRateFloor": "-0.02000000",
+    "fundingIntervalHours": 1,
+    "disclaimer": false
+  }
+]

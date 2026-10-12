@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Fixture sintético con el formato del feed de Cointelegraph (RSS 2.0).
+     "Ahora" del fixture: 2026-10-12T14:37:20Z. Algunas fechas vienen con
+     offset +0100 a propósito, para probar la conversión a UTC. -->
+<rss xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/" version="2.0">
+  <channel>
+    <title>Cointelegraph.com News</title>
+    <link>https://cointelegraph.com</link>
+    <description>Cointelegraph covers fintech, blockchain and Bitcoin bringing you the latest crypto news and analyses on the future of money.</description>
+    <atom:link href="https://cointelegraph.com/rss" rel="self" type="application/rss+xml"/>
+    <language>en</language>
+    <lastBuildDate>Mon, 12 Oct 2026 14:33:50 +0000</lastBuildDate>
+    <item>
+      <title><![CDATA[Bitcoin ETFs log $612M inflows as BTC eyes $110K]]></title>
+      <link>https://cointelegraph.com/news/bitcoin-etfs-log-612m-inflows-as-btc-eyes-110k</link>
+      <guid isPermaLink="false">https://cointelegraph.com/news/bitcoin-etfs-log-612m-inflows-as-btc-eyes-110k</guid>
+      <description><![CDATA[<p style="float:right; margin:0 0 10px 15px; width:240px;"><img src="https://images.cointelegraph.com/images/240_btc-etf.jpg"></p><p>US spot Bitcoin ETFs extended their inflow streak to five days, led by BlackRock's IBIT.</p>]]></description>
+      <pubDate>Mon, 12 Oct 2026 14:21:09 +0000</pubDate>
+      <category><![CDATA[Bitcoin]]></category>
+      <category><![CDATA[ETF]]></category>
+      <dc:creator><![CDATA[Cointelegraph by Helen Partz]]></dc:creator>
+      <media:content medium="image" type="image/jpeg" url="https://images.cointelegraph.com/images/1434_btc-etf.jpg"/>
+    </item>
+    <item>
+      <title><![CDATA[Ethereum developers set date for next hard fork]]></title>
+      <link>https://cointelegraph.com/news/ethereum-developers-set-date-for-next-hard-fork</link>
+      <guid isPermaLink="false">https://cointelegraph.com/news/ethereum-developers-set-date-for-next-hard-fork</guid>
+      <description><![CDATA[<p>Core developers agreed on a mainnet target after two successful testnet forks.</p>]]></description>
+      <pubDate>Mon, 12 Oct 2026 14:10:42 +0100</pubDate>
+      <category><![CDATA[Ethereum]]></category>
+      <dc:creator><![CDATA[Cointelegraph by Brayden Lindrea]]></dc:creator>
+    </item>
+    <item>
+      <title><![CDATA[SEC delays decision on spot AVAX ETF to December]]></title>
+      <link>https://cointelegraph.com/news/sec-delays-decision-spot-avax-etf-december</link>
+      <guid isPermaLink="false">https://cointelegraph.com/news/sec-delays-decision-spot-avax-etf-december</guid>
+      <description><![CDATA[<p>The regulator opened a new comment period on the proposed Avalanche fund.</p>]]></description>
+      <pubDate>Mon, 12 Oct 2026 12:58:30 +0000</pubDate>
+      <category><![CDATA[Regulation]]></category>
+      <dc:creator><![CDATA[Cointelegraph by Vince Quill]]></dc:creator>
+    </item>
+    <item>
+      <title><![CDATA[Solana memecoin launchpad volume hits new record]]></title>
+      <link>https://cointelegraph.com/news/solana-memecoin-launchpad-volume-record</link>
+      <guid isPermaLink="false">https://cointelegraph.com/news/solana-memecoin-launchpad-volume-record</guid>
+      <description><![CDATA[<p>Daily launches on SOL-based platforms topped 40,000 for the first time.</p>]]></description>
+      <pubDate>Mon, 12 Oct 2026 12:15:00 +0000</pubDate>
+      <category><![CDATA[Solana]]></category>
+      <dc:creator><![CDATA[Cointelegraph by Martin Young]]></dc:creator>
+    </item>
+    <item>
+      <title><![CDATA[Ripple CEO says XRP ETF approval is 'a matter of when']]></title>
+      <link>https://cointelegraph.com/news/ripple-ceo-xrp-etf-approval-matter-of-when</link>
+      <guid isPermaLink="false">https://cointelegraph.com/news/ripple-ceo-xrp-etf-approval-matter-of-when</guid>
+      <description><![CDATA[<p>Brad Garlinghouse spoke at a fintech conference in Singapore.</p>]]></description>
+      <pubDate>Mon, 12 Oct 2026 11:47:18 +0100</pubDate>
+      <category><![CDATA[XRP]]></category>
+      <dc:creator><![CDATA[Cointelegraph by Amaka Nwaokocha]]></dc:creator>
+    </item>
+    <item>
+      <title><![CDATA[US inflation cools in September, boosting rate-cut bets]]></title>
+      <link>https://cointelegraph.com/news/us-inflation-cools-september-rate-cut-bets</link>
+      <guid isPermaLink="false">https://cointelegraph.com/news/us-inflation-cools-september-rate-cut-bets</guid>
+      <description><![CDATA[<p>Headline CPI rose 0.2% month over month, below economists' forecasts.</p>]]></description>
+      <pubDate>Mon, 12 Oct 2026 10:05:55 +0000</pubDate>
+      <category><![CDATA[Economy]]></category>
+      <dc:creator><![CDATA[Cointelegraph by Ezra Reguerra]]></dc:creator>
+    </item>
+    <item>
+      <title><![CDATA[Methodology matters: How to secure your seed phrase]]></title>
+      <link>https://cointelegraph.com/explained/methodology-matters-how-to-secure-your-seed-phrase</link>
+      <guid isPermaLink="false">https://cointelegraph.com/explained/methodology-matters-how-to-secure-your-seed-phrase</guid>
+      <description><![CDATA[<p>A step-by-step guide to hardware backups and metal plates.</p>]]></description>
+      <pubDate>Mon, 12 Oct 2026 09:30:00 +0000</pubDate>
+      <category><![CDATA[Explained]]></category>
+      <dc:creator><![CDATA[Cointelegraph by Onkar Singh]]></dc:creator>
+    </item>
+    <item>
+      <title><![CDATA[Console makers face tariff headwinds ahead of holiday season]]></title>
+      <link>https://cointelegraph.com/news/console-makers-tariff-headwinds-holiday-season</link>
+      <guid isPermaLink="false">https://cointelegraph.com/news/console-makers-tariff-headwinds-holiday-season</guid>
+      <description><![CDATA[<p>Hardware prices could rise up to 15% under the new import duties.</p>]]></description>
+      <pubDate>Mon, 12 Oct 2026 08:12:40 +0000</pubDate>
+      <category><![CDATA[Business]]></category>
+      <dc:creator><![CDATA[Cointelegraph by Zoltan Vardai]]></dc:creator>
+    </item>
+    <item>
+      <title><![CDATA[Pirate-themed NFT game shuts down after two years]]></title>
+      <link>https://cointelegraph.com/news/pirate-themed-nft-game-shuts-down</link>
+      <guid isPermaLink="false">https://cointelegraph.com/news/pirate-themed-nft-game-shuts-down</guid>
+      <description><![CDATA[<p>The studio said it would refund players who bought items in the last 30 days.</p>]]></description>
+      <pubDate>Sun, 11 Oct 2026 19:44:03 +0000</pubDate>
+      <category><![CDATA[NFT]]></category>
+      <dc:creator><![CDATA[Cointelegraph by Savannah Fortis]]></dc:creator>
+    </item>
+  </channel>
+</rss>

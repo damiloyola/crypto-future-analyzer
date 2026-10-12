@@ -1,0 +1,278 @@
+{
+  "next": "https://cryptopanic.com/api/developer/v2/posts/?auth_token=REDACTED&page=2",
+  "previous": null,
+  "results": [
+    {
+      "id": 24811901,
+      "slug": "bitcoin-reclaims-$109k-as-spot-etfs-log-third",
+      "title": "Bitcoin reclaims $109K as spot ETFs log third straight day of inflows",
+      "description": null,
+      "published_at": "2026-10-12T14:15:20Z",
+      "created_at": "2026-10-12T14:16:01Z",
+      "kind": "news",
+      "source": {
+        "title": "CoinDesk",
+        "region": "en",
+        "domain": "coindesk.com",
+        "type": "feed"
+      },
+      "original_url": "https://coindesk.com/2026/10/12/bitcoin-reclaims-$109k-as-spot-etfs-log-third",
+      "url": "https://cryptopanic.com/news/24811901/bitcoin-reclaims-$109k-as-spot-etfs-log-third",
+      "image": null,
+      "instruments": [
+        {
+          "code": "BTC",
+          "title": "Bitcoin",
+          "slug": "bitcoin"
+        }
+      ],
+      "votes": {
+        "negative": 2,
+        "positive": 14,
+        "important": 5,
+        "liked": 11,
+        "disliked": 0,
+        "lol": 0,
+        "toxic": 0,
+        "saved": 0,
+        "comments": 3
+      },
+      "panic_score": null,
+      "panic_score_1h": null,
+      "author": null
+    },
+    {
+      "id": 24811877,
+      "slug": "solana-breakpoint-firedancer-client-goes-live-for-all",
+      "title": "Solana Breakpoint: Firedancer client goes live for all mainnet validators",
+      "description": null,
+      "published_at": "2026-10-12T13:49:20Z",
+      "created_at": "2026-10-12T13:50:01Z",
+      "kind": "news",
+      "source": {
+        "title": "The Block",
+        "region": "en",
+        "domain": "theblock.co",
+        "type": "feed"
+      },
+      "original_url": "https://theblock.co/2026/10/12/solana-breakpoint-firedancer-client-goes-live-for-all",
+      "url": "https://cryptopanic.com/news/24811877/solana-breakpoint-firedancer-client-goes-live-for-all",
+      "image": null,
+      "instruments": [
+        {
+          "code": "SOL",
+          "title": "Solana",
+          "slug": "solana"
+        }
+      ],
+      "votes": {
+        "negative": 3,
+        "positive": 21,
+        "important": 9,
+        "liked": 17,
+        "disliked": 0,
+        "lol": 0,
+        "toxic": 0,
+        "saved": 4,
+        "comments": 0
+      },
+      "panic_score": null,
+      "panic_score_1h": null,
+      "author": null
+    },
+    {
+      "id": 24811840,
+      "slug": "fed-minutes-show-officials-split-on-december-rate",
+      "title": "Fed minutes show officials split on December rate cut",
+      "description": null,
+      "published_at": "2026-10-12T13:22:20Z",
+      "created_at": "2026-10-12T13:23:01Z",
+      "kind": "news",
+      "source": {
+        "title": "Reuters",
+        "region": "en",
+        "domain": "reuters.com",
+        "type": "feed"
+      },
+      "original_url": "https://reuters.com/2026/10/12/fed-minutes-show-officials-split-on-december-rate",
+      "url": "https://cryptopanic.com/news/24811840/fed-minutes-show-officials-split-on-december-rate",
+      "image": null,
+      "instruments": [],
+      "votes": {
+        "negative": 7,
+        "positive": 6,
+        "important": 12,
+        "liked": 0,
+        "disliked": 0,
+        "lol": 0,
+        "toxic": 0,
+        "saved": 0,
+        "comments": 5
+      },
+      "panic_score": null,
+      "panic_score_1h": null,
+      "author": null
+    },
+    {
+      "id": 24811802,
+      "slug": "ethereum-gas-fees-drop-to-multi-year-lows-after",
+      "title": "Ethereum gas fees drop to multi-year lows after Fusaka upgrade",
+      "description": null,
+      "published_at": "2026-10-12T12:34:20Z",
+      "created_at": "2026-10-12T12:35:01Z",
+      "kind": "news",
+      "source": {
+        "title": "Cointelegraph",
+        "region": "en",
+        "domain": "cointelegraph.com",
+        "type": "feed"
+      },
+      "original_url": "https://cointelegraph.com/2026/10/12/ethereum-gas-fees-drop-to-multi-year-lows-after",
+      "url": "https://cryptopanic.com/news/24811802/ethereum-gas-fees-drop-to-multi-year-lows-after",
+      "image": null,
+      "instruments": [
+        {
+          "code": "ETH",
+          "title": "Ethereum",
+          "slug": "ethereum"
+        }
+      ],
+      "votes": {
+        "negative": 1,
+        "positive": 9,
+        "important": 2,
+        "liked": 8,
+        "disliked": 0,
+        "lol": 0,
+        "toxic": 0,
+        "saved": 0,
+        "comments": 0
+      },
+      "panic_score": null,
+      "panic_score_1h": null,
+      "author": null
+    },
+    {
+      "id": 24811760,
+      "slug": "spot-solana-and-xrp-etfs-record-combined-usd",
+      "title": "Spot Solana and XRP ETFs record combined USD 180M weekly inflows",
+      "description": null,
+      "published_at": "2026-10-12T10:57:20Z",
+      "created_at": "2026-10-12T10:58:01Z",
+      "kind": "news",
+      "source": {
+        "title": "Decrypt",
+        "region": "en",
+        "domain": "decrypt.co",
+        "type": "feed"
+      },
+      "original_url": "https://decrypt.co/2026/10/12/spot-solana-and-xrp-etfs-record-combined-usd",
+      "url": "https://cryptopanic.com/news/24811760/spot-solana-and-xrp-etfs-record-combined-usd",
+      "image": null,
+      "instruments": [
+        {
+          "code": "SOL",
+          "title": "Solana",
+          "slug": "solana"
+        },
+        {
+          "code": "XRP",
+          "title": "XRP",
+          "slug": "xrp"
+        }
+      ],
+      "votes": {
+        "negative": 4,
+        "positive": 18,
+        "important": 7,
+        "liked": 14,
+        "disliked": 0,
+        "lol": 0,
+        "toxic": 0,
+        "saved": 0,
+        "comments": 2
+      },
+      "panic_score": null,
+      "panic_score_1h": null,
+      "author": null
+    },
+    {
+      "id": 24811733,
+      "slug": "analyst-bitcoin-funding-turns-negative-on-some-venues",
+      "title": "Analyst: Bitcoin funding turns negative on some venues, shorts crowding",
+      "description": null,
+      "published_at": "2026-10-12T09:27:20Z",
+      "created_at": "2026-10-12T09:28:01Z",
+      "kind": "media",
+      "source": {
+        "title": "YouTube",
+        "region": "en",
+        "domain": "youtube.com",
+        "type": "feed"
+      },
+      "original_url": "https://youtube.com/2026/10/12/analyst-bitcoin-funding-turns-negative-on-some-venues",
+      "url": "https://cryptopanic.com/news/24811733/analyst-bitcoin-funding-turns-negative-on-some-venues",
+      "image": null,
+      "instruments": [
+        {
+          "code": "BTC",
+          "title": "Bitcoin",
+          "slug": "bitcoin"
+        }
+      ],
+      "votes": {
+        "negative": 5,
+        "positive": 3,
+        "important": 0,
+        "liked": 0,
+        "disliked": 0,
+        "lol": 2,
+        "toxic": 1,
+        "saved": 0,
+        "comments": 0
+      },
+      "panic_score": null,
+      "panic_score_1h": null,
+      "author": null
+    },
+    {
+      "id": 24811690,
+      "slug": "avalanche-(avax)-gains-6%-as-subnet-activity-hits",
+      "title": "Avalanche (AVAX) gains 6% as subnet activity hits record",
+      "description": null,
+      "published_at": "2026-10-12T06:42:20Z",
+      "created_at": "2026-10-12T06:43:01Z",
+      "kind": "news",
+      "source": {
+        "title": "CryptoSlate",
+        "region": "en",
+        "domain": "cryptoslate.com",
+        "type": "feed"
+      },
+      "original_url": "https://cryptoslate.com/2026/10/12/avalanche-(avax)-gains-6%-as-subnet-activity-hits",
+      "url": "https://cryptopanic.com/news/24811690/avalanche-(avax)-gains-6%-as-subnet-activity-hits",
+      "image": null,
+      "instruments": [
+        {
+          "code": "AVAX",
+          "title": "Avalanche",
+          "slug": "avalanche"
+        }
+      ],
+      "votes": {
+        "negative": 2,
+        "positive": 7,
+        "important": 1,
+        "liked": 5,
+        "disliked": 0,
+        "lol": 0,
+        "toxic": 0,
+        "saved": 0,
+        "comments": 0
+      },
+      "panic_score": null,
+      "panic_score_1h": null,
+      "author": null
+    }
+  ]
+}

@@ -3,12 +3,20 @@
 Solo hace pedidos GET públicos (la fase 1 no usa endpoints privados) y traduce
 los errores a las excepciones de ``app.exchanges.base``:
 
-- sin conexión, timeout, HTTP 5xx, 451 (bloqueo por región), 403 y 429
-  (límite de pedidos) → ``ExchangeUnavailableError``: corresponde probar el
+- sin conexión, timeout, HTTP 5xx, 451 (bloqueo por región), 403, 418 (IP
+  baneada por Binance) y 429 (límite de pedidos), redirecciones infinitas o un
+  cuerpo mal comprimido → ``ExchangeUnavailableError``: corresponde probar el
   fallback o devolver el último valor cacheado;
 - otros 4xx o una respuesta que no es JSON → ``ExchangeError``.
 
-Reintenta con backoff exponencial solo los errores transitorios.
+Reintenta con backoff exponencial solo los errores transitorios (sin red,
+timeout, 5xx). 403/451 no se reintentan porque es un bloqueo por región, y
+418/429 tampoco: Binance pide esperar lo que dice ``Retry-After`` y alarga el
+baneo si se sigue pidiendo (el mensaje del error incluye esa espera).
+
+Funciones: ``make_client``, ``get_json`` (JSON decodificado), ``get_text``
+(cuerpo como texto) y ``get_bytes`` (cuerpo crudo, para que un parser respete
+el encoding que declara el documento, como los feeds RSS).
 """
 
 from __future__ import annotations
@@ -21,7 +29,10 @@ import httpx
 from app.exchanges.base import ExchangeError, ExchangeUnavailableError
 
 USER_AGENT = "crypto-future-analyzer/0.1 (+uso personal, solo lectura)"
-UNAVAILABLE_STATUS = {403, 418, 429, 451}
+UNAVAILABLE_STATUS = frozenset({403, 418, 429, 451})
+# De esos, ninguno se reintenta enseguida: 403/451 son bloqueo por región y
+# 418/429 son límite de pedidos (reintentar alarga el baneo).
+NO_RETRY_STATUS = frozenset({403, 418, 429, 451})
 
 
 def make_client(timeout_s: float = 10.0) -> httpx.AsyncClient:
@@ -70,6 +81,29 @@ async def get_text(
     return resp.text
 
 
+async def get_bytes(
+    client: httpx.AsyncClient,
+    url: str,
+    params: dict[str, Any] | None = None,
+    *,
+    source: str,
+    retries: int = 2,
+    backoff_s: float = 0.5,
+    headers: dict[str, str] | None = None,
+) -> bytes:
+    """GET que devuelve el cuerpo crudo (ya descomprimido), sin decodificar el texto."""
+    resp = await _get(
+        client, url, params, source=source, retries=retries, backoff_s=backoff_s, headers=headers
+    )
+    return resp.content
+
+
+def _retry_after(resp: httpx.Response) -> str:
+    """`` (pide esperar 60 s)`` si la respuesta trae ``Retry-After`` en segundos."""
+    value = resp.headers.get("Retry-After", "").strip()
+    return f" (pide esperar {value} s)" if value.isdigit() else ""
+
+
 async def _get(
     client: httpx.AsyncClient,
     url: str,
@@ -89,12 +123,19 @@ async def _get(
         except httpx.TransportError as exc:  # sin red, DNS, timeout, conexión cortada
             last_exc = ExchangeUnavailableError(f"{source}: sin respuesta ({type(exc).__name__})")
             continue
+        except httpx.RequestError as exc:  # redirecciones infinitas, cuerpo mal comprimido
+            # Reintentar no lo arregla: se pasa al respaldo (o a la caché) enseguida.
+            raise ExchangeUnavailableError(
+                f"{source}: respuesta inválida ({type(exc).__name__})"
+            ) from exc
         status = resp.status_code
         if status < 400:
             return resp
         if status >= 500 or status in UNAVAILABLE_STATUS:
-            last_exc = ExchangeUnavailableError(f"{source}: HTTP {status} en {url}")
-            if status in (403, 451):  # bloqueo por región: reintentar no sirve
+            last_exc = ExchangeUnavailableError(
+                f"{source}: HTTP {status} en {url}{_retry_after(resp)}"
+            )
+            if status in NO_RETRY_STATUS:
                 break
             continue
         raise ExchangeError(f"{source}: HTTP {status} en {url}: {resp.text[:200]}")
