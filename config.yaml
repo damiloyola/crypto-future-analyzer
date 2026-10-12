@@ -248,6 +248,12 @@ trade_plan:
     tp3_r: 2.5
   flag_tp_beyond_daily_range: true  # TP más lejos que el ATR diario = "poco probable intradía"
   time_stop_hours: 24
+  # true = el riesgo por operación (ej. 50 USD) ya incluye las comisiones de
+  # entrada y salida: si toca el stop perdés 50 en total. El tamaño de la
+  # posición se achica un poco para que entren.
+  # false = fórmula pura (riesgo / distancia al stop) y las comisiones se suman
+  # aparte: si toca el stop perdés 50 + comisiones.
+  fees_included_in_risk: true
   liquidation:
     min_distance_ratio: 2.0       # distancia a liquidación >= 2 × distancia al stop
     # Cuando no se cumple, la app prueba subir el margen manteniendo el riesgo

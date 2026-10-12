@@ -274,6 +274,7 @@ class TradePlanConfig(_Strict):
     take_profit: TakeProfitConfig
     flag_tp_beyond_daily_range: bool = True
     time_stop_hours: float = 24
+    fees_included_in_risk: bool = True
     liquidation: PlanLiquidationConfig
 
 
