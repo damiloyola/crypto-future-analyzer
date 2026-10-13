@@ -2,7 +2,8 @@
 
 - ``db``: conexión, creación de tablas y versión del esquema.
 - ``models``: las tablas (operaciones cerradas, posiciones abiertas,
-  movimientos de la billetera e historial de análisis).
+  movimientos de la billetera, eventos de alta volatilidad e historial de
+  análisis).
 - ``repository``: ``Repository``, la única puerta a la base para el resto de
   la app. Valida lo que entra y devuelve dataclasses inmutables con
   ``to_dict()``.
@@ -20,6 +21,7 @@ from app.storage.repository import (
     StoredAnalysis,
     StoredPosition,
     StoredTrade,
+    StoredVolatilityEvent,
     StoredWalletEvent,
 )
 
@@ -28,6 +30,7 @@ __all__ = [
     "StoredAnalysis",
     "StoredPosition",
     "StoredTrade",
+    "StoredVolatilityEvent",
     "StoredWalletEvent",
     "default_db_path",
     "init_db",

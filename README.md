@@ -39,7 +39,7 @@ celular en la misma red wifi.
 | 2 | Datos e indicadores + script de consola ([fuentes](docs/data-sources.md)) | ✅ (falta correrlo en vivo en la Mac) |
 | 3 | Detector de régimen (HMM) + `make train-regime` | ✅ (falta entrenarlo con datos reales en la Mac) |
 | 4 | Score, plan de riesgo, ajustes por régimen y perfiles | ✅ (se ve en la consola; falta probarlo con datos reales en la Mac) |
-| 5 | Circuit breakers y correlación | ⏳ |
+| 5 | Circuit breakers, correlación y carga a mano del estado (`make trade`, `make safety`) | ✅ (se ve en la consola; falta probarlo con tus operaciones reales en la Mac) |
 | 6 | API FastAPI | ⏳ |
 | 7 | Dashboard: régimen, KPIs y gráfico principal | ⏳ |
 | 8 | Integración del LLM | ⏳ |
@@ -159,8 +159,8 @@ que va a usar la app (`risk.plan.build_trade_plan`). Nunca opera: solo calcula.
 make cli SYMBOL=BTC                                         # plan con el perfil por omisión (agresivo)
 make cli SYMBOL=SOL ARGS="--nexo-price 187,45"              # niveles sobre el precio que ves en Nexo
 make cli SYMBOL=ETH ARGS="--max-leverage 30"                # tope a mano, de 1x a 50x (más de 25x: advertencia roja)
-make cli SYMBOL=BTC ARGS='--high-vol-event "Dato de CPI"'   # evento de alta volatilidad: No operar
-make cli SYMBOL=BTC ARGS="--trades-today 2 --pnl-today -30" # cómo te fue hoy (el riesgo baja a lo que queda del límite)
+make cli SYMBOL=BTC ARGS='--high-vol-event "Dato de CPI"'   # evento solo para esta corrida: No operar
+make cli SYMBOL=BTC ARGS="--trades-today 2 --pnl-today -30" # números del día a mano, para probar (ver Hito 5)
 make cli SYMBOL=BTC ARGS="--json"                           # el plan va en "plan" y el score en "score"
 ```
 
@@ -209,6 +209,86 @@ Cómo se arma, en pocas palabras (todos los números están en `config.yaml`):
   el stop, cerrá (la hora se muestra en tu zona horaria). También estima el
   funding de esas 24 h (aparte del riesgo).
 
+### Frenos y carga de operaciones (Hito 5)
+
+En la fase 1 la app no ve tu cuenta: **vos le contás** cómo te va. Con eso, una
+capa de seguridad con **poder de veto** (independiente del score, del régimen y
+de la IA) mira tu día, tu semana y tu mes antes de cada plan, y puede achicar el
+riesgo o bloquear todo.
+
+```bash
+make trade ARGS="add --symbol BTC --side long --pnl -32,5"       # una operación cerrada (resultado neto, comisiones incluidas)
+make trade ARGS='add --symbol ETH --side short --pnl 18 --opened "ayer 22:00" --closed "ayer 23:40"'
+make trade ARGS="open --symbol SOL --side long --risk 40"         # una posición que dejaste abierta
+make trade ARGS="close 1 --pnl -12"                               # la cerrás y queda como operación
+make trade ARGS="balance --amount 300"                            # el saldo que ves en la billetera de futuros
+make trade ARGS="deposit --amount 100"                            # también withdraw --amount 50
+make trade ARGS='event --note "Dato de CPI" --until "mañana 11:00"'  # evento de alta volatilidad
+make trade ARGS="delete trade 3"                                  # borrar algo cargado por error (pregunta antes)
+make trades                                                       # lista lo cargado
+make safety                                                       # cómo están los frenos
+```
+
+- **Fechas y horas** en tu zona (`app.user_timezone`): `"2026-10-13 14:30"`,
+  `"13/10 14:30"`, `"14:30"` (hoy), `"ayer 22:00"`, `"mañana 11:00"`. Montos con
+  coma o punto (`-32,5`). Sin `--closed` es ahora; sin `--opened`, la misma hora
+  del cierre.
+- **Análisis ligado**: cada vez que analizás (`make cli`, con datos reales) el
+  análisis se guarda con un número. Al cargar la operación, la app le adjunta
+  sola el último análisis de esa moneda de las 24 h antes de abrir (régimen,
+  score y plan del momento, para el informe si algo sale mal); `--analysis 7`
+  elige uno y `--analysis none`, ninguno.
+- Después de cargar algo muestra en una línea cómo quedaron los frenos.
+
+Los frenos (todos los números en `config.yaml`, `circuit_breakers`, y en tu perfil):
+
+| Freno | Cuándo salta | Qué hace |
+|---|---|---|
+| Pérdida del día | perdiste el 50 % de tu límite diario (50 de 100 USD) | riesgo × 0,5 hasta que termine el día |
+| Límite del día | perdiste el 100 % del límite diario | no hay planes hasta mañana |
+| Pérdidas seguidas | 3 operaciones perdidas seguidas | pausa de 4 h; después la cuenta arranca de cero |
+| Pérdida de la semana | perdiste el 60 % de la billetera mensual (180 de 300 USD) | riesgo × 0,5 hasta el lunes |
+| Caída del mes | la billetera cayó 70 % desde su máximo del mes | **bloqueo total** (ver abajo) |
+| Evento de alta volatilidad | hay un evento cargado activo | no hay planes hasta su hora de fin |
+
+- La pérdida del día y de la semana es el **neto** de lo que cerraste en ese
+  período (ganancias menos pérdidas); el día y la semana (desde el lunes) son
+  los de tu zona horaria, y el mes es el mes calendario (los depósitos suben el
+  máximo y los retiros lo bajan en lo mismo: sacar plata no es perder).
+- Si nunca anotaste el saldo, la app supone que empezaste el mes con la
+  billetera mensual del perfil (300 USD) y te avisa: anotalo con `balance`.
+- Los multiplicadores se suman a los del régimen (día × semana = × 0,25) y van
+  antes del tope por lo que queda del límite del día; si el riesgo queda debajo
+  del mínimo operable, No operar. Cada ajuste se muestra con su motivo.
+- **Bloqueo total**: la app escribe un informe del incidente en
+  `data/incidents/` (qué operaciones, en qué régimen, qué decía el score y qué
+  falló) y el archivo `data/LOCKED`. Mientras exista, la consola muestra un
+  cartel rojo y **no arma ningún plan** (el resto del análisis sale igual).
+  Para seguir: leé el informe y borrá `data/LOCKED` a mano. La app no lo borra
+  nunca. Cargar operaciones no lo escribe (así podés terminar de cargar, por
+  ejemplo, un depósito que faltaba); lo escriben `make safety` y el análisis.
+- **Correlación**: la consola muestra la matriz de correlación de los
+  retornos de 1 h de los últimos 30 días entre la moneda, tus favoritas y las de
+  tus posiciones abiertas (`*` = 0,8 o más: se mueven casi igual). Si tenés una
+  posición abierta y el plan nuevo va en la **misma dirección** en una moneda
+  muy correlacionada (o la misma), es casi la misma apuesta: entre todas no
+  pueden arriesgar más de 1,5 × tu riesgo por operación (75 USD en el agresivo).
+  El plan nuevo se achica a lo que entra; si queda debajo del mínimo operable,
+  No operar. Una posición en la misma moneda pero al revés es cobertura: no
+  suma riesgo, pero el plan avisa que pueden saltar los dos stops.
+- Con el saldo anotado, el margen de un plan nunca pasa de ese saldo y la
+  liquidación "modelo Nexo" usa ese saldo.
+- `--trades-today` y `--pnl-today` siguen existiendo para probar: el plan usa
+  esos números y lo avisa; los frenos siguen mirando lo cargado.
+- `make cli ARGS="--offline"` usa otra base de prueba (al lado de los modelos
+  sintéticos, con su propio LOCKED): las pruebas nunca tocan tu estado real.
+  `make trade ARGS="... --offline"` carga en esa base. `--db RUTA` (en las dos
+  consolas) usa otra base, con el LOCKED y los informes en su misma carpeta.
+- En JSON (`make cli ARGS="--json"`), los frenos van en `"safety"` (cada freno
+  con umbral, valor actual y progreso, para el panel de riesgo del Hito 9) y la
+  matriz con la exposición en `"correlation"`; si la app está bloqueada,
+  `"plan": null` y `"locked": true`.
+
 ## Configuración
 
 - **`config.yaml`**: todas las reglas, umbrales y pesos (perfiles de riesgo,
@@ -236,7 +316,7 @@ Cómo se arma, en pocas palabras (todos los números están en `config.yaml`):
 │   │   ├── storage/       # SQLite
 │   │   ├── services/      # orquesta un análisis completo
 │   │   └── api/           # endpoints (sin lógica de negocio)
-│   ├── scripts/           # CLI, entrenamiento del régimen, walk-forward
+│   ├── scripts/           # CLI, carga del estado (trades), entrenamiento del régimen, walk-forward
 │   └── tests/
 ├── frontend/              # React + Vite + TypeScript + Tailwind
 │   └── src/ (components, charts, hooks, pages, lib)

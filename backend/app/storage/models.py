@@ -10,6 +10,9 @@ correlación, Hito 5) y el historial de análisis:
   stop (para sumar riesgo entre monedas correlacionadas).
 - ``WalletEvent``: movimientos de la billetera de futuros: depósito, retiro o
   "saldo" (el usuario anota el saldo que ve en ese momento).
+- ``HighVolatilityEvent``: evento de alta volatilidad marcado a mano (Fed, CPI,
+  etc.) con su nota y hora de fin; mientras dura, la capa de seguridad bloquea
+  todos los planes (esquema 2).
 - ``AnalysisRecord``: cada análisis generado, con el plan, el score, el
   veredicto de seguridad, la lectura del LLM y los datos de entrada en JSON.
 
@@ -140,6 +143,24 @@ class WalletEvent(SQLModel, table=True):
     notes: str | None = Field(default=None, sa_type=Text)
 
 
+class HighVolatilityEvent(SQLModel, table=True):
+    """Evento de alta volatilidad marcado a mano (esquema 2).
+
+    Bloquea todos los planes desde ``starts_at`` hasta ``until`` (intervalo
+    semiabierto: a la hora de fin ya no bloquea) y después se apaga solo, sin
+    que haya que borrarlo. ``note`` dice qué evento es ("Dato de inflación de
+    EE.UU."); es obligatoria para que el aviso explique por qué no hay plan.
+    """
+
+    __tablename__ = "high_volatility_events"
+
+    id: int | None = Field(default=None, primary_key=True)
+    created_at: datetime = Field(default_factory=utc_now, sa_type=UTCDateTime)
+    starts_at: datetime = Field(sa_type=UTCDateTime, index=True)
+    until: datetime = Field(sa_type=UTCDateTime, index=True)
+    note: str = Field(sa_type=Text)
+
+
 # --- historial de análisis -------------------------------------------------------
 
 
@@ -183,6 +204,7 @@ class AnalysisRecord(SQLModel, table=True):
 
 __all__ = [
     "AnalysisRecord",
+    "HighVolatilityEvent",
     "ManualTrade",
     "OpenPosition",
     "UTCDateTime",

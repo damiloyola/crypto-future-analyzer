@@ -25,20 +25,31 @@ Opciones:
   ``risk_profiles.leverage_red_warning_above`` muestra una advertencia roja; por
   encima de ``risk_profiles.leverage_hard_cap`` se rechaza (código 2).
 - ``--high-vol-event ["CPI de EE. UU."]``: marca un evento de alta volatilidad
-  (la descripción es opcional; poné la moneda antes): el plan da "No operar".
-- ``--trades-today 2`` y ``--pnl-today -30``: operaciones y resultado (USD) de
-  hoy, para el límite diario del perfil (hasta el Hito 5 no se llevan solos).
-  El riesgo se achica a lo que queda del límite de pérdida del día (con su
-  motivo en "Ajustes"; ``trade_plan.cap_risk_to_daily_remaining``) y, si eso
-  queda debajo del mínimo operable, "No operar". Si se pasan, el plan muestra
-  cómo va el día; el JSON los trae en ``plan.day_state``.
+  solo para esta corrida (la descripción es opcional; poné la moneda antes): el
+  plan da "No operar". Para guardarlo con hora de fin: ``scripts.trades event``.
+- Estado de trading (Hito 5): las operaciones y el resultado de hoy salen de lo
+  cargado con ``scripts.trades`` (``make trade``) en la base de
+  ``app.database_file``. ``--trades-today 2`` y ``--pnl-today -30`` los pisan
+  para probar: el plan usa esos números y lo avisa (los frenos siguen mirando
+  lo cargado). El riesgo se achica a lo que queda del límite de pérdida del
+  día (``trade_plan.cap_risk_to_daily_remaining``) y, si eso queda debajo del
+  mínimo operable, "No operar"; el JSON trae el día en ``plan.day_state``.
+- ``--db RUTA``: otra base de estado de trading; el archivo LOCKED y los
+  informes del incidente van en su misma carpeta. En ``--offline`` (sin
+  ``--db``) se usa una base de prueba al lado de los modelos sintéticos
+  (``regime.synthetic_models_dir``), con su propio LOCKED: las corridas con
+  datos sintéticos nunca tocan el estado real. El análisis se guarda en la base
+  (para ligarlo después a una operación) salvo en ``--offline`` sin ``--db``.
 - ``--offline``: datos sintéticos, sin red (``data.synthetic``). Muestra un
   cartel grande porque los números no son reales. ``--seed`` y ``--now``
   permiten repetir exactamente la misma corrida.
 - ``--json``: el mismo contenido en JSON (claves en inglés, números sin
   formatear, ``null`` donde falta un dato). El régimen va en ``"regime"``
   (``null`` con ``--no-regime``), sin el historial vela por vela; el score en
-  ``"score"`` y el plan en ``"plan"`` (``TradePlan.to_dict``).
+  ``"score"``, el plan en ``"plan"`` (``TradePlan.to_dict``), los frenos en
+  ``"safety"`` (veredicto, estado de trading, bloqueo y rutas), la matriz y
+  la exposición en ``"correlation"`` y el número del análisis guardado en
+  ``"analysis_id"``.
 - ``--no-regime``: no calcula el régimen de mercado (más rápido). El plan lo
   toma como "régimen no disponible" (riesgo × el multiplicador de confianza
   baja).
@@ -50,6 +61,15 @@ con colores ANSI solo si la salida es una terminal):
 1. encabezado: moneda, hora (``app.user_timezone``), perfil, fuentes de datos
    con su hora de actualización y avisos (respaldo, desactualizado,
    sintético, precio de Nexo);
+1b. frenos de seguridad (Hito 5, ``safety.breakers``): estado general (verde,
+   ámbar o rojo) con el motivo, una tabla con cada freno (valor actual contra
+   el umbral, barra de progreso y si está activo), el resultado del día y de
+   la semana, la billetera del mes (saldo, máximo y caída), las posiciones
+   abiertas, los eventos de alta volatilidad y los avisos. Si la caída del mes
+   llegó al tope escribe el informe del incidente y el archivo LOCKED (una sola
+   vez). Con el LOCKED, un cartel rojo con el motivo, la fecha, el informe y
+   "revisá el informe y borrá el archivo a mano", y **no se arma el plan**
+   (``"plan": null`` y ``"locked": true`` en el JSON; el resto sale igual);
 2. precios: referencia (Binance, o Bybit si Binance falló; "no disponible"
    si no hubo ticker), Nexo (manual o "no disponible: se usa ..." con la fuente
    real del precio usado), diferencia y cambio 24 h;
@@ -73,6 +93,10 @@ con colores ANSI solo si la salida es una terminal):
 8. score de confluencia (``app.scoring``): total, pista de dirección, una
    barra de -100 a +100 con los umbrales, y los puntos de cada componente con
    su peso y el porqué;
+8b. correlación (``safety.correlation``): la matriz de los retornos de 1h de
+   los últimos 30 días entre la moneda, las favoritas y las monedas de las
+   posiciones abiertas (2 decimales, ``*`` en los pares muy correlacionados) y
+   el riesgo sumado con las posiciones abiertas para la dirección del plan;
 9. plan de operación (``app.risk.plan.build_trade_plan``, el mismo que va a
    usar la app): cartel grande LONG / SHORT / NO OPERAR, una oración que lo
    resume, la tabla de niveles (entrada a mercado y alternativa con orden
@@ -89,7 +113,9 @@ con colores ANSI solo si la salida es una terminal):
    muestran como "referencia, no operar".
 
 Sale con código 1 y un mensaje claro si no se pueden conseguir los datos
-esenciales (por ejemplo, Binance y Bybit caídos, o un símbolo que no existe),
+esenciales (por ejemplo, Binance y Bybit caídos, o un símbolo que no existe) o
+si no se puede leer el estado de trading (sin eso no se sabe si un freno está
+activo, así que no se arma ningún plan),
 con 2 si los argumentos o la configuración no son válidos (incluido un YAML mal
 escrito) y con 130 si se cancela con Ctrl+C (sale enseguida, también durante el
 entrenamiento del régimen, que no se guarda). Siempre cierra el cliente HTTP.
@@ -102,6 +128,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import logging
 import math
@@ -117,8 +144,9 @@ from typing import Any, TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
+from sqlalchemy.exc import SQLAlchemyError
 
-from app.config import DEFAULT_CONFIG_PATH, AppSettings, get_secrets, load_settings
+from app.config import DEFAULT_CONFIG_PATH, REPO_ROOT, AppSettings, get_secrets, load_settings
 from app.data.cache import TTLCache
 from app.data.snapshot import (
     EssentialDataError,
@@ -140,17 +168,42 @@ from app.regime.service import (
     regime_history_days,
     regimes_to_dict,
 )
-from app.risk.plan import build_trade_plan, plan_inputs_from_analysis
+from app.risk.plan import (
+    OVERRIDE_PNL_TODAY,
+    OVERRIDE_TRADES_TODAY,
+    DayOverride,
+    build_trade_plan,
+    plan_inputs_from_analysis,
+)
 from app.risk.position import MIN_EXCHANGE_LEVERAGE
 from app.risk.profiles import EffectiveProfile, get_profile
 from app.risk.rules import fmt_leverage
 from app.risk.rules import price_decimals as _plan_price_decimals
 from app.risk.sizing import fraction_to_pct
+from app.safety.breakers import (
+    LockTriggerResult,
+    SafetyVerdict,
+    evaluate_breakers,
+    trigger_lock_if_needed,
+)
+from app.safety.correlation import (
+    CorrelationMatrix,
+    Exposure,
+    combined_risk_limit,
+    correlated_exposure,
+    fetch_correlation_matrix,
+)
+from app.safety.incident import timezone_label
+from app.safety.state import TradingState, load_trading_state
 from app.scoring import compute_score, inputs_from_analysis
+from app.storage import Repository
 
 OFFLINE_BANNER = "DATOS SINTÉTICOS (sin red): los números no son reales"
 SCORE_TITLE = "Score de confluencia"
 PLAN_TITLE = "Plan de operación"
+SAFETY_TITLE = "Frenos de seguridad"
+CORRELATION_TITLE = "Correlación"
+LOCKED_TITLE = "APP BLOQUEADA: no se arma ningún plan"
 REGIME_TITLE = "Régimen de mercado"
 REGIME_UNAVAILABLE = "Régimen no disponible"
 DASH = "—"
@@ -432,6 +485,226 @@ def _summary_dict(s: TimeframeSummary) -> dict[str, Any]:
     }
 
 
+# --- estado de trading, frenos y correlación (Hito 5) ------------------------------
+
+#: Nombre de la base de prueba del modo ``--offline`` (al lado de los modelos sintéticos).
+OFFLINE_DB_NAME = "analyzer.db"
+STATE_REAL = "real"
+STATE_OFFLINE = "offline"
+STATE_CUSTOM = "custom"
+
+
+@dataclass(frozen=True)
+class StatePaths:
+    """Dónde viven la base del estado de trading, el archivo LOCKED y los informes.
+
+    - ``kind="real"``: los de ``config.yaml`` (``app.database_file``,
+      ``app.lock_file`` y ``app.incident_dir``).
+    - ``kind="offline"``: una base de prueba en ``regime.synthetic_models_dir``,
+      con su propio LOCKED y su carpeta de informes al lado: las corridas con
+      datos sintéticos nunca tocan el estado real.
+    - ``kind="custom"``: la base de ``--db``, con el LOCKED y los informes en
+      la misma carpeta que esa base.
+    """
+
+    database: Path
+    lock_file: Path
+    incident_dir: Path
+    kind: str = STATE_REAL
+
+    @property
+    def is_real(self) -> bool:
+        return self.kind == STATE_REAL
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "database": str(self.database),
+            "lock_file": str(self.lock_file),
+            "incident_dir": str(self.incident_dir),
+        }
+
+
+def resolve_state_paths(
+    settings: AppSettings, *, offline: bool = False, db: Path | str | None = None
+) -> StatePaths:
+    """Las rutas del estado de trading (ver ``StatePaths``)."""
+    lock_name = Path(settings.app.lock_file).name
+    incidents_name = Path(settings.app.incident_dir).name
+    if db is not None:
+        path = Path(db).expanduser().resolve()
+        return StatePaths(path, path.parent / lock_name, path.parent / incidents_name, STATE_CUSTOM)
+    if offline:
+        folder = settings.resolve_path(settings.regime.synthetic_models_dir)
+        return StatePaths(
+            folder / OFFLINE_DB_NAME, folder / lock_name, folder / incidents_name, STATE_OFFLINE
+        )
+    return StatePaths(
+        settings.resolve_path(settings.app.database_file),
+        settings.resolve_path(settings.app.lock_file),
+        settings.resolve_path(settings.app.incident_dir),
+        STATE_REAL,
+    )
+
+
+def display_path(path: Path | str) -> str:
+    """La ruta relativa a la raíz del repo si está adentro (``data/LOCKED``); si no, entera."""
+    p = Path(path)
+    try:
+        return str(p.resolve().relative_to(REPO_ROOT))
+    except ValueError:
+        return str(p)
+
+
+@dataclass(frozen=True)
+class SafetyContext:
+    """Estado de trading, veredicto de los frenos y, si hubo, qué hizo el bloqueo total."""
+
+    paths: StatePaths
+    state: TradingState
+    verdict: SafetyVerdict
+    lock_result: LockTriggerResult | None = None
+
+
+def evaluate_safety(
+    repo: Repository,
+    settings: AppSettings,
+    profile: Any,
+    now: datetime,
+    paths: StatePaths,
+    *,
+    trigger_lock: bool = True,
+) -> SafetyContext:
+    """Lee el estado, evalúa los frenos y, si la caída del mes lo pide, bloquea la app.
+
+    Con ``trigger_lock`` escribe el informe del incidente y el archivo LOCKED
+    (una sola vez, ``safety.breakers.trigger_lock_if_needed``) y vuelve a
+    evaluar para que el veredicto ya lo muestre.
+    """
+    state = load_trading_state(repo, settings, profile, now)
+    verdict = evaluate_breakers(state, profile, settings, now, lock_path=paths.lock_file)
+    lock_result: LockTriggerResult | None = None
+    if trigger_lock and verdict.needs_lock:
+        lock_result = trigger_lock_if_needed(
+            verdict,
+            state,
+            settings,
+            now,
+            repo=repo,
+            lock_path=paths.lock_file,
+            incident_dir=paths.incident_dir,
+        )
+        verdict = evaluate_breakers(state, profile, settings, now, lock_path=paths.lock_file)
+    return SafetyContext(paths=paths, state=state, verdict=verdict, lock_result=lock_result)
+
+
+def safety_to_dict(ctx: SafetyContext, overrides: Sequence[DayOverride] = ()) -> dict[str, Any]:
+    """El bloque ``"safety"`` del reporte (y del panel de riesgo del Hito 9)."""
+    v = ctx.verdict
+    tz = ctx.state.timezone
+    return _clean(
+        {
+            "status": v.status,
+            "headline": v.headline,
+            "blocked": v.blocked,
+            "locked": v.locked,
+            "risk_multiplier": v.risk_multiplier,
+            "verdict": v.to_dict(),
+            "state": ctx.state.to_dict(),
+            "lock_trigger": None if ctx.lock_result is None else ctx.lock_result.to_dict(tz=tz),
+            "paths": {
+                **ctx.paths.to_dict(),
+                "database_display": display_path(ctx.paths.database),
+                "lock_file_display": display_path(ctx.paths.lock_file),
+            },
+            "day_state_source": "manual" if overrides else "state",
+            "day_overrides": [o.to_dict() for o in overrides],
+        }
+    )
+
+
+@dataclass(frozen=True)
+class CorrelationContext:
+    """La matriz de correlación (o por qué no está) y de qué monedas se pidió."""
+
+    symbols: tuple[str, ...]
+    matrix: CorrelationMatrix | None
+    error: str | None = None
+
+
+def correlation_symbols(symbol: str, settings: AppSettings, extra: Sequence[str] = ()) -> list[str]:
+    """La moneda analizada, las favoritas y las de las posiciones abiertas, sin repetir."""
+    out: list[str] = []
+    for s in [symbol, *settings.symbols.favorites, *extra]:
+        sym = str(s).strip().upper()
+        if sym and sym not in out:
+            out.append(sym)
+    return out
+
+
+async def _correlation_context(
+    symbols: Sequence[str], market_data: Any, settings: AppSettings, now: datetime
+) -> CorrelationContext:
+    """Matriz de correlación; nunca lanza (un error queda como motivo)."""
+    try:
+        matrix = await fetch_correlation_matrix(
+            symbols,
+            market_data,
+            settings,
+            now=now,
+            min_overlap=settings.correlation.min_overlap_bars,
+        )
+    except Exception as exc:  # la correlación nunca tira abajo la consola
+        logging.getLogger(__name__).exception("Falló la matriz de correlación")
+        return CorrelationContext(
+            tuple(symbols), None, f"no se pudo calcular ({type(exc).__name__}: {exc})"
+        )
+    return CorrelationContext(tuple(symbols), matrix)
+
+
+def exposures_for(
+    symbol: str,
+    positions: Sequence[Any],
+    matrix: CorrelationMatrix | None,
+    settings: AppSettings,
+) -> dict[str, Exposure]:
+    """Exposición a las posiciones abiertas para un plan long y para uno short."""
+    threshold = settings.correlation.high_threshold
+    return {
+        side: correlated_exposure(symbol, side, positions, matrix, threshold)
+        for side in ("long", "short")
+    }
+
+
+def correlation_to_dict(
+    ctx: CorrelationContext,
+    exposures: dict[str, Exposure],
+    settings: AppSettings,
+    profile: EffectiveProfile,
+    plan_side: str | None,
+) -> dict[str, Any]:
+    """El bloque ``"correlation"`` del reporte."""
+    cfg = settings.correlation
+    return _clean(
+        {
+            "symbols": list(ctx.symbols),
+            "matrix": None if ctx.matrix is None else ctx.matrix.to_dict(),
+            "error": ctx.error,
+            "timeframe": cfg.timeframe,
+            "lookback_days": cfg.lookback_days,
+            "high_threshold": cfg.high_threshold,
+            "max_combined_risk_multiplier": cfg.max_combined_risk_multiplier,
+            "cap_new_risk_to_limit": cfg.cap_new_risk_to_limit,
+            "risk_per_trade_usd": profile.risk_per_trade_usd,
+            "limit_usd": combined_risk_limit(
+                profile.risk_per_trade_usd, cfg.max_combined_risk_multiplier
+            ),
+            "exposure": {side: e.to_dict() for side, e in exposures.items()},
+            "plan_side": plan_side,
+        }
+    )
+
+
 def build_report(
     snapshot: MarketSnapshot,
     analysis: MarketAnalysis,
@@ -440,10 +713,12 @@ def build_report(
     regime: dict[str, Any] | None = None,
     *,
     regime_report: RegimeReport | None = None,
-    trades_today: int = 0,
-    pnl_today_usd: float = 0.0,
+    trades_today: int | None = None,
+    pnl_today_usd: float | None = None,
     high_volatility_event: bool = False,
     event_description: str | None = None,
+    safety: SafetyContext | None = None,
+    correlation: CorrelationContext | None = None,
 ) -> dict[str, Any]:
     """Todo el contenido de la salida, en un dict serializable a JSON.
 
@@ -452,8 +727,17 @@ def build_report(
     - ``regime``: lo que devuelve ``regimes_to_dict`` (o ``None`` si no se calculó).
     - ``regime_report``: el ``RegimeReport`` de 1h que usa el plan (``None`` si
       no está disponible: el plan lo toma como confianza baja).
-    - ``trades_today``, ``pnl_today_usd``, ``high_volatility_event`` y
-      ``event_description``: estado del día para las reglas del plan.
+    - ``safety``: estado de trading y veredicto de los frenos (Hito 5). De ahí
+      salen las operaciones y el resultado de hoy para el plan; si la app está
+      bloqueada (archivo LOCKED), **no se arma el plan** (``"plan": null`` y
+      ``"locked": true``).
+    - ``trades_today`` / ``pnl_today_usd``: ``None`` = los del estado cargado
+      (0 sin estado). Si vienen con ``safety``, son números puestos a mano para
+      probar: el plan los usa y lo avisa.
+    - ``high_volatility_event`` y ``event_description``: evento marcado a mano
+      solo para esta corrida.
+    - ``correlation``: la matriz de correlación; con ``safety``, la exposición
+      a las posiciones abiertas entra al plan.
 
     El score (``"score"``) y el plan (``"plan"``) se calculan acá con
     ``scoring.compute_score`` y ``risk.plan.build_trade_plan``, con la hora de
@@ -461,19 +745,54 @@ def build_report(
     """
     eff = profile if isinstance(profile, EffectiveProfile) else get_profile(profile, settings)
     score = compute_score(inputs_from_analysis(analysis, snapshot, settings), settings)
-    plan_inputs = plan_inputs_from_analysis(
-        analysis,
-        snapshot,
-        score,
-        regime_report,
-        eff,
-        settings,
-        trades_today=trades_today,
-        pnl_today_usd=pnl_today_usd,
-        high_volatility_event=high_volatility_event,
-        event_description=event_description,
-    )
-    plan = build_trade_plan(plan_inputs, settings, now=snapshot.created_at)
+    overrides: list[DayOverride] = []
+    if safety is not None:
+        st = safety.state
+        day_trades = st.trades_today if trades_today is None else trades_today
+        day_pnl = st.plan_pnl_today_usd if pnl_today_usd is None else pnl_today_usd
+        if trades_today is not None:
+            overrides.append(DayOverride(OVERRIDE_TRADES_TODAY, trades_today, st.trades_today))
+        if pnl_today_usd is not None:
+            overrides.append(DayOverride(OVERRIDE_PNL_TODAY, pnl_today_usd, st.plan_pnl_today_usd))
+    else:
+        day_trades = trades_today or 0
+        day_pnl = pnl_today_usd or 0.0
+    exposures: dict[str, Exposure] = {}
+    if safety is not None:
+        exposures = exposures_for(
+            snapshot.symbol,
+            safety.state.open_positions,
+            None if correlation is None else correlation.matrix,
+            settings,
+        )
+    # Con el saldo de la billetera anotado a mano: el margen nunca pasa de ese
+    # saldo (trade_plan.liquidation) y la liquidación "modelo Nexo" usa ese saldo.
+    wallet_usd: float | None = None
+    if safety is not None and not safety.state.wallet.assumed:
+        balance = safety.state.wallet.current_balance_usd
+        wallet_usd = balance if balance > 0 else None
+    locked = safety is not None and safety.verdict.locked
+    plan = None
+    if not locked:
+        plan_inputs = plan_inputs_from_analysis(
+            analysis,
+            snapshot,
+            score,
+            regime_report,
+            eff,
+            settings,
+            trades_today=day_trades,
+            pnl_today_usd=day_pnl,
+            high_volatility_event=high_volatility_event,
+            event_description=event_description,
+            safety=None if safety is None else safety.verdict,
+            correlation=exposures or None,
+            day_overrides=tuple(overrides),
+            available_margin_usd=wallet_usd,
+        )
+        if wallet_usd is not None:
+            plan_inputs = dataclasses.replace(plan_inputs, wallet_equity_usd=wallet_usd)
+        plan = build_trade_plan(plan_inputs, settings, now=snapshot.created_at)
     ex = snapshot.execution_price
     ticker = snapshot.ticker
     reference = ticker.price if ticker else (ex.binance_price if ex else None)
@@ -608,7 +927,15 @@ def build_report(
             ],
         },
         "score": score.to_dict(),
-        "plan": plan.to_dict(),
+        "plan": None if plan is None else plan.to_dict(),
+        "locked": locked,
+        "safety": None if safety is None else safety_to_dict(safety, overrides),
+        "correlation": None
+        if correlation is None
+        else correlation_to_dict(
+            correlation, exposures, settings, eff, None if plan is None else plan.direction
+        ),
+        "analysis_id": None,
     }
     return _clean(report)
 
@@ -1414,18 +1741,29 @@ def _plan_position_rows(
     rows.append(("Pérdida máxima", Cell(loss_text, "bold")))
     mult = _finite(risk["risk_multiplier"])
     by_regime = mult is not None and abs(mult - 1.0) > 1e-12
+    safety_mult = _finite(risk.get("safety_multiplier"))
+    by_safety = safety_mult is not None and abs(safety_mult - 1.0) > 1e-12
     by_day = bool(risk.get("capped_by_daily_limit"))
-    if by_regime or by_day:
+    by_corr = bool(risk.get("capped_by_correlation"))
+    if by_regime or by_safety or by_day or by_corr:
         text = f"{fmt_usd(risk['requested_usd'])} del perfil"
         if by_regime:
             text += (
                 f" × {_multiplier_text(mult or 0.0)} = {fmt_usd(risk['after_regime_usd'])} "
                 "(ajustes por régimen)"
             )
-        if by_day:
+        if by_safety:
             text += (
-                f" → {fmt_usd(risk['after_adjustments_usd'])} (lo que te queda del límite de "
-                "pérdida del día)"
+                f" × {_multiplier_text(safety_mult or 0.0)} = "
+                f"{fmt_usd(risk.get('after_safety_usd'))} (frenos de seguridad)"
+            )
+        if by_day:
+            after_day = risk.get("after_daily_usd") if by_corr else risk["after_adjustments_usd"]
+            text += f" → {fmt_usd(after_day)} (lo que te queda del límite de pérdida del día)"
+        if by_corr:
+            text += (
+                f" → {fmt_usd(risk['after_adjustments_usd'])} (lo que entra en el tope con tus "
+                "posiciones correlacionadas)"
             )
         rows.append(("Riesgo pedido", text))
     if risk.get("reduced_by_position"):
@@ -1554,6 +1892,17 @@ def _render_alternative(alt: dict[str, Any], entry: Any, style: Style) -> list[s
 def _render_plan(r: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
     p = r.get("plan")
     lines = _section(PLAN_TITLE, style)
+    if not p and r.get("locked"):
+        lock_path = ((r.get("safety") or {}).get("paths") or {}).get("lock_file_display")
+        where = f" ({lock_path})" if lock_path else ""
+        return [
+            *lines,
+            style.paint(
+                f"  No hay plan: la app está bloqueada por el archivo LOCKED{where}. Mirá "
+                f"«{SAFETY_TITLE}» arriba: revisá el informe y borrá ese archivo a mano.",
+                "alert",
+            ),
+        ]
     if not p:
         return [*lines, "  No disponible."]
     status = p["status"]
@@ -1650,12 +1999,340 @@ def _render_plan(r: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
     return lines
 
 
+# --- frenos de seguridad y correlación (Hito 5) --------------------------------------
+
+_VERDICT_TEXT = {"verde": "VERDE", "ambar": "ÁMBAR", "rojo": "ROJO"}
+_VERDICT_COLOR = {"verde": "green", "ambar": "yellow", "rojo": "alert"}
+# Barra de progreso de los frenos: una celda cada 1/PROGRESS_CELLS (es dibujo, no regla).
+PROGRESS_CELLS = 8
+
+
+def progress_bar(progress: Any, cells: int = PROGRESS_CELLS) -> str:
+    """``0.6`` → ``"█████░░░  60 %"`` (recortado a 0-100 %)."""
+    v = _finite(progress)
+    v = 0.0 if v is None else max(0.0, min(1.0, v))
+    full = int(round(v * cells))
+    return f"{'█' * full}{'░' * (cells - full)} {round(v * 100):>3d} %"
+
+
+def _signed_usd(x: Any) -> str:
+    """``-30`` → ``"-30,00 USD"``; ``12`` → ``"+12,00 USD"``; ``0`` → ``"0,00 USD"``."""
+    v = _finite(x)
+    if v is None:
+        return DASH
+    if round(v, 2) == 0:
+        return fmt_usd(0.0)
+    return f"{fmt_num(v, 2, sign=True)} USD"
+
+
+def _breaker_amount(b: dict[str, Any]) -> str:
+    """Valor actual contra el umbral, corto: ``"60 USD de 50 USD"``, ``"1 de 3 seguidas"``."""
+    unit = b.get("unit")
+    if b.get("threshold") is None:
+        return printable(b.get("current_text") or DASH)
+    if unit == "pérdidas seguidas":
+        return f"{fmt_num(b.get('current'), 0)} de {fmt_num(b.get('threshold'), 0)} seguidas"
+    return f"{printable(b.get('current_text'))} de {printable(b.get('threshold_text'))}"
+
+
+def _breaker_state(b: dict[str, Any]) -> Cell:
+    if not b.get("triggered"):
+        return Cell("ok", "green")
+    kind = b.get("kind")
+    if kind == "reduce":
+        return Cell(
+            f"ACTIVO: riesgo × {_multiplier_text(b.get('risk_multiplier') or 1.0)}", "yellow"
+        )
+    if kind == "lock":
+        return Cell("BLOQUEO TOTAL", "alert")
+    return Cell("BLOQUEA", "red")
+
+
+def render_locked_block(lock: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
+    """Cartel rojo de la app bloqueada (archivo LOCKED), con qué hacer."""
+    lines = _banner(LOCKED_TITLE, style)
+    rows: list[tuple[str, Cell | str]] = []
+    if lock.get("reason"):
+        rows.append(("Motivo", Cell(printable(lock["reason"]), "red")))
+    if lock.get("triggered_at"):
+        rows.append(("Desde", f"{fmt_time(lock['triggered_at'], tz)} ({timezone_label(tz)})"))
+    if lock.get("report_path"):
+        rows.append(("Informe del incidente", display_path(lock["report_path"])))
+    if not lock.get("readable", True):
+        rows.append(("", Cell("El archivo LOCKED no se pudo leer; igual bloquea.", "yellow")))
+    lines += _kv(rows, style)
+    path = display_path(lock.get("path") or "LOCKED")
+    lines.append(
+        style.paint(
+            f"  Revisá el informe y borrá {path} a mano para volver a tener planes.", "alert"
+        )
+    )
+    return lines
+
+
+def _period_line(period: dict[str, Any]) -> str:
+    """``"-30,00 USD neto · 3 cerradas (0 ganadas, 3 perdidas)"``."""
+    n = int(period.get("trades") or 0)
+    if n == 0:
+        return "sin operaciones cerradas"
+    detail = f"{n} {'cerrada' if n == 1 else 'cerradas'} ({period.get('wins', 0)} " + (
+        f"{'ganada' if period.get('wins') == 1 else 'ganadas'}, {period.get('losses', 0)} "
+        f"{'perdida' if period.get('losses') == 1 else 'perdidas'})"
+    )
+    return f"{_signed_usd(period.get('net_pnl_usd'))} neto · {detail}"
+
+
+def _position_text(p: dict[str, Any], tz: ZoneInfo) -> str:
+    entry = (
+        ""
+        if p.get("entry_price") is None
+        else f", entrada {fmt_num(p['entry_price'], price_decimals(p['entry_price']))}"
+    )
+    return (
+        f"#{p.get('id')} {printable(p.get('symbol'))} {p.get('side')}: riesgo "
+        f"{fmt_usd(p.get('risk_usd'))}{entry} (abierta {fmt_time(p.get('opened_at'), tz)})"
+    )
+
+
+def render_safety_section(
+    safety: dict[str, Any], style: Style, tz: ZoneInfo, *, title: str = SAFETY_TITLE
+) -> list[str]:
+    """Sección de los frenos de seguridad (la usan la consola y ``scripts.trades status``)."""
+    lines = _section(title, style)
+    verdict = safety.get("verdict") or {}
+    state = safety.get("state") or {}
+    lock = verdict.get("lock") or {}
+    if verdict.get("locked"):
+        lines += render_locked_block(lock, style, tz)
+        lines.append("")
+    trigger = safety.get("lock_trigger") or {}
+    if trigger.get("action") == "locked":
+        where = f" ({display_path(trigger['report_path'])})" if trigger.get("report_path") else ""
+        lines.append(
+            style.paint(
+                f"  Recién se bloqueó la app: se escribió el informe del incidente{where} y el "
+                "archivo LOCKED.",
+                "alert",
+            )
+        )
+        if trigger.get("report_error"):
+            lines.append(style.paint(f"  {printable(trigger['report_error'])}", "yellow"))
+    status = verdict.get("status") or "verde"
+    lines.append(
+        "  "
+        + style.paint(f"Estado: {_VERDICT_TEXT.get(status, status)}", _VERDICT_COLOR.get(status))
+        + f" · {printable(verdict.get('headline') or '')}"
+    )
+    rows: list[list[Cell | str]] = []
+    for b in verdict.get("breakers") or []:
+        bar = DASH if b.get("threshold") is None else progress_bar(b.get("progress"))
+        rows.append([printable(b.get("label")), _breaker_amount(b), bar, _breaker_state(b)])
+    if rows:
+        lines.append("")
+        lines += render_table(
+            rows, style, header=["Freno", "Ahora", "Progreso", "Estado"], aligns="<<<<"
+        )
+    # El del archivo LOCKED ya está en el cartel rojo de arriba.
+    active = [
+        b
+        for b in verdict.get("breakers") or []
+        if b.get("triggered") and not (b.get("code") == "lock_file" and verdict.get("locked"))
+    ]
+    for b in active:
+        color = "yellow" if b.get("kind") == "reduce" else "red"
+        lines.append(
+            style.paint(f"  · {printable(b.get('label'))} — {printable(b.get('message'))}", color)
+        )
+
+    labels = (state.get("periods") or {}).get("labels") or {}
+    wallet = state.get("wallet") or {}
+    basis = (
+        "La pérdida del día y de la semana es el neto de lo que cerraste (ganancias menos "
+        "pérdidas)."
+        if state.get("loss_basis") == "net"
+        else "La pérdida del día y de la semana suma solo las operaciones perdidas."
+    )
+    rows2: list[tuple[str, Cell | str]] = []
+    day = state.get("day") or {}
+    rows2.append(("Hoy", Cell(_period_line(day), _signed_color(day.get("net_pnl_usd")))))
+    max_trades = state.get("max_trades_per_day")
+    trades_txt = f"{state.get('trades_today', 0)}" + (
+        "" if max_trades is None else f" de {max_trades} permitidas"
+    )
+    rows2.append(("Operaciones de hoy", trades_txt))
+    week = state.get("week") or {}
+    week_label = labels.get("week")
+    rows2.append(
+        (
+            "Semana",
+            Cell(
+                _period_line(week) + ("" if not week_label else f" · {week_label}"),
+                _signed_color(week.get("net_pnl_usd")),
+            ),
+        )
+    )
+    if wallet:
+        wallet_txt = (
+            f"saldo {fmt_usd(wallet.get('current_balance_usd'))} · máximo del mes "
+            f"{fmt_usd(wallet.get('month_peak_usd'))} · caída "
+            f"{fmt_pct(wallet.get('drawdown_pct'), 1)}"
+        )
+        if wallet.get("assumed"):
+            wallet_txt += " (supuesto)"
+        rows2.append(("Billetera del mes", wallet_txt))
+    positions = state.get("open_positions") or []
+    if positions:
+        rows2.append(("Posiciones abiertas", _position_text(positions[0], tz)))
+        rows2 += [("", _position_text(p, tz)) for p in positions[1:]]
+    else:
+        rows2.append(("Posiciones abiertas", "ninguna"))
+    events = state.get("active_volatility_events") or []
+    upcoming = state.get("upcoming_volatility_events") or []
+    if events:
+        for i, e in enumerate(events):
+            rows2.append(
+                (
+                    "Eventos" if i == 0 else "",
+                    Cell(
+                        f"#{e.get('id')} «{printable(e.get('note'))}», activo hasta "
+                        f"{fmt_time(e.get('until'), tz)}",
+                        "red",
+                    ),
+                )
+            )
+    else:
+        rows2.append(("Eventos", "ningún evento de alta volatilidad activo"))
+    for e in upcoming:
+        rows2.append(
+            (
+                "",
+                f"#{e.get('id')} «{printable(e.get('note'))}», programado desde "
+                f"{fmt_time(e.get('starts_at'), tz)} hasta {fmt_time(e.get('until'), tz)}",
+            )
+        )
+    lines.append("")
+    lines += _kv(rows2, style)
+    lines.append(style.paint(f"  {basis}", "dim"))
+    warnings = verdict.get("warnings") or []
+    if warnings:
+        lines.append(style.paint("  Avisos:", "yellow"))
+        for w in warnings:
+            lines.append(style.paint(f"  · {printable(w)}", "yellow"))
+    paths = safety.get("paths") or {}
+    where = paths.get("database_display") or paths.get("database") or DASH
+    kind = paths.get("kind")
+    if kind == STATE_OFFLINE:
+        note = f"Base de prueba de los datos sintéticos: {where} (tu estado real no se toca)."
+    elif kind == STATE_CUSTOM:
+        note = f"Base elegida con --db: {where}."
+    else:
+        note = f"Estado cargado a mano en {where} (cargalo con make trade; miralo con make trades)."
+    lines.append(style.paint(f"  {note}", "dim"))
+    return lines
+
+
+def _render_safety(r: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
+    safety = r.get("safety")
+    if not safety:
+        return []
+    return render_safety_section(safety, style, tz)
+
+
+def _render_correlation(r: dict[str, Any], style: Style) -> list[str]:
+    corr = r.get("correlation")
+    if not corr:
+        return []
+    lines = _section(CORRELATION_TITLE, style)
+    threshold = corr.get("high_threshold")
+    m = corr.get("matrix")
+    if m is None or not m.get("symbols"):
+        why = corr.get("error") or "no hay datos"
+        lines.append(style.paint(f"  Matriz no disponible: {printable(why)}.", "yellow"))
+    else:
+        lines.append(
+            style.paint(
+                f"  Correlación de los retornos de {m.get('timeframe')} de los últimos "
+                f"{m.get('lookback_days')} días (1 = se mueven igual, 0 = nada que ver). "
+                f"* = muy correlacionadas ({fmt_num(threshold, 2)} o más): cuentan como la misma "
+                "apuesta. — = sin datos suficientes.",
+                "dim",
+            )
+        )
+        symbols = m["symbols"]
+        rows: list[list[Cell | str]] = []
+        for i, a in enumerate(symbols):
+            row: list[Cell | str] = [Cell(printable(a), "bold")]
+            for j, _b in enumerate(symbols):
+                value = _finite(m["values"][i][j])
+                if i == j:
+                    row.append(Cell(fmt_num(1.0, 2), "dim"))
+                elif value is None:
+                    row.append(DASH)
+                elif threshold is not None and value >= threshold - 1e-9:
+                    row.append(Cell(f"*{fmt_num(value, 2)}", "yellow"))
+                else:
+                    row.append(fmt_num(round(value, 2) or 0.0, 2))  # sin "-0,00"
+            rows.append(row)
+        lines.append("")
+        lines += render_table(rows, style, header=["", *map(printable, symbols)])
+        for e in m.get("excluded") or []:
+            lines.append(
+                style.paint(
+                    f"  · {printable(e['symbol'])} quedó afuera: {printable(e['reason'])}", "yellow"
+                )
+            )
+        for w in m.get("warnings") or []:
+            if "sintétic" in str(w).lower() and r.get("offline"):
+                continue  # ya lo dice el cartel
+            lines.append(style.paint(f"  · {printable(w)}", "yellow"))
+
+    side = corr.get("plan_side")
+    exposures = corr.get("exposure") or {}
+    lines.append("")
+    limit_txt = (
+        f"{fmt_usd(corr.get('limit_usd'))} "
+        f"({_multiplier_text(corr.get('max_combined_risk_multiplier') or 1.0)} × tu riesgo por "
+        f"operación de {fmt_usd(corr.get('risk_per_trade_usd'))})"
+    )
+    if not exposures:
+        lines.append("  Sin estado de trading: no se miró el riesgo sumado con otras posiciones.")
+        return lines
+    if side is None or side not in exposures:
+        positions = (r.get("safety") or {}).get("state", {}).get("open_positions") or []
+        if not positions:
+            lines.append("  No tenés posiciones abiertas: la correlación no cambia el plan.")
+        else:
+            lines.append(
+                "  El plan no tiene dirección: no hace falta sumar riesgo con tus posiciones "
+                "abiertas."
+            )
+        lines.append(
+            style.paint(
+                f"  Tope de riesgo entre posiciones muy correlacionadas: {limit_txt}.", "dim"
+            )
+        )
+        return lines
+    exp = exposures[side]
+    lines.append(style.paint(f"  Riesgo sumado para el plan ({side})", "bold"))
+    lines.append(f"    {printable(exp.get('explanation'))}")
+    existing = _finite(exp.get("existing_risk_usd")) or 0.0
+    limit = _finite(corr.get("limit_usd")) or 0.0
+    lines.append(
+        f"    Tope entre todas: {limit_txt}. Ya usado: {fmt_usd(existing)}. Le queda al plan: "
+        f"{fmt_usd(max(0.0, limit - existing))}."
+    )
+    for e in exp.get("skipped") or []:
+        lines.append(style.paint(f"    · {printable(e.get('explanation'))}", "dim"))
+    return lines
+
+
 def render_text(report: dict[str, Any], *, color: bool = False) -> str:
     """Salida para la consola, en castellano."""
     style = Style(enabled=color)
     tz = _tz(report["user_timezone"])
     lines: list[str] = []
     lines += _render_header(report, style, tz)
+    lines += _render_safety(report, style, tz)
     lines += _render_prices(report, style)
     lines += _render_regime(report, style, tz)
     lines += _render_timeframes(report, style, tz)
@@ -1663,7 +2340,18 @@ def render_text(report: dict[str, Any], *, color: bool = False) -> str:
     lines += _render_derivatives(report, style, tz)
     lines += _render_sentiment(report, style, tz)
     lines += _render_score(report, style)
+    lines += _render_correlation(report, style)
     lines += _render_plan(report, style, tz)
+    if report.get("analysis_id") is not None:
+        hint = (
+            ""
+            if report.get("locked")
+            else " Si operás, cargá el resultado con make trade (se liga solo a este análisis)."
+        )
+        lines.append("")
+        lines.append(
+            style.paint(f"  Análisis guardado con el número {report['analysis_id']}.{hint}", "dim")
+        )
     if report["offline"]:
         lines.append("")
         lines += _banner(OFFLINE_BANNER, style)
@@ -1787,17 +2475,15 @@ _NEGATIVE_AMOUNT_OPTIONS = ("--pnl-today",)
 _NEGATIVE_NUMBER = re.compile(r"[-−]\s*\d[\d.,]*")
 
 
-def _join_negative_amounts(argv: Sequence[str] | None) -> list[str]:
+def _join_negative_amounts(
+    argv: Sequence[str] | None, options: Sequence[str] = _NEGATIVE_AMOUNT_OPTIONS
+) -> list[str]:
     args = list(sys.argv[1:] if argv is None else argv)
     out: list[str] = []
     i = 0
     while i < len(args):
         a = args[i]
-        if (
-            a in _NEGATIVE_AMOUNT_OPTIONS
-            and i + 1 < len(args)
-            and _NEGATIVE_NUMBER.fullmatch(args[i + 1].strip())
-        ):
+        if a in options and i + 1 < len(args) and _NEGATIVE_NUMBER.fullmatch(args[i + 1].strip()):
             out.append(f"{a}={args[i + 1]}")
             i += 2
             continue
@@ -1838,21 +2524,31 @@ def build_parser() -> argparse.ArgumentParser:
         const="",
         default=None,
         metavar="DESCRIPCIÓN",
-        help="marca un evento de alta volatilidad (Fed, CPI...): el plan da No operar",
+        help="marca un evento de alta volatilidad solo para esta corrida (Fed, CPI...): el plan "
+        'da No operar. Para guardarlo con hora de fin: make trade ARGS="event ..."',
     )
     parser.add_argument(
         "--trades-today",
         type=_non_negative_int,
-        default=0,
+        default=None,
         metavar="N",
-        help="operaciones que ya hiciste hoy (para el límite del día)",
+        help="operaciones de hoy puestas a mano para probar (si no, salen de lo que cargaste "
+        "con make trade)",
     )
     parser.add_argument(
         "--pnl-today",
         type=_signed_amount,
-        default=0.0,
+        default=None,
         metavar="USD",
-        help="resultado de hoy en USD, negativo si perdiste (ej. -30)",
+        help="resultado de hoy en USD puesto a mano para probar, negativo si perdiste (ej. -30; "
+        "si no, sale de lo que cargaste)",
+    )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        metavar="RUTA",
+        help="otra base de estado de trading (el LOCKED y los informes van en su misma carpeta)",
     )
     parser.add_argument("--offline", action="store_true", help="datos sintéticos, sin red")
     parser.add_argument("--json", action="store_true", help="salida en JSON")
@@ -1909,9 +2605,18 @@ async def _regime_report(
 
 
 async def _fetch_data(
-    symbol: str, settings: AppSettings, args: argparse.Namespace, err: TextIO
-) -> tuple[MarketSnapshot, dict[str, Any] | None, RegimeReport | None]:
-    """Snapshot de mercado y, si no se pidió ``--no-regime``, el régimen (dict y reporte de 1h)."""
+    symbol: str,
+    settings: AppSettings,
+    args: argparse.Namespace,
+    err: TextIO,
+    *,
+    extra_symbols: Sequence[str] = (),
+) -> tuple[MarketSnapshot, dict[str, Any] | None, RegimeReport | None, CorrelationContext]:
+    """Snapshot de mercado, el régimen (salvo ``--no-regime``) y la matriz de correlación.
+
+    La matriz es de la moneda analizada, las favoritas y ``extra_symbols`` (las
+    monedas de las posiciones abiertas), con la misma fuente de velas.
+    """
     want_regime = not args.no_regime
     if args.offline:
         market = SyntheticMarketData(
@@ -1929,7 +2634,20 @@ async def _fetch_data(
             regime, regime_main = await _regime_report(
                 snapshot.symbol, settings, market, synthetic=True, clock=lambda: market.now, err=err
             )
-        return snapshot, regime, regime_main
+        # Para la correlación alcanza la historia corta (las velas recientes son
+        # las mismas que con la historia larga del régimen, y sale mucho más rápido).
+        corr_market = SyntheticMarketData(
+            seed=args.seed,
+            now=market.now,
+            funding_interval_hours=settings.fees.funding_interval_hours,
+        )
+        correlation = await _correlation_context(
+            correlation_symbols(snapshot.symbol, settings, extra_symbols),
+            corr_market,
+            settings,
+            snapshot.created_at,
+        )
+        return snapshot, regime, regime_main, correlation
     secrets = get_secrets()
     async with AsyncExitStack() as stack:
         client = make_client(settings.exchanges.request_timeout_s)
@@ -1947,7 +2665,13 @@ async def _fetch_data(
             regime, regime_main = await _regime_report(
                 snapshot.symbol, settings, market_data, synthetic=False, clock=None, err=err
             )
-        return snapshot, regime, regime_main
+        correlation = await _correlation_context(
+            correlation_symbols(snapshot.symbol, settings, extra_symbols),
+            market_data,
+            settings,
+            snapshot.created_at,
+        )
+        return snapshot, regime, regime_main, correlation
 
 
 def main(
@@ -1977,8 +2701,39 @@ def main(
         print(str(exc), file=err)
         return EXIT_USAGE
 
+    paths = resolve_state_paths(settings, offline=args.offline, db=args.db)
     try:
-        snapshot, regime, regime_main = asyncio.run(_fetch_data(symbol, settings, args, err))
+        repo = Repository.open(paths.database)
+        open_symbols = [p.symbol for p in repo.list_open_positions()]
+    except (OSError, ValueError, RuntimeError, SQLAlchemyError) as exc:
+        print(
+            f"No se pudo abrir la base de tu estado de trading ({display_path(paths.database)}): "
+            f"{exc}",
+            file=err,
+        )
+        return EXIT_DATA
+    try:
+        return _run(args, symbol, settings, profile, paths, repo, open_symbols, out, err)
+    finally:
+        repo.engine.dispose()
+
+
+def _run(
+    args: argparse.Namespace,
+    symbol: str,
+    settings: AppSettings,
+    profile: EffectiveProfile,
+    paths: StatePaths,
+    repo: Repository,
+    open_symbols: Sequence[str],
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    """Datos, frenos de seguridad, reporte y guardado del análisis (ver ``main``)."""
+    try:
+        snapshot, regime, regime_main, correlation = asyncio.run(
+            _fetch_data(symbol, settings, args, err, extra_symbols=open_symbols)
+        )
     except KeyboardInterrupt:
         print(f"\n{CANCELLED}", file=err)
         return EXIT_INTERRUPTED
@@ -1989,9 +2744,20 @@ def main(
         print(f"Dato inválido: {exc}", file=err)
         return EXIT_USAGE
 
-    analysis = analyze_all(
-        snapshot.candles, settings, snapshot.current_price, now=snapshot.created_at
-    )
+    now = snapshot.created_at
+    # El "ahora" del repositorio es el del análisis (con --now, el de la prueba).
+    repo_now = Repository(repo.engine, clock=lambda: now)
+    try:
+        safety = evaluate_safety(repo_now, settings, profile, now, paths)
+    except (OSError, ValueError, SQLAlchemyError) as exc:
+        print(
+            "No se pudieron evaluar los frenos de seguridad (sin eso no se arma ningún plan): "
+            f"{exc}",
+            file=err,
+        )
+        return EXIT_DATA
+
+    analysis = analyze_all(snapshot.candles, settings, snapshot.current_price, now=now)
     report = build_report(
         snapshot,
         analysis,
@@ -2005,13 +2771,95 @@ def main(
         event_description=printable(args.high_vol_event) or None
         if args.high_vol_event is not None
         else None,
+        safety=safety,
+        correlation=correlation,
     )
+    # Con datos sintéticos el análisis no se guarda, salvo en una base elegida con --db.
+    if not args.offline or args.db is not None:
+        try:
+            stored = save_analysis_record(repo_now, report, profile, regime_main, now)
+            report["analysis_id"] = stored.id
+        except (OSError, ValueError, SQLAlchemyError) as exc:
+            report["warnings"].append(f"No se pudo guardar el análisis en la base: {exc}")
     if args.json:
         out.write(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
     else:
         color = bool(getattr(out, "isatty", lambda: False)())
         out.write(render_text(report, color=color))
     return EXIT_OK
+
+
+def _analysis_safety_json(report: dict[str, Any]) -> dict[str, Any]:
+    """Lo que se guarda del veredicto de seguridad con cada análisis (sin la historia del mes)."""
+    safety = report.get("safety") or {}
+    state = safety.get("state") or {}
+    wallet = {k: v for k, v in (state.get("wallet") or {}).items() if k != "points"}
+    corr = report.get("correlation") or {}
+    matrix = corr.get("matrix") or {}
+    return {
+        "status": safety.get("status"),
+        "headline": safety.get("headline"),
+        "blocked": safety.get("blocked"),
+        "locked": safety.get("locked"),
+        "risk_multiplier": safety.get("risk_multiplier"),
+        "verdict": safety.get("verdict"),
+        "lock_trigger": safety.get("lock_trigger"),
+        "day": state.get("day"),
+        "week": state.get("week"),
+        "trades_today": state.get("trades_today"),
+        "streak": state.get("streak"),
+        "wallet": wallet,
+        "open_positions": state.get("open_positions"),
+        "active_volatility_events": state.get("active_volatility_events"),
+        "day_overrides": safety.get("day_overrides"),
+        "correlation": {
+            "plan_side": corr.get("plan_side"),
+            "limit_usd": corr.get("limit_usd"),
+            "exposure": corr.get("exposure"),
+            "high_pairs": [p for p in matrix.get("pairs") or [] if p.get("high")],
+            "error": corr.get("error"),
+        },
+    }
+
+
+def save_analysis_record(
+    repo: Repository,
+    report: dict[str, Any],
+    profile: EffectiveProfile,
+    regime_report: RegimeReport | None,
+    now: datetime,
+) -> Any:
+    """Guarda el análisis (``AnalysisRecord``) para ligarlo después a una operación."""
+    plan = report.get("plan")
+    score = report.get("score") or {}
+    prices = report.get("prices") or {}
+    inputs = {
+        "generated_at": report.get("generated_at"),
+        "offline": report.get("offline"),
+        "prices": prices,
+        "daily_range": report.get("daily_range"),
+        "levels": report.get("levels"),
+        "timeframes": report.get("timeframes"),
+        "derivatives": report.get("derivatives"),
+        "fear_greed": (report.get("sentiment") or {}).get("fear_greed"),
+    }
+    return repo.save_analysis(
+        symbol=report["symbol"],
+        profile_name=profile.name,
+        price=prices.get("execution_price"),
+        price_source=prices.get("execution_source") or "desconocido",
+        plan_status=(plan or {}).get("status") or "NO_OPERAR",
+        plan=plan,
+        score=score,
+        safety=_analysis_safety_json(report),
+        inputs=inputs,
+        regime_category=getattr(regime_report, "category", None),
+        regime_name=getattr(regime_report, "name", None),
+        regime_confidence=getattr(regime_report, "confidence", None),
+        regime_unstable=getattr(regime_report, "unstable", None),
+        score_total=score.get("total"),
+        created_at=now,
+    )
 
 
 def exit_process(code: int) -> None:

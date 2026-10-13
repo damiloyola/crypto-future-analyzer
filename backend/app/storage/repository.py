@@ -5,7 +5,8 @@ operaciones. Cada método abre y cierra su propia sesión (una transacción por
 llamada), así que se puede usar desde varios hilos.
 
 Qué devuelve: dataclasses inmutables (``StoredTrade``, ``StoredPosition``,
-``StoredWalletEvent``, ``StoredAnalysis``), nunca los objetos de SQLModel. Se
+``StoredWalletEvent``, ``StoredVolatilityEvent``, ``StoredAnalysis``), nunca
+los objetos de SQLModel. Se
 pueden usar después de cerrada la sesión, no consultan la base de nuevo y
 modificarlas no cambia nada guardado. Cada una tiene ``to_dict()`` listo para
 JSON (fechas en ISO 8601 con ``+00:00``, sin NaN ni infinitos).
@@ -26,6 +27,12 @@ Validaciones (``ValueError`` con el motivo en castellano): dirección distinta
 de ``"long"``/``"short"``, moneda que no es alfanumérica, cierre antes de la
 apertura, riesgo <= 0, precios <= 0, montos <= 0 en depósitos y retiros,
 saldo negativo, números no finitos, análisis inexistente o de otra moneda.
+
+Eventos de alta volatilidad (``add_volatility_event``): nota obligatoria y hora
+de fin posterior a ahora y al inicio (el inicio por defecto es ahora y puede
+estar en el futuro, para marcar un evento con anticipación). Bloquean los
+planes mientras ``starts_at <= ahora < until`` y después se apagan solos
+(``active_volatility_events``); ``delete_volatility_event`` los borra antes.
 
 Operaciones ligadas a un análisis (``analysis_id``): el análisis tiene que
 existir y ser de la misma moneda; el contexto que no se pase a mano (régimen,
@@ -54,6 +61,7 @@ from app.risk.rules import json_safe
 from app.storage.db import open_db, session_scope
 from app.storage.models import (
     AnalysisRecord,
+    HighVolatilityEvent,
     ManualTrade,
     OpenPosition,
     WalletEvent,
@@ -66,6 +74,10 @@ MAX_CLOCK_SKEW = timedelta(minutes=5)
 
 #: Largo máximo de las notas, para que un pegado gigante no infle la base.
 MAX_NOTES_LENGTH = 2000
+
+#: Largo máximo de la nota de un evento de alta volatilidad (se muestra en el
+#: aviso de bloqueo: tiene que ser corta).
+MAX_EVENT_NOTE_LENGTH = 300
 
 #: Largo máximo del símbolo de una moneda (``1000PEPE`` tiene 8).
 MAX_SYMBOL_LENGTH = 20
@@ -233,6 +245,44 @@ class StoredWalletEvent:
     def _from_row(cls, row: WalletEvent) -> StoredWalletEvent:
         assert row.id is not None
         return cls(id=row.id, ts=row.ts, kind=row.kind, amount_usd=row.amount_usd, notes=row.notes)
+
+
+@dataclass(frozen=True)
+class StoredVolatilityEvent:
+    """Evento de alta volatilidad tal como quedó guardado (ver ``models.HighVolatilityEvent``)."""
+
+    id: int
+    created_at: datetime
+    starts_at: datetime
+    until: datetime
+    note: str
+
+    def is_active(self, now: datetime) -> bool:
+        """``True`` si bloquea en ``now``: ``starts_at <= now < until``."""
+        moment = _aware(now, "La hora")
+        return self.starts_at <= moment < self.until
+
+    def to_dict(self) -> dict[str, Any]:
+        return json_safe(
+            {
+                "id": self.id,
+                "created_at": _iso(self.created_at),
+                "starts_at": _iso(self.starts_at),
+                "until": _iso(self.until),
+                "note": self.note,
+            }
+        )
+
+    @classmethod
+    def _from_row(cls, row: HighVolatilityEvent) -> StoredVolatilityEvent:
+        assert row.id is not None
+        return cls(
+            id=row.id,
+            created_at=row.created_at,
+            starts_at=row.starts_at,
+            until=row.until,
+            note=row.note,
+        )
 
 
 @dataclass(frozen=True)
@@ -884,6 +934,90 @@ class Repository:
             session.delete(row)
             return True
 
+    # --- eventos de alta volatilidad ---------------------------------------------
+
+    def add_volatility_event(
+        self,
+        note: str,
+        until: datetime,
+        starts_at: datetime | None = None,
+    ) -> StoredVolatilityEvent:
+        """Marca un evento de alta volatilidad: bloquea todos los planes hasta ``until``.
+
+        - ``note``: qué evento es (obligatoria, se muestra en el aviso).
+        - ``until``: hora de fin (con zona horaria); tiene que ser posterior a
+          ahora y al inicio. A esa hora el evento deja de bloquear solo.
+        - ``starts_at``: desde cuándo bloquea; por defecto, ahora. Puede estar
+          en el futuro (para marcar con anticipación el dato de inflación de
+          mañana, por ejemplo).
+        """
+        text = _text(note, "La nota del evento", MAX_EVENT_NOTE_LENGTH)
+        now = self._now()
+        start = now if starts_at is None else _aware(starts_at, "El inicio del evento")
+        end = _aware(until, "La hora de fin del evento")
+        if end <= now:
+            raise ValueError(
+                f"La hora de fin del evento ({end.isoformat()}) ya pasó. Poné una hora futura."
+            )
+        if end <= start:
+            raise ValueError(
+                f"La hora de fin del evento ({end.isoformat()}) tiene que ser posterior al "
+                f"inicio ({start.isoformat()})."
+            )
+        row = HighVolatilityEvent(created_at=now, starts_at=start, until=end, note=text)
+        with session_scope(self._engine) as session:
+            session.add(row)
+            session.flush()
+            return StoredVolatilityEvent._from_row(row)
+
+    def get_volatility_event(self, event_id: int) -> StoredVolatilityEvent | None:
+        """El evento ``event_id``, o ``None`` si no existe."""
+        eid = _record_id(event_id, "El número de evento")
+        with session_scope(self._engine) as session:
+            row = session.get(HighVolatilityEvent, eid)
+            return None if row is None else StoredVolatilityEvent._from_row(row)
+
+    def list_volatility_events(
+        self, *, ending_after: datetime | None = None
+    ) -> list[StoredVolatilityEvent]:
+        """Eventos ordenados por inicio (y por número).
+
+        Con ``ending_after``, solo los que todavía no terminaron en ese momento
+        (``until > ending_after``): los activos y los programados para más tarde.
+        """
+        stmt = select(HighVolatilityEvent)
+        if ending_after is not None:
+            moment = _aware(ending_after, "El momento")
+            stmt = stmt.where(col(HighVolatilityEvent.until) > moment)
+        stmt = stmt.order_by(col(HighVolatilityEvent.starts_at), col(HighVolatilityEvent.id))
+        with session_scope(self._engine) as session:
+            return [StoredVolatilityEvent._from_row(r) for r in session.exec(stmt).all()]
+
+    def active_volatility_events(self, now: datetime | None = None) -> list[StoredVolatilityEvent]:
+        """Los eventos que bloquean en ``now`` (por defecto, ahora).
+
+        Activo = ``starts_at <= now < until``: a la hora de fin ya no bloquea.
+        """
+        moment = self._now() if now is None else _aware(now, "La hora")
+        stmt = (
+            select(HighVolatilityEvent)
+            .where(col(HighVolatilityEvent.starts_at) <= moment)
+            .where(col(HighVolatilityEvent.until) > moment)
+            .order_by(col(HighVolatilityEvent.starts_at), col(HighVolatilityEvent.id))
+        )
+        with session_scope(self._engine) as session:
+            return [StoredVolatilityEvent._from_row(r) for r in session.exec(stmt).all()]
+
+    def delete_volatility_event(self, event_id: int) -> bool:
+        """Borra el evento (para terminarlo antes o corregirlo). ``False`` si no existía."""
+        eid = _record_id(event_id, "El número de evento")
+        with session_scope(self._engine) as session:
+            row = session.get(HighVolatilityEvent, eid)
+            if row is None:
+                return False
+            session.delete(row)
+            return True
+
     # --- análisis -----------------------------------------------------------------
 
     def save_analysis(
@@ -1007,6 +1141,7 @@ class Repository:
 
 __all__ = [
     "MAX_CLOCK_SKEW",
+    "MAX_EVENT_NOTE_LENGTH",
     "MAX_NOTES_LENGTH",
     "MAX_SYMBOL_LENGTH",
     "PLAN_STATUSES",
@@ -1018,5 +1153,6 @@ __all__ = [
     "StoredAnalysis",
     "StoredPosition",
     "StoredTrade",
+    "StoredVolatilityEvent",
     "StoredWalletEvent",
 ]

@@ -15,11 +15,23 @@
 
 ``create_all`` no modifica tablas que ya existen: si en un hito futuro cambia
 una tabla, hay que subir ``SCHEMA_VERSION`` y escribir la migración.
+
+Historial del esquema (``PRAGMA user_version``)
+    1. Hito 5, tanda 1: ``manual_trades``, ``open_positions``,
+       ``wallet_events`` y ``analyses``.
+    2. Hito 5, tanda 2: agrega ``high_volatility_events`` (evento de alta
+       volatilidad con nota, inicio y hora de fin). El cambio es **aditivo**: no
+       toca ninguna tabla existente. Una base de la versión 1 se migra sola al
+       abrirla (``MIGRATIONS[1]`` crea la tabla nueva y marca la versión 2), sin
+       perder datos.
+
+Una base de una versión **más nueva** que la app (por ejemplo, abierta con un
+checkout viejo) se rechaza: la app vieja no sabe qué tablas o columnas espera.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -39,7 +51,8 @@ DEFAULT_DB_FILENAME = "analyzer.db"
 IN_MEMORY = ":memory:"
 
 #: Versión del esquema. Se guarda en ``PRAGMA user_version`` al crear la base.
-SCHEMA_VERSION = 1
+#: Ver el historial en el docstring del módulo.
+SCHEMA_VERSION = 2
 
 
 def default_db_path(settings: AppSettings) -> Path:
@@ -102,18 +115,35 @@ def _table_names(engine: Engine) -> set[str]:
     return {str(r[0]) for r in rows}
 
 
+def _migrate_1_to_2(engine: Engine) -> None:
+    """Versión 1 → 2: crea ``high_volatility_events`` (aditivo, no toca datos)."""
+    table = SQLModel.metadata.tables[_models.HighVolatilityEvent.__tablename__]
+    table.create(engine, checkfirst=True)
+
+
+#: Migraciones: ``MIGRATIONS[n]`` lleva una base de la versión ``n`` a la ``n + 1``.
+MIGRATIONS: dict[int, Callable[[Engine], None]] = {1: _migrate_1_to_2}
+
+
+def _set_user_version(engine: Engine, version: int) -> None:
+    with engine.begin() as conn:
+        conn.exec_driver_sql(f"PRAGMA user_version = {int(version)}")
+
+
 def init_db(engine: Engine) -> None:
-    """Crea las tablas que falten y marca la versión del esquema.
+    """Crea las tablas que falten, migra versiones viejas y marca la versión del esquema.
 
     - Base nueva (versión 0): crea todo y guarda ``SCHEMA_VERSION``. Si tiene
       solo tablas de la app (una creación que se cortó a la mitad), la completa.
+    - Base de una versión anterior (por ejemplo, la 1): aplica las migraciones
+      de ``MIGRATIONS`` en orden (todas aditivas) y marca ``SCHEMA_VERSION``.
     - Base con la misma versión: crea solo las tablas que falten (no toca datos).
-    - Base de otra versión, o un archivo SQLite con tablas ajenas a la app:
-      ``RuntimeError`` explicando qué hacer, para no leer ni escribir con un
-      esquema que no coincide.
+    - Base de una versión más nueva que la app, o un archivo SQLite con tablas
+      ajenas a la app: ``RuntimeError`` explicando qué hacer, para no leer ni
+      escribir con un esquema que no coincide.
     """
     version = _user_version(engine)
-    if version not in (0, SCHEMA_VERSION):
+    if version < 0 or version > SCHEMA_VERSION:
         raise RuntimeError(
             f"La base de datos {engine.url.database} es de otra versión de la app "
             f"(esquema {version}, se esperaba {SCHEMA_VERSION}). Hacé una copia del "
@@ -126,10 +156,13 @@ def init_db(engine: Engine) -> None:
                 f"El archivo {engine.url.database} no parece ser la base de la app: "
                 f"tiene otras tablas ({', '.join(sorted(foreign))}). Usá otro archivo."
             )
+        SQLModel.metadata.create_all(engine)
+        _set_user_version(engine, SCHEMA_VERSION)
+        return
+    for step in range(version, SCHEMA_VERSION):
+        MIGRATIONS[step](engine)
+        _set_user_version(engine, step + 1)
     SQLModel.metadata.create_all(engine)
-    if version == 0:
-        with engine.begin() as conn:
-            conn.exec_driver_sql(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
 
 
 def open_db(path: Path | str) -> Engine:
@@ -160,6 +193,7 @@ def session_scope(engine: Engine) -> Iterator[Session]:
 __all__ = [
     "DEFAULT_DB_FILENAME",
     "IN_MEMORY",
+    "MIGRATIONS",
     "SCHEMA_VERSION",
     "default_db_path",
     "init_db",

@@ -11,7 +11,9 @@ import asyncio
 import io
 import json
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -20,13 +22,17 @@ import yaml
 
 from app.config import DEFAULT_CONFIG_PATH, Secrets
 from app.data.synthetic import DEFAULT_SEED, SyntheticMarketData
+from app.storage import Repository
 from scripts import analyze_cli
 from scripts.analyze_cli import (
+    CORRELATION_TITLE,
     DASH,
+    LOCKED_TITLE,
     OFFLINE_BANNER,
     PLAN_TITLE,
     REGIME_TITLE,
     REGIME_UNAVAILABLE,
+    SAFETY_TITLE,
     SCORE_TITLE,
     build_report,
     fmt_compact_usd,
@@ -38,13 +44,16 @@ from scripts.analyze_cli import (
     parse_price,
     price_decimals,
     printable,
+    progress_bar,
     render_text,
+    resolve_state_paths,
     score_bar,
 )
 from tests.fakes import FIXED_NOW, FIXED_NOW_ISO, FakeMarketData
 
 SECTIONS = [
     "Fuentes de datos",
+    SAFETY_TITLE,
     "Precios",
     REGIME_TITLE,
     "Indicadores por timeframe",
@@ -53,14 +62,26 @@ SECTIONS = [
     "Derivados",
     "Sentimiento y noticias",
     SCORE_TITLE,
+    CORRELATION_TITLE,
     PLAN_TITLE,
 ]
 LEAKS = re.compile(r"\b(nan|none|inf|null)\b", re.IGNORECASE)
 
 
 def write_small_config(root: Path, **regime_changes) -> Path:
-    """``config.yaml`` real con un régimen chico y rápido, y modelos dentro de ``root``."""
+    """``config.yaml`` real con un régimen chico y rápido, y modelos dentro de ``root``.
+
+    La base del estado de trading, el LOCKED y los informes también van dentro
+    de ``root``: los tests nunca tocan ``data/``.
+    """
     data = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    data["app"].update(
+        {
+            "database_file": str(root / "estado" / "analyzer.db"),
+            "lock_file": str(root / "estado" / "LOCKED"),
+            "incident_dir": str(root / "estado" / "incidents"),
+        }
+    )
     data["regime"].update(
         {
             "n_states_min": 3,
@@ -1262,3 +1283,291 @@ def test_plan_headline_prices_match_the_table(sol_json):
         f"SHORT a mercado en {shown(plan['entry']['price'])}: stop en "
         f"{shown(plan['stop']['price'])} y objetivo principal (TP2) en {shown(tp2['price'])};"
     )
+
+
+# --- Hito 5: frenos de seguridad, correlación y estado cargado a mano ----------------------
+
+FIXED_BA = "America/Argentina/Buenos_Aires"
+
+
+def _state_repo(db: Path) -> Repository:
+    return Repository.open(db, clock=lambda: FIXED_NOW)
+
+
+def _local(day: int, hour: int, minute: int = 0) -> datetime:
+    return datetime(2026, 10, day, hour, minute, tzinfo=ZoneInfo(FIXED_BA))
+
+
+def test_sections_order_safety_near_the_top(btc_text):
+    assert btc_text.index("━━ Fuentes de datos") < btc_text.index(f"━━ {SAFETY_TITLE}")
+    assert btc_text.index(f"━━ {SAFETY_TITLE}") < btc_text.index("━━ Precios")
+    assert btc_text.index(f"━━ {SCORE_TITLE}") < btc_text.index(f"━━ {CORRELATION_TITLE}")
+    assert btc_text.index(f"━━ {CORRELATION_TITLE}") < btc_text.index(f"━━ {PLAN_TITLE}")
+
+
+def test_safety_section_lists_every_breaker(btc_text):
+    block = btc_text[btc_text.index(f"━━ {SAFETY_TITLE}") : btc_text.index("━━ Precios")]
+    assert "Estado: VERDE · Ningún freno activo" in block
+    for label in (
+        "Pérdida del día: bajar el riesgo",
+        "Pérdida del día: límite",
+        "Pérdidas seguidas: pausa",
+        "Pérdida de la semana: bajar el riesgo",
+        "Caída del mes: bloqueo total",
+        "Evento de alta volatilidad",
+        "Bloqueo total (archivo LOCKED)",
+    ):
+        assert label in block
+    assert "0 USD de 50 USD" in block and "0 de 3 seguidas" in block
+    assert progress_bar(0) in block
+    assert "Billetera del mes" in block and "(supuesto)" in block
+    assert "Base de prueba de los datos sintéticos:" in block
+
+
+def test_progress_bar():
+    assert progress_bar(0.5) == "████░░░░  50 %"
+    assert progress_bar(1.7) == "████████ 100 %"
+    assert progress_bar(None) == "░░░░░░░░   0 %"
+
+
+def test_json_has_safety_and_correlation(btc_json):
+    safety = btc_json["safety"]
+    assert safety["status"] == "verde" and safety["blocked"] is False
+    assert [b["code"] for b in safety["verdict"]["breakers"]] == [
+        "daily_loss_reduce",
+        "daily_loss_block",
+        "losing_streak",
+        "weekly_loss_reduce",
+        "monthly_drawdown_lock",
+        "volatility_event",
+        "lock_file",
+    ]
+    assert safety["state"]["trades_today"] == 0 and safety["day_state_source"] == "state"
+    assert safety["paths"]["kind"] == "offline"
+    corr = btc_json["correlation"]
+    assert corr["symbols"][0] == "BTC"
+    assert set(corr["symbols"]) >= {"BTC", "ETH", "SOL", "XRP", "AVAX"}
+    assert corr["matrix"]["symbols"] == corr["symbols"]
+    assert corr["limit_usd"] == 75.0 and set(corr["exposure"]) == {"long", "short"}
+    assert btc_json["locked"] is False and btc_json["analysis_id"] is None
+    assert btc_json["plan"]["safety"]["evaluated"] is True
+
+
+def test_offline_uses_its_own_database(tmp_path):
+    from app.config import load_settings
+
+    path = write_small_config(tmp_path)
+    settings = load_settings(path)
+    offline = resolve_state_paths(settings, offline=True)
+    real = resolve_state_paths(settings)
+    assert offline.database.parent == tmp_path / "sinteticos"
+    assert offline.lock_file.parent == offline.database.parent
+    assert offline.database != real.database and offline.lock_file != real.lock_file
+    code, out, err = run(
+        "BTC", "--offline", "--json", "--no-regime", "--now", FIXED_NOW_ISO, "--config", str(path)
+    )
+    assert code == 0, err
+    report = json.loads(out)
+    assert report["safety"]["paths"]["database"] == str(offline.database)
+    assert offline.database.exists() and not real.database.exists()
+    assert report["analysis_id"] is None  # con datos sintéticos no se guarda
+
+
+def test_loaded_losses_start_the_cooldown_and_veto_the_plan(tmp_path):
+    db = tmp_path / "estado.db"
+    r = _state_repo(db)
+    for hour in (9, 10, 11):
+        closed = _local(12, hour)
+        r.add_trade(symbol="BTC", side="long", pnl_usd=-10.0, opened_at=closed, closed_at=closed)
+    code, out, err = run(
+        "SOL", "--offline", "--json", "--no-regime", "--now", FIXED_NOW_ISO, "--db", str(db)
+    )
+    assert code == 0, err
+    report = json.loads(out)
+    plan = report["plan"]
+    assert plan["status"] == "NO_OPERAR"
+    assert plan["rules"][0]["code"] == "safety_losing_streak"
+    assert "pausa de 4 horas" in plan["rules"][0]["message"]
+    assert plan["headline"].startswith("No operar: perdiste 3 operaciones seguidas")
+    assert report["safety"]["status"] == "rojo"
+    assert plan["day_state"]["trades_today"] == 3
+    assert plan["day_state"]["pnl_today_usd"] == -30.0
+    # Con --db el análisis se guarda aunque los datos sean sintéticos.
+    stored = _state_repo(db).get_analysis(report["analysis_id"])
+    assert stored is not None and stored.symbol == "SOL" and stored.plan_status == "NO_OPERAR"
+    assert stored.safety["status"] == "rojo" and stored.plan["status"] == "NO_OPERAR"
+    text = render_text(report)
+    block = text[text.index(f"━━ {SAFETY_TITLE}") : text.index("━━ Precios")]
+    assert "Estado: ROJO" in block and "BLOQUEA" in block
+    assert f"Análisis guardado con el número {report['analysis_id']}." in text
+
+
+def test_daily_loss_halves_the_risk_from_the_loaded_state(tmp_path):
+    db = tmp_path / "estado.db"
+    r = _state_repo(db)
+    r.add_wallet_event(kind="balance", amount_usd=1000.0, ts=_local(1, 9))
+    r.add_trade(
+        symbol="BTC", side="long", pnl_usd=-60.0, opened_at=_local(12, 8), closed_at=_local(12, 9)
+    )
+    code, out, err = run("SOL", "--offline", "--json", "--now", FIXED_NOW_ISO, "--db", str(db))
+    assert code == 0, err
+    report = json.loads(out)
+    plan = report["plan"]
+    assert report["safety"]["status"] == "ambar"
+    assert plan["risk"]["safety_multiplier"] == 0.5
+    assert plan["risk"]["after_safety_usd"] == pytest.approx(plan["risk"]["after_regime_usd"] / 2)
+    assert any(a["source"] == "safety" for a in plan["adjustments"])
+    line = next(x for x in render_text(report).splitlines() if "Riesgo pedido" in x)
+    assert "× 0,5 = " in line and "(frenos de seguridad)" in line
+    # El saldo anotado se usa para la liquidación "modelo Nexo" (940 USD).
+    assert plan["liquidation"]["wallet"]["equity_usd"] == pytest.approx(940.0)
+
+
+def test_same_coin_open_position_shrinks_the_plan_and_hedge_warns(tmp_path):
+    db = tmp_path / "estado.db"
+    r = _state_repo(db)
+    r.add_open_position(symbol="SOL", side="short", risk_usd=40.0, opened_at=_local(11, 20))
+    r.add_open_position(symbol="SOL", side="long", risk_usd=15.0, opened_at=_local(11, 21))
+    code, out, err = run("SOL", "--offline", "--json", "--now", FIXED_NOW_ISO, "--db", str(db))
+    assert code == 0, err
+    report = json.loads(out)
+    plan = report["plan"]
+    assert plan["status"] == "SHORT"
+    assert plan["risk"]["capped_by_correlation"] is True
+    assert plan["risk"]["after_adjustments_usd"] == pytest.approx(35.0)
+    assert plan["risk"]["max_loss_usd"] <= 35.0 + 1e-9
+    assert any("funciona como cobertura" in w for w in plan["warnings"])
+    assert report["correlation"]["plan_side"] == "short"
+    assert report["correlation"]["exposure"]["short"]["existing_risk_usd"] == 40.0
+    text = render_text(report)
+    corr = text[text.index(f"━━ {CORRELATION_TITLE}") : text.index(f"━━ {PLAN_TITLE}")]
+    assert "Riesgo sumado para el plan (short)" in corr
+    assert "Ya usado: 40,00 USD. Le queda al plan: 35,00 USD." in corr
+    assert "(lo que entra en el tope con tus posiciones correlacionadas)" in text
+
+
+def test_lock_file_means_no_plan(tmp_path):
+    from app.safety.lockfile import write_lock
+
+    db = tmp_path / "estado.db"
+    write_lock(
+        tmp_path / "LOCKED",
+        reason="La billetera del mes cayó 72 % desde su máximo.",
+        triggered_at=FIXED_NOW,
+        report_path=tmp_path / "incidents" / "informe.md",
+    )
+    code, out, err = run("SOL", "--offline", "--json", "--now", FIXED_NOW_ISO, "--db", str(db))
+    assert code == 0, err
+    report = json.loads(out)
+    assert report["plan"] is None and report["locked"] is True
+    assert report["score"] is not None  # el resto del análisis sale igual
+    text = render_text(report)
+    assert LEAKS.search(text) is None
+    assert LOCKED_TITLE in text
+    assert "La billetera del mes cayó 72 % desde su máximo." in text
+    assert f"Revisá el informe y borrá {tmp_path / 'LOCKED'} a mano" in text
+    plan_block = _plan_block(text)
+    assert "No hay plan: la app está bloqueada por el archivo LOCKED" in plan_block
+    assert "NO OPERAR" not in plan_block and "Niveles" not in plan_block
+    assert "Si operás" not in text
+
+
+def test_drawdown_writes_the_lock_once_and_then_no_plan(tmp_path):
+    db = tmp_path / "estado.db"
+    r = _state_repo(db)
+    r.add_wallet_event(kind="balance", amount_usd=300.0, ts=_local(1, 9))
+    for day in (5, 8):
+        r.add_trade(
+            symbol="BTC",
+            side="long",
+            pnl_usd=-110.0,
+            opened_at=_local(day, 10),
+            closed_at=_local(day, 12),
+        )
+    lock = tmp_path / "LOCKED"
+    code, out, err = run("BTC", "--offline", "--json", "--now", FIXED_NOW_ISO, "--db", str(db))
+    assert code == 0, err
+    report = json.loads(out)
+    assert lock.exists() and report["plan"] is None and report["locked"] is True
+    assert report["safety"]["lock_trigger"]["action"] == "locked"
+    reports = list((tmp_path / "incidents").glob("*.md"))
+    assert len(reports) == 1
+    assert "Recién se bloqueó la app" in render_text(report)
+    first = lock.read_text(encoding="utf-8")
+    code, out, err = run("BTC", "--offline", "--json", "--now", FIXED_NOW_ISO, "--db", str(db))
+    assert code == 0, err
+    again = json.loads(out)
+    assert again["safety"]["lock_trigger"] is None and again["plan"] is None
+    assert lock.read_text(encoding="utf-8") == first
+    assert len(list((tmp_path / "incidents").glob("*.md"))) == 1
+
+
+def test_day_overrides_warn_and_say_where_the_numbers_came_from(tmp_path):
+    db = tmp_path / "estado.db"
+    code, out, err = run(
+        "SOL", "--offline", "--json", "--now", FIXED_NOW_ISO, "--db", str(db), "--pnl-today", "-80"
+    )
+    assert code == 0, err
+    report = json.loads(out)
+    assert report["safety"]["day_state_source"] == "manual"
+    assert report["plan"]["day_overrides"] == [
+        {"field": "pnl_today_usd", "value": -80.0, "loaded": 0.0}
+    ]
+    assert any(
+        w.startswith("Números del día puestos a mano para probar: resultado de hoy = -80 USD")
+        for w in report["plan"]["warnings"]
+    )
+    assert report["safety"]["status"] == "verde"  # los frenos siguen mirando lo cargado
+
+
+def test_live_mode_saves_the_analysis_in_the_configured_database(
+    monkeypatch, no_secrets, tracked_clients
+):
+    fake = FakeMarketData()
+    monkeypatch.setattr(analyze_cli, "build_market_data", lambda settings, client, cache: fake)
+    with respx.mock(assert_all_called=False) as router:
+        router.route().mock(return_value=httpx.Response(451))
+        code, out, err = run("BTC", "--json", "--no-regime")
+    assert code == 0, err
+    report = json.loads(out)
+    config = yaml.safe_load(_CONFIG["path"].read_text(encoding="utf-8"))
+    database = Path(config["app"]["database_file"])
+    assert report["safety"]["paths"] == {
+        "kind": "real",
+        "database": str(database),
+        "lock_file": config["app"]["lock_file"],
+        "incident_dir": config["app"]["incident_dir"],
+        "database_display": str(database),
+        "lock_file_display": config["app"]["lock_file"],
+    }
+    stored = Repository.open(database).get_analysis(report["analysis_id"])
+    assert stored is not None and stored.symbol == "BTC"
+
+
+def test_unusable_database_exits_1(tmp_path):
+    bad = tmp_path / "roto.db"
+    bad.write_text("no soy una base", encoding="utf-8")
+    code, out, err = run("BTC", "--offline", "--no-regime", "--db", str(bad))
+    assert code == 1 and out == ""
+    assert "No se pudo abrir la base de tu estado de trading" in err
+
+
+def test_analysis_then_trade_links_automatically(tmp_path):
+    from scripts import trades
+
+    db = tmp_path / "estado.db"
+    code, out, err = run("SOL", "--offline", "--json", "--now", FIXED_NOW_ISO, "--db", str(db))
+    assert code == 0, err
+    analysis_id = json.loads(out)["analysis_id"]
+    t_out, t_err = io.StringIO(), io.StringIO()
+    later = FIXED_NOW + timedelta(hours=2)
+    code = trades.main(
+        ["add", "--symbol", "SOL", "--side", "short", "--pnl", "12,5", "--db", str(db)],
+        out=t_out,
+        err=t_err,
+        clock=lambda: later,
+    )
+    assert code == 0, t_err.getvalue()
+    [stored] = _state_repo(db).list_trades()
+    assert stored.analysis_id == analysis_id and stored.plan_status == "SHORT"
+    assert f"Ligada al análisis #{analysis_id}" in t_out.getvalue()

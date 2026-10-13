@@ -6,7 +6,7 @@ VENV := $(BACKEND)/.venv
 PY := $(VENV)/bin/python
 SYMBOL ?= BTC
 
-.PHONY: help setup setup-backend setup-frontend dev backend frontend test test-backend test-frontend lint format cli train-regime walk-forward clean
+.PHONY: help setup setup-backend setup-frontend dev backend frontend test test-backend test-frontend lint format cli trade trades safety train-regime walk-forward clean
 
 help: ## Muestra esta ayuda
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -50,6 +50,15 @@ format: ## Formatea el backend
 
 cli: ## Datos, régimen, score y plan de una moneda. Ej: make cli SYMBOL=ETH ARGS="--offline"
 	cd $(BACKEND) && .venv/bin/python -m scripts.analyze_cli $(SYMBOL) $(ARGS)
+
+trade: ## Carga tu estado a mano. Ej: make trade ARGS="add --symbol BTC --side long --pnl -32,5"
+	cd $(BACKEND) && .venv/bin/python -m scripts.trades $(ARGS)
+
+trades: ## Lista lo cargado: operaciones, posiciones, billetera y eventos
+	cd $(BACKEND) && .venv/bin/python -m scripts.trades list $(ARGS)
+
+safety: ## Estado de los frenos de seguridad (si la caída del mes llegó al tope, bloquea la app)
+	cd $(BACKEND) && .venv/bin/python -m scripts.trades status $(ARGS)
 
 # Sin SYMBOL (ni en la línea de comandos ni en el entorno) entrena todas las
 # favoritas: el BTC por omisión de arriba no cuenta (origin "file").

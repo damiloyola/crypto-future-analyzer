@@ -23,6 +23,7 @@ from app.storage import (
     StoredAnalysis,
     StoredPosition,
     StoredTrade,
+    StoredVolatilityEvent,
     StoredWalletEvent,
     default_db_path,
     init_db,
@@ -30,9 +31,9 @@ from app.storage import (
     open_db,
     session_scope,
 )
-from app.storage.db import SCHEMA_VERSION
+from app.storage.db import MIGRATIONS, SCHEMA_VERSION
 from app.storage.models import ManualTrade, UTCDateTime, WalletEvent
-from app.storage.repository import MAX_CLOCK_SKEW, MAX_NOTES_LENGTH
+from app.storage.repository import MAX_CLOCK_SKEW, MAX_EVENT_NOTE_LENGTH, MAX_NOTES_LENGTH
 from tests.test_plan import plan_for
 
 NOW = datetime(2026, 10, 13, 15, 0, tzinfo=UTC)
@@ -116,7 +117,13 @@ def test_make_engine_creates_missing_folders(tmp_path: Path):
     init_db(engine)
     assert db_file.is_file()
     tables = {r[0] for r in raw_rows(db_file, "SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"manual_trades", "open_positions", "wallet_events", "analyses"} <= tables
+    assert {
+        "manual_trades",
+        "open_positions",
+        "wallet_events",
+        "high_volatility_events",
+        "analyses",
+    } <= tables
     assert raw_rows(db_file, "PRAGMA user_version") == [(SCHEMA_VERSION,)]
 
 
@@ -144,6 +151,53 @@ def test_init_db_refuses_a_database_from_another_schema_version(tmp_path: Path):
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
     with pytest.raises(RuntimeError, match="otra versión"):
         open_db(db_file)
+
+
+def test_schema_version_2_and_every_old_version_has_a_migration():
+    assert SCHEMA_VERSION == 2
+    assert sorted(MIGRATIONS) == list(range(1, SCHEMA_VERSION))
+
+
+def _make_v1_database(db_file: Path) -> None:
+    """Base como la dejaba la tanda 1 del Hito 5: 4 tablas y ``user_version = 1``."""
+    open_db(db_file).dispose()
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("DROP TABLE high_volatility_events")
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute(
+            "INSERT INTO manual_trades (symbol, side, opened_at, closed_at, pnl_usd, created_at) "
+            "VALUES ('BTC', 'long', '2026-10-13 10:00:00', '2026-10-13 11:00:00', -12.5, "
+            "'2026-10-13 11:00:00')"
+        )
+
+
+def test_a_v1_database_is_migrated_without_losing_data(tmp_path: Path, clock: FakeClock):
+    db_file = tmp_path / "v1.db"
+    _make_v1_database(db_file)
+    tables = {r[0] for r in raw_rows(db_file, "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "high_volatility_events" not in tables
+
+    repo = Repository.open(db_file, clock=clock)
+    assert raw_rows(db_file, "PRAGMA user_version") == [(2,)]
+    (trade,) = repo.list_trades()
+    assert (trade.symbol, trade.pnl_usd) == ("BTC", -12.5)
+    assert trade.closed_at == datetime(2026, 10, 13, 11, 0, tzinfo=UTC)
+    event = repo.add_volatility_event("CPI", until=NOW + timedelta(hours=1))
+    assert repo.active_volatility_events() == [event]
+    # Abrirla de nuevo no vuelve a migrar ni toca nada.
+    again = Repository.open(db_file, clock=clock)
+    assert len(again.list_trades()) == 1
+    assert again.list_volatility_events() == [event]
+
+
+def test_a_v1_database_that_already_has_the_new_table_is_migrated(tmp_path: Path):
+    """Migración idempotente: si la tabla ya existe (corte a mitad), no falla."""
+    db_file = tmp_path / "v1b.db"
+    open_db(db_file).dispose()
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("PRAGMA user_version = 1")
+    open_db(db_file).dispose()
+    assert raw_rows(db_file, "PRAGMA user_version") == [(SCHEMA_VERSION,)]
 
 
 def test_init_db_refuses_a_foreign_sqlite_file(tmp_path: Path):
@@ -604,6 +658,129 @@ def test_wallet_event_validation_errors(repo: Repository, kind, amount, message)
     with pytest.raises(ValueError, match=message):
         repo.add_wallet_event(kind=kind, amount_usd=amount)
     assert repo.list_wallet_events() == []
+
+
+# --- eventos de alta volatilidad -----------------------------------------------------
+
+
+def test_volatility_event_round_trip(repo: Repository, tmp_path: Path):
+    until = datetime(2026, 10, 13, 14, 30, tzinfo=BUENOS_AIRES)  # 17:30 UTC
+    event = repo.add_volatility_event("  Dato de inflación de EE.UU.  ", until=until)
+    assert isinstance(event, StoredVolatilityEvent)
+    assert event.note == "Dato de inflación de EE.UU."
+    assert event.starts_at == NOW and event.created_at == NOW  # por defecto, ahora
+    assert event.until == datetime(2026, 10, 13, 17, 30, tzinfo=UTC)
+    assert event.until.tzinfo is UTC
+    assert repo.get_volatility_event(event.id) == event
+    assert repo.get_volatility_event(999) is None
+    rows = raw_rows(
+        tmp_path / "test.db", "SELECT starts_at, until, note FROM high_volatility_events"
+    )
+    assert rows == [("2026-10-13 15:00:00.000000", "2026-10-13 17:30:00.000000", event.note)]
+    d = event.to_dict()
+    assert json.loads(json.dumps(d, allow_nan=False)) == d
+    assert d == {
+        "id": event.id,
+        "created_at": "2026-10-13T15:00:00+00:00",
+        "starts_at": "2026-10-13T15:00:00+00:00",
+        "until": "2026-10-13T17:30:00+00:00",
+        "note": "Dato de inflación de EE.UU.",
+    }
+
+
+def test_volatility_event_is_active_between_start_and_end(repo: Repository):
+    event = repo.add_volatility_event(
+        "Fed", starts_at=NOW + timedelta(hours=1), until=NOW + timedelta(hours=3)
+    )
+    assert not event.is_active(NOW)
+    assert event.is_active(NOW + timedelta(hours=1))  # el inicio cuenta
+    assert event.is_active(NOW + timedelta(hours=2, minutes=59))
+    assert not event.is_active(NOW + timedelta(hours=3))  # a la hora de fin ya no bloquea
+    with pytest.raises(ValueError, match="zona horaria"):
+        event.is_active(datetime(2026, 10, 13, 16, 0))
+
+
+def test_volatility_event_can_start_in_the_past(repo: Repository):
+    event = repo.add_volatility_event(
+        "Ya empezó", starts_at=ago(minutes=30), until=NOW + timedelta(minutes=30)
+    )
+    assert event.is_active(NOW)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"note": "", "until": NOW + timedelta(hours=1)}, "La nota del evento no puede estar"),
+        ({"note": "   ", "until": NOW + timedelta(hours=1)}, "La nota del evento no puede estar"),
+        ({"note": None, "until": NOW + timedelta(hours=1)}, "La nota del evento no puede estar"),
+        (
+            {"note": "x" * (MAX_EVENT_NOTE_LENGTH + 1), "until": NOW + timedelta(hours=1)},
+            "demasiado largo",
+        ),
+        ({"note": "CPI", "until": NOW}, "ya pasó"),
+        ({"note": "CPI", "until": ago(minutes=1)}, "ya pasó"),
+        (
+            {
+                "note": "CPI",
+                "starts_at": NOW + timedelta(hours=2),
+                "until": NOW + timedelta(hours=1),
+            },
+            "posterior al inicio",
+        ),
+        (
+            {
+                "note": "CPI",
+                "starts_at": NOW + timedelta(hours=1),
+                "until": NOW + timedelta(hours=1),
+            },
+            "posterior al inicio",
+        ),
+        ({"note": "CPI", "until": datetime(2026, 10, 13, 18, 0)}, "no tiene zona horaria"),
+        (
+            {
+                "note": "CPI",
+                "starts_at": datetime(2026, 10, 13, 15, 0),
+                "until": NOW + timedelta(1),
+            },
+            "no tiene zona horaria",
+        ),
+        ({"note": "CPI", "until": "mañana"}, "tiene que ser una fecha"),
+    ],
+)
+def test_volatility_event_validation_errors(repo: Repository, kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        repo.add_volatility_event(**kwargs)
+    assert repo.list_volatility_events() == []
+
+
+def test_list_and_active_volatility_events(repo: Repository, clock: FakeClock):
+    later = repo.add_volatility_event(
+        "Más tarde", starts_at=NOW + timedelta(hours=5), until=NOW + timedelta(hours=6)
+    )
+    now_ev = repo.add_volatility_event("Ahora", until=NOW + timedelta(hours=1))
+    short = repo.add_volatility_event("Corto", until=NOW + timedelta(minutes=10))
+    # Ordenados por inicio (y por número en el mismo inicio).
+    assert repo.list_volatility_events() == [now_ev, short, later]
+    assert repo.active_volatility_events() == [now_ev, short]
+    assert repo.active_volatility_events(NOW + timedelta(minutes=10)) == [now_ev]
+    assert repo.active_volatility_events(NOW + timedelta(hours=5)) == [later]
+    assert repo.list_volatility_events(ending_after=NOW + timedelta(minutes=10)) == [now_ev, later]
+    assert repo.list_volatility_events(ending_after=NOW + timedelta(hours=6)) == []
+    # Se apagan solos: con el reloj adelantado no hay activos, pero siguen guardados.
+    clock.advance(hours=7)
+    assert repo.active_volatility_events() == []
+    assert len(repo.list_volatility_events()) == 3
+    with pytest.raises(ValueError, match="zona horaria"):
+        repo.active_volatility_events(datetime(2026, 10, 13, 15, 0))
+
+
+def test_delete_volatility_event(repo: Repository):
+    event = repo.add_volatility_event("CPI", until=NOW + timedelta(hours=1))
+    assert repo.delete_volatility_event(event.id) is True
+    assert repo.delete_volatility_event(event.id) is False
+    assert repo.active_volatility_events() == []
+    with pytest.raises(ValueError, match="número entero positivo"):
+        repo.delete_volatility_event(0)
 
 
 # --- análisis -------------------------------------------------------------------------
