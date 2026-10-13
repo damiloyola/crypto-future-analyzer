@@ -343,6 +343,10 @@ trade_plan:
   # - el riesgo se achica a lo que queda del límite de pérdida del día; si
   #   queda debajo del mínimo operable, "No operar";
   cap_risk_to_daily_remaining: true
+  # - (Hito 5) "lo que queda del día" también descuenta el riesgo de las
+  #   posiciones abiertas: aunque salten todos los stops, el día no pasa su
+  #   límite de pérdida;
+  daily_cap_includes_open_risk: true
   # - si el precio de Nexo pegado a mano difiere de Binance más que
   #   exchanges.nexo.manual_price_max_diff_pct, "No operar" hasta corregirlo;
   block_if_price_suspect: true
@@ -472,16 +476,35 @@ circuit_breakers:
     cooldown_hours: 4
     # Decisión del usuario: terminada la pausa, la cuenta arranca de cero.
     reset_after_cooldown: true
+    # Decisión del usuario: si perdés otra vez durante la pausa, la pausa se
+    # estira cooldown_hours desde esa pérdida.
+    extend_cooldown_on_loss: true
   weekly_loss_reduce:
     pct_of_monthly_wallet: 60  # pérdida de la semana >= 60 % de la billetera mensual
     risk_multiplier: 0.5       # hasta fin de semana
   monthly_drawdown_lock:
     pct_from_peak: 70          # billetera del mes cae >= 70 % desde su máximo: LOCK
+    # Decisiones del usuario (Hito 5):
+    # - un retiro baja el máximo en la misma proporción que el saldo: sacar
+    #   plata nunca cambia el % de caída ("subtract" = baja lo retirado;
+    #   "none" = el retiro cuenta como caída);
+    withdrawal_peak: "proportional"
+    # - un depósito sube el máximo en lo mismo: la pérdida previa sigue
+    #   contando y no se puede esquivar el bloqueo depositando;
+    deposit_raises_peak: true
+    # - si el usuario borra el LOCKED, la caída se vuelve a medir desde el
+    #   saldo del momento del bloqueo (como un mes nuevo): solo se vuelve a
+    #   bloquear si cae otra vez el % del tope desde ahí.
+    restart_after_unlock: true
   week_starts_on: "monday"
   # Decisiones del usuario (Hito 5):
   # - la pérdida del día y de la semana es el NETO (ganancias y pérdidas
   #   cerradas en ese período, comisiones incluidas); "gross" = solo pérdidas;
   loss_basis: "net"
+  # - una vez que la pérdida del día o de la semana llegó a un umbral, el freno
+  #   sigue hasta que termina el período (00:00 o el lunes), aunque después una
+  #   ganancia mejore el neto;
+  latch_until_period_end: true
   # - el mes de la billetera es el mes calendario (el día 1 el máximo vuelve a
   #   ser el saldo de ese momento; los depósitos lo suben);
   month_starts: "calendar"

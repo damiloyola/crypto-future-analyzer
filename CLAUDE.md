@@ -98,6 +98,18 @@ El frontend solo muestra lo que devuelve la API; no calcula riesgo.
   los depósitos lo suben); con una posición abierta correlacionada en la misma
   dirección, el plan nuevo se **achica** a lo que entra en 1,5 × riesgo
   (`correlation.cap_new_risk_to_limit`), y si queda debajo del mínimo, "No operar".
+- **Frenos, segunda ronda (Hito 5):** un freno del día/semana que saltó sigue
+  hasta que termina el período aunque una ganancia mejore el neto
+  (`circuit_breakers.latch_until_period_end`); una pérdida durante la pausa la
+  estira 4 h desde esa pérdida (`losing_streak.extend_cooldown_on_loss`); en el
+  freno del mes, un **retiro** baja el máximo en la misma proporción que el
+  saldo (el % de caída no cambia, `monthly_drawdown_lock.withdrawal_peak:
+  proportional`), un **depósito** sube el máximo en lo mismo (la pérdida previa
+  sigue contando, `deposit_raises_peak`), y si el usuario borra el LOCKED la
+  caída se vuelve a medir desde el saldo del momento del bloqueo, como un mes
+  nuevo (`restart_after_unlock`); "lo que queda del límite del día" también
+  descuenta el riesgo de las posiciones abiertas
+  (`trade_plan.daily_cap_includes_open_risk`).
 - **Evento de alta volatilidad (Hito 5):** se guarda en la base con nota y
   hora de fin; bloquea todos los planes hasta esa hora y después se apaga solo.
   Una posición abierta en la misma moneda y dirección contraria es cobertura

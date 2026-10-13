@@ -359,6 +359,7 @@ class TradePlanConfig(_Strict):
     fees_included_in_risk: bool = True
     alt_entry_min_distance_atr: float = Field(1.0, ge=0)
     cap_risk_to_daily_remaining: bool = True
+    daily_cap_includes_open_risk: bool = True
     block_if_price_suspect: bool = True
     block_if_daily_range_missing: bool = True
     liquidation: PlanLiquidationConfig
@@ -477,6 +478,8 @@ class LosingStreak(_Strict):
     consecutive_losses: int = Field(ge=1)
     cooldown_hours: float = Field(gt=0)
     reset_after_cooldown: bool = True
+    # Una pérdida durante la pausa la estira: vuelve a contar desde esa pérdida.
+    extend_cooldown_on_loss: bool = True
 
 
 class WeeklyLossReduce(ReduceBreaker):
@@ -485,6 +488,16 @@ class WeeklyLossReduce(ReduceBreaker):
 
 class MonthlyDrawdownLock(_Strict):
     pct_from_peak: float = Field(gt=0, le=100)
+    # Retiro: "proportional" = el máximo baja en la misma proporción que el saldo
+    # (el % de caída no cambia); "subtract" = el máximo baja lo retirado;
+    # "none" = el máximo no cambia (el retiro cuenta como caída).
+    withdrawal_peak: Literal["proportional", "subtract", "none"] = "proportional"
+    # Depósito: el máximo sube en lo mismo que se depositó (la pérdida previa
+    # sigue contando). false = el máximo solo sube si el saldo lo pasa.
+    deposit_raises_peak: bool = True
+    # Después de que el usuario borra el LOCKED, la caída se mide desde el saldo
+    # del momento del bloqueo (como un mes nuevo).
+    restart_after_unlock: bool = True
 
 
 class CircuitBreakersConfig(_Strict):
@@ -497,6 +510,9 @@ class CircuitBreakersConfig(_Strict):
         "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
     ] = "monday"
     loss_basis: Literal["net", "gross"] = "net"
+    # Una vez que la pérdida del día/semana llegó a un umbral, el freno sigue
+    # hasta que termina el período aunque después una ganancia mejore el neto.
+    latch_until_period_end: bool = True
     month_starts: Literal["calendar"] = "calendar"
     link_analysis_within_hours: float = Field(24, gt=0)
 
