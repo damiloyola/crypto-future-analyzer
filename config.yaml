@@ -28,6 +28,11 @@ app:
   lock_file: "data/LOCKED"  # si existe, la app NO genera planes (ver safety)
   incident_dir: "data/incidents"
   database_file: "data/analyzer.db"  # operaciones, posiciones, billetera y análisis (SQLite)
+  # Controles al cargar datos a mano (make trade): si algo parece un error de
+  # tipeo, la consola pide confirmar con --yes.
+  manual_input:
+    confirm_pnl_over_risk_multiple: 3   # resultado > saldo o > 3 × riesgo por operación
+    confirm_event_longer_than_days: 7   # evento de volatilidad de más de 7 días
 
 symbols:
   # Monedas que se muestran como favoritas en el selector.

@@ -41,6 +41,17 @@ class _Strict(BaseModel):
 # --- app / símbolos / exchanges ----------------------------------------------
 
 
+class ManualInputConfig(_Strict):
+    """Controles al cargar datos a mano (``scripts/trades.py``): piden ``--yes``."""
+
+    # Un resultado más grande (en valor absoluto) que el saldo o que esta
+    # cantidad de veces el riesgo por operación pide confirmación (¿error de tipeo?).
+    confirm_pnl_over_risk_multiple: float = Field(3.0, gt=0)
+    # Un evento de alta volatilidad que dura más que esto pide confirmación
+    # (¿año mal tipeado?).
+    confirm_event_longer_than_days: float = Field(7.0, gt=0)
+
+
 class AppConfig(_Strict):
     user_timezone: str
     market_timezone: str = "UTC"
@@ -51,6 +62,7 @@ class AppConfig(_Strict):
     lock_file: str = "data/LOCKED"
     incident_dir: str = "data/incidents"
     database_file: str = "data/analyzer.db"
+    manual_input: ManualInputConfig = Field(default_factory=lambda: ManualInputConfig())
 
 
 class SymbolsConfig(_Strict):
