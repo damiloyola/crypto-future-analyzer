@@ -45,6 +45,12 @@ Observaciones (cada una con su ``code``, en el orden en que salen)
     - ``no_analysis_context``: operaciones sin análisis de la app asociado (no
       se sabe qué decían el régimen, el score ni el plan).
 
+    Un análisis de prueba (``analysis_test_marks``: hecho con datos
+    sintéticos, o con números del día puestos a mano para probar) se marca en
+    la tabla y no cuenta para "el plan decía No operar", "contra el plan" ni,
+    si los datos eran sintéticos, "contra el régimen": no dice nada del mercado
+    real.
+
     Son hechos calculados por el código con los datos cargados, no opiniones
     del LLM. Si no hay ninguno, el informe lo dice y pide revisar igual.
 
@@ -66,6 +72,11 @@ Qué hay acá (todo puro salvo ``write_incident_report`` y ``create_new_file``)
       fechas.
     - ``create_new_file(path, text)``: escritura atómica que nunca pisa un
       archivo existente (también la usa ``safety.lockfile``).
+    - ``analysis_test_marks(inputs)`` / ``fmt_analysis_marks(marks)``: si un
+      análisis guardado fue de prueba y cómo se marca ("(datos sintéticos)").
+    - ``shown_drawdown_pct(pct)``: la caída que se muestra, recortada a
+      ``MAX_SHOWN_DRAWDOWN_PCT`` (más de 100 % solo pasa si el saldo calculado
+      dio negativo).
 
 Decisiones
     - **Tolerante con los datos**: el informe se escribe en el peor momento y
@@ -128,6 +139,16 @@ OBS_NO_ANALYSIS_CONTEXT = "no_analysis_context"
 OBS_TOO_MANY_TRADES = "too_many_trades"
 OBS_DAILY_LOSS_LIMIT = "daily_loss_limit"
 OBS_DEPOSIT_AFTER_LOSS = "deposit_after_loss"
+
+# Marcas de un análisis guardado que no sirve como contexto real
+# (``analysis_test_marks``).
+ANALYSIS_MARK_SYNTHETIC = "datos sintéticos"
+ANALYSIS_MARK_TEST_NUMBERS = "números de prueba"
+
+# Tope de la caída de la billetera que se muestra: más de 100 % solo pasa si el
+# saldo calculado da negativo (casi siempre un dato mal cargado, que ya tiene
+# su aviso). Es dibujo, no regla: el freno compara el número sin recortar.
+MAX_SHOWN_DRAWDOWN_PCT = 100.0
 
 FILE_PREFIX = "incidente_"
 FILE_SUFFIX = ".md"
@@ -384,6 +405,35 @@ def fmt_regime(category: Any, name: Any = None, confidence: Any = None) -> str:
     return f"{label} ({fmt_percent(pct, 0)})"
 
 
+def shown_drawdown_pct(value_pct: float) -> float:
+    """La caída que se muestra: ``388.2`` → ``100.0`` (ver ``MAX_SHOWN_DRAWDOWN_PCT``)."""
+    return min(float(value_pct), MAX_SHOWN_DRAWDOWN_PCT)
+
+
+def analysis_test_marks(inputs: Any) -> tuple[str, ...]:
+    """Por qué un análisis guardado no es "real" (``()`` si lo es).
+
+    ``inputs`` es el dict ``inputs`` del análisis (``StoredAnalysis.inputs``,
+    lo arma ``scripts.analyze_cli``): ``offline`` verdadero → ``"datos
+    sintéticos"``; ``day_overrides`` no vacío (``--pnl-today`` /
+    ``--trades-today``) → ``"números de prueba"``.
+    """
+    if not isinstance(inputs, Mapping):
+        return ()
+    marks: list[str] = []
+    if inputs.get("offline") is True:
+        marks.append(ANALYSIS_MARK_SYNTHETIC)
+    if inputs.get("day_overrides"):
+        marks.append(ANALYSIS_MARK_TEST_NUMBERS)
+    return tuple(marks)
+
+
+def fmt_analysis_marks(marks: Iterable[str]) -> str:
+    """``("datos sintéticos",)`` → ``"(datos sintéticos)"``; sin marcas → ``""``."""
+    items = [m for m in marks if m]
+    return f"({' y '.join(items)})" if items else ""
+
+
 def md_cell(value: Any) -> str:
     """Texto seguro para una celda de tabla markdown (sin ``|`` sueltos ni saltos de línea)."""
     text = _text(value)
@@ -406,6 +456,9 @@ class IncidentTrigger:
     - ``drawdown_pct``: cuánto cayó desde el máximo (0-100). Si no viene y hay
       máximo y saldo, se calcula.
     - ``threshold_pct``: el tope de caída (``pct_from_peak``).
+    - ``measured_since``: si la caída se midió desde un bloqueo anterior que el
+      usuario desbloqueó a mano (no desde el inicio del mes), la hora de ese
+      bloqueo; el máximo y el saldo son los medidos desde ahí.
     """
 
     code: str
@@ -414,6 +467,7 @@ class IncidentTrigger:
     current_balance_usd: float | None = None
     drawdown_pct: float | None = None
     threshold_pct: float | None = None
+    measured_since: datetime | None = None
 
     def __post_init__(self) -> None:
         peak = self.wallet_peak_usd
@@ -433,10 +487,12 @@ class IncidentTrigger:
             current_balance_usd=_finite(_field(value, "current_balance_usd")),
             drawdown_pct=_finite(_field(value, "drawdown_pct")),
             threshold_pct=_finite(_field(value, "threshold_pct")),
+            measured_since=to_utc(_field(value, "measured_since")),
         )
 
     def to_dict(self) -> dict[str, Any]:
         """Dict listo para JSON."""
+        since = self.measured_since
         return json_safe(
             {
                 "code": self.code,
@@ -445,6 +501,7 @@ class IncidentTrigger:
                 "current_balance_usd": self.current_balance_usd,
                 "drawdown_pct": self.drawdown_pct,
                 "threshold_pct": self.threshold_pct,
+                "measured_since": None if since is None else since.isoformat(),
             }
         )
 
@@ -471,6 +528,7 @@ class IncidentTrade:
     plan_status: str | None = None
     notes: str | None = None
     analysis_id: int | None = None
+    analysis_marks: tuple[str, ...] = ()
 
     @classmethod
     def from_value(cls, value: Any) -> IncidentTrade:
@@ -492,6 +550,9 @@ class IncidentTrade:
             plan_status=normalize_plan_status(_field(value, "plan_status")),
             notes=_text(_field(value, "notes")),
             analysis_id=_int_or_none(_field(value, "analysis_id")),
+            analysis_marks=tuple(
+                str(m) for m in (_field(value, "analysis_marks") or ()) if _text(m) is not None
+            ),
         )
 
     @property
@@ -514,20 +575,22 @@ class IncidentTrade:
 
     @property
     def traded_on_no_trade(self) -> bool:
-        """El plan decía "No operar" y se operó igual."""
-        return self.plan_status == STATUS_NO_TRADE
+        """El plan decía "No operar" y se operó igual (si el análisis no fue de prueba)."""
+        return not self.analysis_marks and self.plan_status == STATUS_NO_TRADE
 
     @property
     def against_plan(self) -> bool:
-        """El plan decía una dirección y se operó la contraria."""
+        """El plan decía una dirección y se operó la contraria (si el análisis no fue de prueba)."""
+        if self.analysis_marks:
+            return False
         return (self.plan_status == STATUS_LONG and self.side == "short") or (
             self.plan_status == STATUS_SHORT and self.side == "long"
         )
 
     @property
     def against_regime(self) -> bool:
-        """Long en régimen bajista/crash o short en alcista/euforia."""
-        if self.regime_category is None:
+        """Long en régimen bajista/crash o short en alcista/euforia (con datos reales)."""
+        if self.regime_category is None or ANALYSIS_MARK_SYNTHETIC in self.analysis_marks:
             return False
         return (self.side == "long" and self.regime_category in _AGAINST_LONG) or (
             self.side == "short" and self.regime_category in _AGAINST_SHORT
@@ -581,6 +644,7 @@ class IncidentTrade:
                 "plan_status": self.plan_status,
                 "notes": self.notes,
                 "analysis_id": self.analysis_id,
+                "analysis_marks": list(self.analysis_marks),
                 "flags": list(self.flags()),
             }
         )
@@ -1163,10 +1227,18 @@ def _summary_lines(
 ) -> list[str]:
     out: list[str] = []
     peak, balance, dd = trigger.wallet_peak_usd, trigger.current_balance_usd, trigger.drawdown_pct
+    if dd is not None:
+        dd = shown_drawdown_pct(dd)
+    since = to_utc(trigger.measured_since)
+    who = (
+        "La billetera del mes"
+        if since is None
+        else f"Desde el bloqueo del {fmt_datetime(since, tz)} (que se desbloqueó a mano), la "
+        "billetera"
+    )
     if peak is not None and balance is not None:
         line = (
-            f"- La billetera del mes llegó a un máximo de **{fmt_usd(peak)}** y ahora tiene "
-            f"**{fmt_usd(balance)}**"
+            f"- {who} llegó a un máximo de **{fmt_usd(peak)}** y ahora tiene **{fmt_usd(balance)}**"
         )
         if dd is not None:
             if trigger.threshold_pct is not None:
@@ -1179,7 +1251,7 @@ def _summary_lines(
                 line += f": cayó **{fmt_percent(dd)}** desde ese máximo"
         out.append(line + ".")
     elif dd is not None:
-        out.append(f"- La billetera del mes cayó **{fmt_percent(dd)}** desde su máximo.")
+        out.append(f"- {who} cayó **{fmt_percent(dd)}** desde su máximo.")
 
     if summary.count == 0:
         out.append("- No hay operaciones cargadas en el período.")
@@ -1246,6 +1318,15 @@ def _summary_lines(
         tail = f" ({', '.join(bits)})" if bits else ""
         out.append(f"- Perfil de riesgo: **{name}**{tail}.")
     return out
+
+
+def _regime_cell(t: IncidentTrade) -> str:
+    """Régimen de la tabla, con la marca si el análisis fue de prueba."""
+    regime = fmt_regime(t.regime_category, t.regime_name, t.regime_confidence)
+    marks = fmt_analysis_marks(t.analysis_marks)
+    if not marks:
+        return regime
+    return marks if regime == DASH else f"{regime} {marks}"
 
 
 def build_incident_report(
@@ -1367,7 +1448,7 @@ def build_incident_report(
                         md_cell(fmt_side(t.side)),
                         md_cell(fmt_pnl(t.pnl_usd)),
                         md_cell(risk_txt),
-                        md_cell(fmt_regime(t.regime_category, t.regime_name, t.regime_confidence)),
+                        md_cell(_regime_cell(t)),
                         md_cell(score_txt),
                         md_cell(fmt_plan_status(t.plan_status)),
                         md_cell(flags),
@@ -1383,6 +1464,13 @@ def build_incident_report(
             "favor de subir, negativo = a favor de bajar). El porcentaje del régimen es qué "
             "tan seguro estaba el detector."
         )
+        if any(t.analysis_marks for _, t in numbered):
+            md.append("")
+            md.append(
+                "**(datos sintéticos)** = el análisis ligado se hizo con datos inventados para "
+                "probar la app; **(números de prueba)** = el plan usó números del día puestos a "
+                "mano para probar. Ese régimen, score y plan no dicen nada del mercado real."
+            )
         md.append("")
         with_notes = [(n, t) for n, t in numbered if t.notes]
         if with_notes:
@@ -1468,7 +1556,14 @@ def build_incident_report(
     md.append(f"- Disparador: `{trig.code}`")
     md.append(f"- Hora del disparo (UTC): {when.isoformat()}")
     if trig.drawdown_pct is not None:
-        md.append(f"- Caída desde el máximo: {fmt_num(trig.drawdown_pct, 4)} %")
+        shown = shown_drawdown_pct(trig.drawdown_pct)
+        line = f"- Caída desde el máximo: {fmt_num(shown, 4)} %"
+        if shown < trig.drawdown_pct:
+            line += (
+                f" (la cuenta dio {fmt_num(trig.drawdown_pct, 2)} % porque el saldo calculado "
+                "quedó negativo: revisá lo cargado)"
+            )
+        md.append(line)
     if trig.threshold_pct is not None:
         md.append(f"- Tope de caída: {fmt_num(trig.threshold_pct, 4)} %")
     if settings_info:
@@ -1590,10 +1685,13 @@ def write_incident_report(
 
 
 __all__ = [
+    "ANALYSIS_MARK_SYNTHETIC",
+    "ANALYSIS_MARK_TEST_NUMBERS",
     "DEFAULT_LOSING_STREAK",
     "FILE_PREFIX",
     "FILE_SUFFIX",
     "MAX_NAME_ATTEMPTS",
+    "MAX_SHOWN_DRAWDOWN_PCT",
     "OBS_AGAINST_PLAN",
     "OBS_AGAINST_REGIME",
     "OBS_DAILY_LOSS_LIMIT",
@@ -1611,9 +1709,11 @@ __all__ = [
     "IncidentWalletEvent",
     "Observation",
     "TradeSummary",
+    "analysis_test_marks",
     "build_incident_report",
     "create_new_file",
     "find_observations",
+    "fmt_analysis_marks",
     "fmt_date",
     "fmt_datetime",
     "fmt_long_datetime",
@@ -1628,6 +1728,7 @@ __all__ = [
     "normalize_plan_status",
     "normalize_side",
     "resolve_timezone",
+    "shown_drawdown_pct",
     "sorted_trades",
     "summarize_trades",
     "timezone_label",

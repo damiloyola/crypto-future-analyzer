@@ -29,13 +29,20 @@ Pasos de ``build_trade_plan`` (todos los números salen de ``config.yaml``)
    régimen y, si vino ``safety``, los de los frenos; ver "Capa de seguridad"
    abajo), el riesgo se achica a lo que queda del límite, ``max_daily_loss_usd - max(0,
    -pnl_today_usd)``, con su motivo ("Riesgo bajado de 50 a 20 USD: hoy ya
-   perdiste 80 de tus 100 USD de límite..."). Si así queda debajo de
+   perdiste 80 de tus 100 USD de límite..."). Con
+   ``daily_cap_includes_open_risk`` (decisión del usuario, Hito 5) también se
+   descuenta ``open_risk_usd``, lo que se pierde si saltan los stops de todas
+   las posiciones abiertas, y el motivo nombra las dos partes ("hoy ya perdiste
+   40 USD y tenés 50 USD en juego en posiciones abiertas...: quedan 10 USD...").
+   Si así queda debajo de
    ``min_operable_risk_usd``, "No operar" (si el régimen ya lo había dejado
    debajo, el motivo que se muestra es el del día: aunque el régimen se aclare,
    no se puede operar hasta mañana). Si el límite de pérdida ya se alcanzó, lo
    bloquea la regla de límites del día (y el riesgo no se toca: los niveles
    quedan como referencia); si esa regla falla solo por la cantidad de
-   operaciones, el riesgo se achica igual.
+   operaciones, el riesgo se achica igual. Si lo cerrado no llegó al límite
+   pero con las posiciones abiertas no queda nada, bloquea la regla
+   ``daily_remaining`` (y el riesgo tampoco se toca).
 3. **Stop por estructura** (``stops.structural_stop``): el soporte (long) o la
    resistencia (short) más cercano de ``trade_plan.stop_timeframes`` ∓
    ``stop_atr_buffer`` × ATR del timeframe de entrada, salteando los que están
@@ -79,10 +86,13 @@ Pasos de ``build_trade_plan`` (todos los números salen de ``config.yaml``)
    no tocó el TP1 ni el stop, se cierra (si no hay TP1, o queda más lejos que el
    TP2, se mira el TP2; si no hay ninguno de los dos, no hay stop por tiempo).
 10. **Reglas**: se evalúan TODAS y se guardan con ``ok`` (no se corta en la
-    primera): frenos de seguridad que bloquean (solo si vino ``safety``; el
-    resumen sin bloqueos va al final), precio de Nexo
+    primera): frenos de seguridad que bloquean, incluido el evento de alta
+    volatilidad guardado (solo si vino ``safety``; el resumen sin bloqueos va
+    al final), precio de Nexo
     (solo si se comparó con el de referencia), dirección, régimen, score
-    mínimo, 4h contra 1h, límites del día, evento de alta volatilidad, riesgo
+    mínimo, 4h contra 1h, límites del día, lo que queda del día con las
+    posiciones abiertas (solo si no queda nada), evento de alta volatilidad
+    marcado a mano, riesgo
     combinado con posiciones correlacionadas (solo si vino ``correlation``),
     stop, R:R a TP2 con comisiones, TP2 dentro del rango del
     día, apalancamiento, liquidación y riesgo mínimo operable (este último
@@ -146,10 +156,21 @@ objetos por "duck typing".
     la lista de reglas y en el titular: la capa de seguridad tiene la última
     palabra. Código ``"safety_<freno>"`` (por ejemplo
     ``"safety_losing_streak"``). El evento de alta volatilidad guardado en la
-    base usa la regla de siempre (``high_volatility_event``) con su hora de
-    fin, y el límite de pérdida del día no se repite si ya lo dice la regla de
-    límites del día. Sin bloqueos, una regla ``"safety"`` que se cumple resume
-    el veredicto al final de la lista.
+    base va con los otros vetos, primero, pero con el código de la regla de
+    siempre (``high_volatility_event``) y su hora de fin; el límite de pérdida
+    del día no se repite si ya lo dice la regla de límites del día. Sin
+    bloqueos, una regla ``"safety"`` que se cumple resume el veredicto al final
+    de la lista.
+
+- ``open_risk_usd``: lo que se pierde si saltan los stops de todas las
+  posiciones abiertas (``state.open_risk_usd``); ver el tope por el límite del
+  día en el paso 2. El JSON lo trae en ``risk`` y en ``day_state``.
+- ``wallet_balance_usd`` / ``wallet_balance_assumed``: el saldo de la billetera
+  de futuros que muestran los frenos (anotado o supuesto). Con 0 o menos, la
+  regla ``wallet_balance`` da "No operar" (no hay plata para el margen); el
+  riesgo no se toca y los niveles quedan como referencia. Con saldo positivo,
+  quien llama lo pasa también como tope de margen (``available_margin_usd``)
+  y para la liquidación "modelo Nexo" (``wallet_equity_usd``).
 
 - ``correlation``: la exposición por dirección (``CorrelationExposure``, o el
   ``Exposure`` de ``safety.correlation``), una para ``"long"`` y otra para
@@ -164,10 +185,14 @@ objetos por "duck typing".
     plan nuevo se achica a lo que entra, con un ajuste que nombra las
     posiciones (``SOURCE_CORRELATION``); si queda debajo del mínimo operable,
     "No operar". Sin esa opción, la regla ``"correlation"`` falla. El tope se
-    aplica después del límite del día.
+    aplica después del límite del día. Una posición que se cuenta sin datos de
+    correlación (``"unknown_correlation"``: no hay matriz o pocas velas en
+    común) no se describe como "se mueve junto con": el texto dice que no hay
+    datos y que se cuenta por las dudas.
   - una posición abierta en la **misma moneda y dirección contraria** es
     cobertura: no suma riesgo, pero el plan avisa que pueden saltar los dos
-    stops (decisión del usuario).
+    stops (decisión del usuario). Otra moneda en dirección contraria no suma
+    riesgo y no se llama cobertura.
 
 Si varios pasos dejan el riesgo debajo del mínimo operable, el motivo que se
 muestra es el del último (régimen → frenos → límite del día → correlación): es
@@ -192,7 +217,12 @@ from app.risk.fees import (
     net_rr,
     trade_fees_usd,
 )
-from app.risk.position import LIMIT_LEVERAGE, PositionFit, fit_position
+from app.risk.position import (
+    LIMIT_AVAILABLE_MARGIN,
+    LIMIT_LEVERAGE,
+    PositionFit,
+    fit_position,
+)
 from app.risk.regime_adjustments import (
     CATEGORY_LABELS,
     REGIME_BLOCKED,
@@ -256,6 +286,12 @@ TP2_DAILY_RANGE = "tp2_daily_range"
 
 # Código del ajuste por el límite de pérdida del día.
 DAILY_LOSS_CAP = "daily_loss_cap"
+# Regla que bloquea cuando no queda nada del límite de pérdida del día por el
+# riesgo de las posiciones abiertas (``trade_plan.daily_cap_includes_open_risk``).
+DAILY_REMAINING_RULE = "daily_remaining"
+# Regla que bloquea cuando el saldo de la billetera (anotado o supuesto) es 0 o
+# negativo: no hay plata para el margen (``PlanInputs.wallet_balance_usd``).
+WALLET_BALANCE_RULE = "wallet_balance"
 
 # Capa de seguridad (Hito 5). Regla que resume el veredicto cuando no bloquea y
 # prefijo de las reglas de cada freno que bloquea ("safety_losing_streak", ...).
@@ -265,9 +301,12 @@ SAFETY_RULE_PREFIX = "safety_"
 CORRELATION_RULE = "correlation"
 CORRELATION_CAP = "correlation_cap"
 
-# Motivo de ``safety.correlation`` para una posición en dirección contraria
-# (cobertura). Se repite acá porque ``risk`` está debajo de ``safety``.
+# Motivos de ``safety.correlation`` que el plan mira: la misma moneda en
+# dirección contraria (cobertura) y una posición que se cuenta sin saber su
+# correlación (por las dudas). Se repiten acá porque ``risk`` está debajo de
+# ``safety``.
 REASON_HEDGE = "hedge"
+REASON_UNKNOWN_CORRELATION = "unknown_correlation"
 
 # De dónde sale cada objetivo.
 TP_NEXT_LEVEL = "next_level"
@@ -327,7 +366,8 @@ class CorrelatedPosition:
     ganancia, cuenta como 0). ``correlation``: con la moneda del plan (``None``
     si no hay dato). ``reason``: el motivo de ``safety.correlation``
     (``"same_symbol"``, ``"high_correlation"``, ``"unknown_correlation"`` o
-    ``"hedge"``).
+    ``"hedge"``). Sin ``reason``, una moneda distinta de la del plan sin
+    ``correlation`` también se toma como "sin dato" (ver ``unknown_for``).
     """
 
     symbol: str
@@ -353,6 +393,14 @@ class CorrelatedPosition:
     @property
     def counted_risk_usd(self) -> float:
         return max(0.0, self.risk_usd)
+
+    def unknown_for(self, symbol: str) -> bool:
+        """Se cuenta sin saber si se mueve junto con ``symbol`` (por las dudas)."""
+        if self.symbol == symbol:
+            return False
+        if self.reason is not None:
+            return self.reason == REASON_UNKNOWN_CORRELATION
+        return self.correlation is None
 
     def describe(self) -> str:
         """``"ETH long (30 USD)"``."""
@@ -475,6 +523,16 @@ class PlanInputs:
       no se evaluó.
     - ``day_overrides``: los números del día cargados a mano para probar (el
       plan los usa y avisa).
+    - ``open_risk_usd``: lo que se pierde si saltan los stops de **todas** las
+      posiciones abiertas (``TradingState.open_risk_usd``: cada posición con el
+      stop en ganancia cuenta 0; una cobertura en la misma moneda cuenta, porque
+      pueden saltar los dos stops). Con ``trade_plan.daily_cap_includes_open_risk``
+      se descuenta de lo que queda del límite de pérdida del día.
+    - ``wallet_balance_usd``: el saldo actual de la billetera de futuros
+      (``TradingState.wallet.current_balance_usd``; ``None`` si no se sabe).
+      Con 0 o menos, "No operar" (regla ``wallet_balance``).
+      ``wallet_balance_assumed``: ``True`` si ese saldo es supuesto (el
+      usuario nunca anotó uno); solo cambia los textos.
     """
 
     symbol: str
@@ -502,6 +560,9 @@ class PlanInputs:
     safety: Any | None = None
     correlation: Mapping[str, Any] | None = None
     day_overrides: tuple[DayOverride, ...] = ()
+    open_risk_usd: float = 0.0
+    wallet_balance_usd: float | None = None
+    wallet_balance_assumed: bool = False
 
 
 def plan_inputs_from_analysis(
@@ -520,6 +581,10 @@ def plan_inputs_from_analysis(
     safety: Any | None = None,
     correlation: Mapping[str, Any] | None = None,
     day_overrides: tuple[DayOverride, ...] = (),
+    open_risk_usd: float = 0.0,
+    wallet_equity_usd: float | None = None,
+    wallet_balance_usd: float | None = None,
+    wallet_balance_assumed: bool = False,
 ) -> PlanInputs:
     """``PlanInputs`` desde el análisis de indicadores y la foto del mercado.
 
@@ -537,8 +602,12 @@ def plan_inputs_from_analysis(
     - ``price_diff_pct`` / ``reference_price``: la diferencia del precio de
       Nexo contra el de referencia y ese precio
       (``snapshot.execution_price.diff_pct`` y ``.binance_price``).
-    - ``trades_today`` / ``pnl_today_usd``: del ``TradingState`` (Hito 5);
-      ``safety``, ``correlation`` y ``day_overrides`` pasan tal cual.
+    - ``trades_today`` / ``pnl_today_usd`` / ``open_risk_usd``: del
+      ``TradingState`` (Hito 5); ``safety``, ``correlation`` y ``day_overrides``
+      pasan tal cual.
+    - ``available_margin_usd`` / ``wallet_equity_usd`` / ``wallet_balance_usd``
+      / ``wallet_balance_assumed``: el saldo de la billetera (ver
+      ``PlanInputs``), tal cual.
     """
     entry = float(snapshot.current_price)
     timeframes = dict.fromkeys([*settings.trade_plan.stop_timeframes, settings.timeframes.entry])
@@ -597,6 +666,10 @@ def plan_inputs_from_analysis(
         safety=safety,
         correlation=correlation,
         day_overrides=tuple(day_overrides),
+        open_risk_usd=open_risk_usd,
+        wallet_equity_usd=wallet_equity_usd,
+        wallet_balance_usd=wallet_balance_usd,
+        wallet_balance_assumed=bool(wallet_balance_assumed),
     )
 
 
@@ -875,7 +948,12 @@ class TradePlan:
       que queda del límite del día, el que se usa para la posición) y la
       pérdida máxima real en ``position.risk_usd`` (comisiones incluidas).
       ``daily_remaining_usd``: lo que quedaba del límite de pérdida del día
-      antes de esta operación; ``risk_capped_by_day``: si se achicó por eso.
+      antes de esta operación (con ``daily_cap_includes_open_risk``, ya sin el
+      riesgo de las posiciones abiertas); ``risk_capped_by_day``: si se achicó
+      por eso.
+    - ``open_risk_usd``: el riesgo de las posiciones abiertas que vino en
+      ``PlanInputs``; ``daily_open_risk_usd``: la parte que se descontó del
+      límite del día (0 si ``daily_cap_includes_open_risk`` está apagado).
     - ``tp2_missing_reason``: por qué no hay TP2 (stop absurdamente lejos en
       un short), o ``None``.
     - ``day_state``: el estado del día que se usó (operaciones y resultado de
@@ -946,6 +1024,8 @@ class TradePlan:
     correlation_summary: dict[str, Any] = field(default_factory=dict)
     risk_capped_by_correlation: bool = False
     day_overrides: tuple[DayOverride, ...] = ()
+    open_risk_usd: float = 0.0
+    daily_open_risk_usd: float = 0.0
 
     @property
     def ok(self) -> bool:
@@ -1027,6 +1107,8 @@ class TradePlan:
                 "after_regime_usd": self.regime_risk_usd,
                 "safety_multiplier": self.safety_multiplier,
                 "after_safety_usd": self.safety_risk_usd,
+                "open_risk_usd": self.open_risk_usd,
+                "daily_open_risk_usd": self.daily_open_risk_usd,
                 "daily_remaining_usd": self.daily_remaining_usd,
                 "capped_by_daily_limit": self.risk_capped_by_day,
                 "after_daily_usd": self.daily_risk_usd,
@@ -1521,19 +1603,134 @@ def _regime_floor_rule(adj: RegimeAdjustmentResult, profile: EffectiveProfile) -
     return RuleResult(MIN_OPERABLE_RISK, False, adj.block_reasons[-1], suggestion)
 
 
+def _day_used_text(loss_today: float, open_risk: float) -> str:
+    """Lo que ya se usó del límite del día, con el riesgo de las posiciones abiertas.
+
+    ``"hoy ya perdiste 40 USD y tenés 50 USD en juego en posiciones abiertas (lo
+    que perdés si saltan sus stops)"``. Sin pérdida hoy: ``"hoy no perdiste nada,
+    pero tenés ..."``.
+    """
+    at_stake = (
+        f"tenés {fmt_usd(open_risk)} en juego en posiciones abiertas (lo que perdés si saltan "
+        "sus stops)"
+    )
+    if round(loss_today, 2) <= 0:
+        return f"hoy no perdiste nada, pero {at_stake}"
+    return f"hoy ya perdiste {fmt_usd(loss_today)} y {at_stake}"
+
+
+# Qué hacer cuando el riesgo de las posiciones abiertas no deja lugar en el día.
+_OPEN_RISK_DAY_TIP = (
+    "Esperá a mañana, o a que alguna posición abierta se cierre sin pérdida o tenga el stop en "
+    "ganancia (ahí deja de contar)."
+)
+
+
+def _daily_cap_message(
+    before: float,
+    remaining: float,
+    loss_today: float,
+    open_risk: float,
+    max_daily_loss: float,
+    *,
+    fees_included: bool,
+) -> str:
+    """Motivo del ajuste "riesgo bajado a lo que queda del límite del día"."""
+    if open_risk <= 0:
+        if fees_included:
+            then = "así, si esta operación toca el stop, no pasás el límite"
+        else:
+            then = (
+                "así, si esta operación toca el stop, solo las comisiones quedan por encima "
+                "del límite"
+            )
+        return (
+            f"Riesgo bajado de {fmt_usd(before, unit=False)} a {fmt_usd(remaining)}: hoy ya "
+            f"perdiste {fmt_usd(loss_today, unit=False)} de tus {fmt_usd(max_daily_loss)} de "
+            f"límite del día ({then})."
+        )
+    if fees_included:
+        then = "Así, aunque salten todos los stops, no pasás el límite."
+    else:
+        then = (
+            "Así, aunque salten todos los stops, solo las comisiones de esta operación quedan "
+            "por encima del límite."
+        )
+    return (
+        f"Riesgo bajado de {fmt_usd(before, unit=False)} a {fmt_usd(remaining)}: "
+        f"{_day_used_text(loss_today, open_risk)}: quedan {fmt_usd(remaining)} de tu límite de "
+        f"{fmt_usd(max_daily_loss)} del día. {then}"
+    )
+
+
 def _daily_cap_floor_rule(
-    loss_today: float, max_daily_loss: float, remaining: float, profile: EffectiveProfile
+    loss_today: float,
+    max_daily_loss: float,
+    remaining: float,
+    profile: EffectiveProfile,
+    open_risk: float = 0.0,
 ) -> RuleResult:
     """Lo que queda del límite de pérdida del día no llega al mínimo operable."""
+    floor_txt = fmt_usd(profile.min_operable_risk_usd)
+    if open_risk <= 0:
+        return RuleResult(
+            code=MIN_OPERABLE_RISK,
+            ok=False,
+            message=(
+                f"{NO_TRADE}: hoy ya perdiste {fmt_usd(loss_today, unit=False)} de tus "
+                f"{fmt_usd(max_daily_loss)} de límite del día; lo que te queda "
+                f"({fmt_usd(remaining)}) es menos que el mínimo operable de {floor_txt}."
+            ),
+            suggestion="Esperá a mañana.",
+        )
     return RuleResult(
         code=MIN_OPERABLE_RISK,
         ok=False,
         message=(
-            f"{NO_TRADE}: hoy ya perdiste {fmt_usd(loss_today, unit=False)} de tus "
-            f"{fmt_usd(max_daily_loss)} de límite del día; lo que te queda ({fmt_usd(remaining)}) "
-            f"es menos que el mínimo operable de {fmt_usd(profile.min_operable_risk_usd)}."
+            f"{NO_TRADE}: {_day_used_text(loss_today, open_risk)}: de tu límite de "
+            f"{fmt_usd(max_daily_loss)} del día quedan {fmt_usd(remaining)}, menos que el mínimo "
+            f"operable de {floor_txt}."
         ),
-        suggestion="Esperá a mañana.",
+        suggestion=_OPEN_RISK_DAY_TIP,
+    )
+
+
+def _daily_used_up_rule(loss_today: float, open_risk: float, max_daily_loss: float) -> RuleResult:
+    """No queda nada del límite del día: lo usan la pérdida de hoy y las posiciones abiertas."""
+    return RuleResult(
+        code=DAILY_REMAINING_RULE,
+        ok=False,
+        message=(
+            f"{NO_TRADE}: {_day_used_text(loss_today, open_risk)}: entre las dos cosas ya usás "
+            f"todo tu límite de {fmt_usd(max_daily_loss)} del día y no queda nada para otra "
+            "operación."
+        ),
+        suggestion=_OPEN_RISK_DAY_TIP,
+    )
+
+
+def _wallet_empty_rule(balance: float, *, assumed: bool) -> RuleResult:
+    """La billetera de futuros está en 0 o menos: no hay plata para el margen."""
+    if assumed:
+        source = (
+            "según la cuenta de la app (es un saldo supuesto: nunca anotaste el saldo real; "
+            "se toma la billetera mensual del perfil al empezar el mes y se le suman y restan "
+            "tus resultados)"
+        )
+    else:
+        source = "según el saldo que anotaste y lo que cargaste después"
+    shown = fmt_usd(balance) if round(balance, 2) < 0 else fmt_usd(0.0)
+    return RuleResult(
+        code=WALLET_BALANCE_RULE,
+        ok=False,
+        message=(
+            f"{NO_TRADE}: tu billetera de futuros tiene {shown} ({source}): no hay plata para "
+            "poner de margen."
+        ),
+        suggestion=(
+            'Si depositaste, cargalo (make trade ARGS="deposit --amount ..."); si el saldo real '
+            'es otro, anotalo (make trade ARGS="balance --amount ...").'
+        ),
     )
 
 
@@ -1676,21 +1873,32 @@ def _safety_block_rule(breaker: Any, code: str | None = None) -> RuleResult:
     )
 
 
-def _safety_rules(safety: Any, *, skip_codes: frozenset[str]) -> list[RuleResult]:
+def _safety_rules(
+    safety: Any,
+    *,
+    skip_codes: frozenset[str],
+    rule_codes: Mapping[str, str] | None = None,
+) -> list[RuleResult]:
     """Las reglas de los frenos: una por cada uno que bloquea, o una que se cumple.
 
-    Las que bloquean van primeras en la lista del plan (y en el titular); la
-    que se cumple, al final ("se evalúa al final").
+    Las que bloquean van primeras en la lista del plan (y en el titular), en el
+    orden de los frenos; la que se cumple, al final ("se evalúa al final").
 
-    ``skip_codes``: frenos que ya dice otra regla del plan (el evento de alta
-    volatilidad, o el límite de pérdida del día si la regla de límites del día
-    ya falla por eso).
+    ``skip_codes``: frenos que ya dice otra regla del plan (el límite de
+    pérdida del día si la regla de límites del día ya falla por eso).
+    ``rule_codes``: código de regla para un freno en vez de ``"safety_<freno>"``
+    (el evento de alta volatilidad guardado usa ``high_volatility_event``).
     """
     blocking = [b for b in _safety_breakers(safety) if _field(b, "blocks")]
     if not blocking:
         headline = str(_field(safety, "headline") or "Ningún freno de seguridad activo.")
         return [RuleResult(SAFETY_RULE, True, headline)]
-    return [_safety_block_rule(b) for b in blocking if str(_field(b, "code")) not in skip_codes]
+    codes = rule_codes or {}
+    return [
+        _safety_block_rule(b, code=codes.get(str(_field(b, "code"))))
+        for b in blocking
+        if str(_field(b, "code")) not in skip_codes
+    ]
 
 
 def _safety_summary(safety: Any, multiplier: float) -> dict[str, Any]:
@@ -1725,28 +1933,69 @@ def _join_es(items: list[str]) -> str:
     return ", ".join(items[:-1]) + " y " + items[-1]
 
 
+def _unique_symbols(positions: Any) -> list[str]:
+    return list(dict.fromkeys(p.symbol for p in positions))
+
+
 def _coins(exposure: CorrelationExposure) -> str:
-    return _join_es(list(dict.fromkeys(p.symbol for p in exposure.counted)))
+    return _join_es(_unique_symbols(exposure.counted))
+
+
+def _unknown(exposure: CorrelationExposure, symbol: str) -> list[CorrelatedPosition]:
+    """Las posiciones que se cuentan sin saber si se mueven junto con ``symbol``."""
+    return [p for p in exposure.counted if p.unknown_for(symbol)]
+
+
+def _doubt_text(unknown: list[CorrelatedPosition], symbol: str) -> str:
+    """``"no hay datos para saber si ETH se mueve junto con BTC; por las dudas se cuenta"``."""
+    coins = _unique_symbols(unknown)
+    moves = "se mueven" if len(coins) > 1 else "se mueve"
+    counts = "se cuentan" if len(unknown) > 1 else "se cuenta"
+    return (
+        f"no hay datos para saber si {_join_es(coins)} {moves} junto con {symbol}; por las "
+        f"dudas {counts}"
+    )
 
 
 def _exposure_phrase(exposure: CorrelationExposure, symbol: str) -> str:
     """Las posiciones que suman riesgo, en una frase.
 
     ``"una posición en long (compra) en ETH, que se mueve junto con BTC, con 40
-    USD de riesgo"``.
+    USD de riesgo"``. Si alguna se cuenta sin dato de correlación (por las
+    dudas), no se afirma que "se mueve junto": ``"una posición en long (compra)
+    en ETH, con 40 USD de riesgo (no hay datos para saber si ETH se mueve junto
+    con BTC; por las dudas se cuenta)"``.
     """
     n = len(exposure.counted)
     side = _SIDE_TEXT[exposure.side]
     what = f"una posición en {side} en" if n == 1 else f"{n} posiciones en {side} en"
-    if all(p.symbol == symbol for p in exposure.counted):
-        relation = "la misma moneda"
-    else:
-        relation = f"que se mueve{'n' if n > 1 else ''} junto con {symbol}"
     total = " entre todas" if n > 1 else ""
-    return (
-        f"{what} {_coins(exposure)}, {relation}, con {fmt_usd(exposure.existing_risk_usd)} de "
-        f"riesgo{total}"
+    risk = f"con {fmt_usd(exposure.existing_risk_usd)} de riesgo{total}"
+    unknown = _unknown(exposure, symbol)
+    if not unknown:
+        if all(p.symbol == symbol for p in exposure.counted):
+            relation = "la misma moneda"
+        else:
+            relation = f"que se mueve{'n' if n > 1 else ''} junto con {symbol}"
+        return f"{what} {_coins(exposure)}, {relation}, {risk}"
+    known = [p for p in exposure.counted if not p.unknown_for(symbol)]
+    if not known:
+        return f"{what} {_coins(exposure)}, {risk} ({_doubt_text(unknown, symbol)})"
+    details: list[str] = []
+    if any(p.symbol == symbol for p in known):
+        details.append(f"{symbol} es la misma moneda")
+    related = _unique_symbols(p for p in known if p.symbol != symbol)
+    if related:
+        moves = "se mueven" if len(related) > 1 else "se mueve"
+        details.append(f"{_join_es(related)} {moves} junto con {symbol}")
+    doubt_coins = _unique_symbols(unknown)
+    moves = "se mueven" if len(doubt_coins) > 1 else "se mueve"
+    counts = "se cuentan" if len(unknown) > 1 else "se cuenta"
+    details.append(
+        f"de {_join_es(doubt_coins)} no hay datos para saber si {moves} junto con {symbol} y "
+        f"por las dudas {counts}"
     )
+    return f"{what} {_coins(exposure)}, {risk} ({'; '.join(details)})"
 
 
 def _correlation_cap_message(
@@ -1758,9 +2007,10 @@ def _correlation_cap_message(
     multiplier: float,
     risk_per_trade: float,
 ) -> str:
+    lose = "pueden perder" if _unknown(exposure, symbol) else "pierden"
     return (
         f"Riesgo bajado de {fmt_usd(before, unit=False)} a {fmt_usd(remaining)}: ya tenés "
-        f"{_exposure_phrase(exposure, symbol)}. Si el mercado se da vuelta pierden juntas: "
+        f"{_exposure_phrase(exposure, symbol)}. Si el mercado se da vuelta {lose} juntas: "
         f"sumando el plan nuevo, no pueden arriesgar más de {fmt_usd(limit)} "
         f"({fmt_num(multiplier, 2)} × tu riesgo por operación de {fmt_usd(risk_per_trade)})."
     )
@@ -1820,6 +2070,7 @@ def _correlation_rule(
     existing = exposure.existing_risk_usd
     combined = existing + new_risk
     phrase = _exposure_phrase(exposure, symbol)
+    unknown = _unknown(exposure, symbol)
     if full:
         return RuleResult(
             code=CORRELATION_RULE,
@@ -1832,22 +2083,32 @@ def _correlation_rule(
         )
     if combined <= limit * (1.0 + REL_TOL) or (capped and cap_enabled):
         extra = " (el plan se achicó para entrar)" if capped else ""
-        return RuleResult(
-            code=CORRELATION_RULE,
-            ok=True,
-            message=(
-                f"Riesgo sumado con tus posiciones correlacionadas ({_coins(exposure)}): "
-                f"{fmt_usd(existing, unit=False)} + {fmt_usd(new_risk, unit=False)} = "
-                f"{fmt_usd(combined)} de {fmt_usd(limit)} permitidos{extra}."
-            ),
+        sums = (
+            f"{fmt_usd(existing, unit=False)} + {fmt_usd(new_risk, unit=False)} = "
+            f"{fmt_usd(combined)} de {fmt_usd(limit)} permitidos{extra}."
         )
+        if not unknown:
+            message = (
+                f"Riesgo sumado con tus posiciones correlacionadas ({_coins(exposure)}): {sums}"
+            )
+        else:
+            doubt = _doubt_text(unknown, symbol)
+            message = (
+                f"Riesgo sumado con tus posiciones en {side} en {_coins(exposure)}: {sums} "
+                f"{doubt[:1].upper()}{doubt[1:]}."
+            )
+        return RuleResult(code=CORRELATION_RULE, ok=True, message=message)
+    kind = (
+        "posiciones en la misma dirección que se mueven juntas (o que no se sabe si lo hacen)"
+        if unknown
+        else "posiciones muy correlacionadas en la misma dirección"
+    )
     return RuleResult(
         code=CORRELATION_RULE,
         ok=False,
         message=(
             f"{NO_TRADE}: ya tenés {phrase}; sumando el plan nuevo serían {fmt_usd(combined)}, "
-            f"más que el tope de {fmt_usd(limit)} para posiciones muy correlacionadas en la misma "
-            "dirección."
+            f"más que el tope de {fmt_usd(limit)} para {kind}."
         ),
         suggestion=_CORRELATION_TIP,
     )
@@ -1870,6 +2131,7 @@ def _hedge_warning(exposure: CorrelationExposure, symbol: str) -> str | None:
 
 def _correlation_summary(
     exposure: CorrelationExposure,
+    symbol: str,
     limit: float,
     before: float | None,
     after: float | None,
@@ -1889,6 +2151,7 @@ def _correlation_summary(
             "combined_risk_usd": None if after is None else existing + after,
             "capped": capped,
             "counted": [p.to_dict() for p in exposure.counted],
+            "unknown_symbols": _unique_symbols(_unknown(exposure, symbol)),
             "hedges": [p.to_dict() for p in exposure.hedges],
         }
     )
@@ -1945,6 +2208,8 @@ def _min_risk_rule(
     fit: PositionFit,
     profile: EffectiveProfile,
     cap_floor_rule: RuleResult | None = None,
+    *,
+    wallet_assumed: bool = False,
 ) -> RuleResult:
     """Riesgo mínimo operable, con el motivo más claro.
 
@@ -1953,7 +2218,9 @@ def _min_risk_rule(
     ya lo dejó debajo (aunque con las comisiones aparte la pérdida total lo
     pase) o si el riesgo final de la posición, en los términos del perfil
     (``PositionFit.floor_risk_usd``), quedó debajo. Si fallan varios, manda el
-    último paso (ver ``_risk_floor_rule``).
+    último paso (ver ``_risk_floor_rule``). Si lo que limitó la posición es el
+    saldo de la billetera, la sugerencia lo dice (``wallet_assumed``: si ese
+    saldo es supuesto).
     """
     floor_rule = _risk_floor_rule(adj, profile, cap_floor_rule)
     if floor_rule is not None:
@@ -1962,7 +2229,16 @@ def _min_risk_rule(
     if base.ok:
         return base
     if fit.size_reduced and fit.block_reason:
-        if LIMIT_LEVERAGE in fit.limited_by:
+        if LIMIT_AVAILABLE_MARGIN in fit.limited_by and fit.available_margin_usd is not None:
+            source = "el saldo supuesto" if wallet_assumed else "el saldo"
+            tip = (
+                f"El margen está limitado por {source} de tu billetera "
+                f"({fmt_usd(fit.available_margin_usd)}): con tan poca plata la posición no llega "
+                "al riesgo mínimo. Si depositaste o tu saldo real es otro, cargalo (make trade "
+                'ARGS="deposit --amount ..." o ARGS="balance --amount ..."); si no, esperá una '
+                "entrada con el stop más lejos."
+            )
+        elif LIMIT_LEVERAGE in fit.limited_by:
             tip = (
                 "Esperá una entrada con el stop más lejos: con un stop tan corto la posición "
                 "no entra en tu tope de apalancamiento."
@@ -2091,6 +2367,7 @@ def _validate(inputs: PlanInputs, now: datetime) -> float:
         raise ValueError(f"now tiene que ser una fecha con zona horaria (vino {now!r}).")
     if inputs.available_margin_usd is not None:
         ensure_positive(inputs.available_margin_usd, "El margen disponible")
+    ensure_finite(inputs.open_risk_usd, "El riesgo de las posiciones abiertas")
     if not isinstance(inputs.high_volatility_event, bool):
         raise ValueError(
             "La marca de evento de alta volatilidad tiene que ser sí o no "
@@ -2235,11 +2512,34 @@ def _build(
     rules.append(daily_rule)
     loss_today = max(0.0, -float(inputs.pnl_today_usd))
     max_daily_loss = float(profile.max_daily_loss_usd)
-    daily_remaining = max(0.0, max_daily_loss - loss_today)
+    # Riesgo de las posiciones abiertas (decisión del usuario,
+    # daily_cap_includes_open_risk): también sale de lo que queda del día, así
+    # aunque salten todos los stops el día no pasa su límite.
+    open_risk = max(0.0, float(inputs.open_risk_usd))
+    daily_open_risk = open_risk if tp_cfg.daily_cap_includes_open_risk else 0.0
+    daily_remaining = max(0.0, max_daily_loss - loss_today - daily_open_risk)
     loss_limit_reached = daily_loss_limit_reached(loss_today, max_daily_loss)
+    # Entre la pérdida de hoy y las posiciones abiertas no queda nada del día:
+    # como con el límite ya alcanzado, el riesgo no se toca (los niveles quedan
+    # como referencia) y una regla bloquea. Si el límite ya se alcanzó con lo
+    # cerrado, lo dice la regla de límites del día.
+    day_used_up = (
+        side is not None
+        and tp_cfg.cap_risk_to_daily_remaining
+        and not loss_limit_reached
+        and daily_open_risk > 0
+        and daily_remaining <= max_daily_loss * REL_TOL
+    )
+    if day_used_up:
+        rules.append(_daily_used_up_rule(loss_today, daily_open_risk, max_daily_loss))
+    # Billetera en 0 o menos (anotada o supuesta): no hay plata para el margen.
+    wallet_balance = clean_number(inputs.wallet_balance_usd)
+    if wallet_balance is not None and round(wallet_balance, 2) <= 0:
+        rules.append(_wallet_empty_rule(wallet_balance, assumed=inputs.wallet_balance_assumed))
 
     # Evento de alta volatilidad: el marcado a mano para esta corrida o, si no,
-    # el guardado en la base (un freno de seguridad, con su hora de fin).
+    # el guardado en la base (un freno de seguridad, con su hora de fin). El
+    # guardado es un veto como los otros frenos: va con ellos, primero.
     safety = inputs.safety
     vol_breaker = next(
         (
@@ -2249,28 +2549,25 @@ def _build(
         ),
         None,
     )
-    if vol_breaker is not None and not inputs.high_volatility_event:
-        rules.append(_safety_block_rule(vol_breaker, code=HIGH_VOLATILITY_EVENT))
-    else:
+    stored_event = vol_breaker is not None and not inputs.high_volatility_event
+    if not stored_event:
         rules.append(
             check_high_volatility_event(inputs.high_volatility_event, inputs.event_description)
         )
 
     # Frenos de seguridad (Hito 5): el veto va primero en la lista y en el
     # titular. El límite de pérdida del día no se repite si la regla de límites
-    # del día ya falla por eso; el evento ya quedó en su regla.
+    # del día ya falla por eso; el evento guardado usa la regla del evento.
     safety_mult: float | None = None
     safety_tail: list[RuleResult] = []  # sin bloqueos, el resumen va al final de la lista
     if safety is not None:
         safety_mult = _safety_multiplier(safety)
-        skip = (
-            {"volatility_event"}
-            if vol_breaker is not None and not inputs.high_volatility_event
-            else set()
+        skip = {"daily_loss_block"} if loss_limit_reached else set()
+        safety_rules = _safety_rules(
+            safety,
+            skip_codes=frozenset(skip),
+            rule_codes={"volatility_event": HIGH_VOLATILITY_EVENT} if stored_event else None,
         )
-        if loss_limit_reached:
-            skip.add("daily_loss_block")
-        safety_rules = _safety_rules(safety, skip_codes=frozenset(skip))
         if any(not r.ok for r in safety_rules):
             rules[:0] = safety_rules
         else:
@@ -2306,27 +2603,28 @@ def _build(
     # referencia). Si la regla falla solo por la cantidad de operaciones, el
     # tope se aplica igual: el plan de referencia no puede arriesgar más de lo
     # que queda del día.
+    # Con daily_cap_includes_open_risk, "lo que queda" también descuenta el
+    # riesgo de las posiciones abiertas (y el motivo nombra las dos partes).
     capped_by_day = False
     if (
         risk_usd is not None
         and tp_cfg.cap_risk_to_daily_remaining
         and not loss_limit_reached
+        and not day_used_up
         and risk_usd > daily_remaining * (1.0 + REL_TOL)
     ):
-        if tp_cfg.fees_included_in_risk:
-            then = "así, si esta operación toca el stop, no pasás el límite"
-        else:
-            then = (
-                "así, si esta operación toca el stop, solo las comisiones quedan por encima "
-                "del límite"
-            )
         adjustments.append(
             PlanAdjustment(
                 SOURCE_DAILY_LIMIT,
                 DAILY_LOSS_CAP,
-                f"Riesgo bajado de {fmt_usd(risk_usd, unit=False)} a {fmt_usd(daily_remaining)}: "
-                f"hoy ya perdiste {fmt_usd(loss_today, unit=False)} de tus "
-                f"{fmt_usd(max_daily_loss)} de límite del día ({then}).",
+                _daily_cap_message(
+                    risk_usd,
+                    daily_remaining,
+                    loss_today,
+                    daily_open_risk,
+                    max_daily_loss,
+                    fees_included=bool(tp_cfg.fees_included_in_risk),
+                ),
                 daily_remaining / risk_usd,
             )
         )
@@ -2334,7 +2632,7 @@ def _build(
         capped_by_day = True
         if daily_remaining < floor * (1.0 - REL_TOL):
             cap_floor_rule = _daily_cap_floor_rule(
-                loss_today, max_daily_loss, daily_remaining, profile
+                loss_today, max_daily_loss, daily_remaining, profile, daily_open_risk
             )
     daily_risk = risk_usd
 
@@ -2402,7 +2700,7 @@ def _build(
         if hedge is not None:
             warnings.append(hedge)
         corr_summary = _correlation_summary(
-            exposure, limit, before_corr, risk_usd, capped=capped_by_corr
+            exposure, inputs.symbol, limit, before_corr, risk_usd, capped=capped_by_corr
         )
 
     override = _override_warning(inputs.day_overrides)
@@ -2501,6 +2799,18 @@ def _build(
             for a in fit.adjustments
         ]
         warnings += list(fit.warnings)
+        if (
+            inputs.wallet_balance_assumed
+            and inputs.available_margin_usd is not None
+            and LIMIT_AVAILABLE_MARGIN in fit.limited_by
+        ):
+            warnings.append(
+                f"El margen quedó limitado por el saldo supuesto de tu billetera "
+                f"({fmt_usd(inputs.available_margin_usd)}): como nunca anotaste el saldo real, la "
+                "app supone que empezaste el mes con la billetera mensual del perfil y le suma y "
+                'resta tus resultados. Si tenés otro saldo, anotalo (make trade ARGS="balance '
+                '--amount ...").'
+            )
         q = fit.quantity
         flag_daily = bool(tp_cfg.flag_tp_beyond_daily_range)
 
@@ -2628,24 +2938,38 @@ def _build(
         )
         rules.append(check_leverage(fit.leverage, profile))
         rules.append(_liquidation_rule(fit))
-        rules.append(_min_risk_rule(adj, fit, profile, cap_floor_rule))
+        rules.append(
+            _min_risk_rule(
+                adj, fit, profile, cap_floor_rule, wallet_assumed=inputs.wallet_balance_assumed
+            )
+        )
         funding = _funding_estimate(side, fit.size_usd, inputs, settings)
         time_stop = _time_stop(now, settings, tp1, tp2)
 
     # Sin el tope por el límite del día (cap_risk_to_daily_remaining apagado),
-    # si esta operación lo pasaría al tocar el stop, se avisa (no bloquea).
-    loss_if_stopped = None if fit is None else loss_today + fit.risk_usd
+    # si esta operación lo pasaría al tocar el stop, se avisa (no bloquea). Con
+    # daily_cap_includes_open_risk, la cuenta suma los stops de las posiciones
+    # abiertas.
+    loss_if_stopped = None if fit is None else loss_today + daily_open_risk + fit.risk_usd
     if (
         not tp_cfg.cap_risk_to_daily_remaining
         and not loss_limit_reached
         and loss_if_stopped is not None
         and loss_if_stopped > max_daily_loss * (1.0 + REL_TOL)
     ):
-        warnings.append(
-            f"Ojo con el límite del día: hoy ya perdiste {fmt_usd(loss_today)}; si esta "
-            f"operación toca el stop, el día cerraría con {fmt_usd(loss_if_stopped)} de "
-            f"pérdida, más que tu límite de {fmt_usd(max_daily_loss)}."
-        )
+        if daily_open_risk > 0:
+            warnings.append(
+                f"Ojo con el límite del día: {_day_used_text(loss_today, daily_open_risk)}; si "
+                f"saltan todos los stops, también el de esta operación, el día cerraría con "
+                f"{fmt_usd(loss_if_stopped)} de pérdida, más que tu límite de "
+                f"{fmt_usd(max_daily_loss)}."
+            )
+        else:
+            warnings.append(
+                f"Ojo con el límite del día: hoy ya perdiste {fmt_usd(loss_today)}; si esta "
+                f"operación toca el stop, el día cerraría con {fmt_usd(loss_if_stopped)} de "
+                f"pérdida, más que tu límite de {fmt_usd(max_daily_loss)}."
+            )
 
     if found is not None:
         # Avisos que solo tienen sentido si hay niveles.
@@ -2691,6 +3015,9 @@ def _build(
         "max_trades_per_day": profile.max_trades_per_day,
         "pnl_today_usd": float(inputs.pnl_today_usd),
         "loss_today_usd": loss_today,
+        "open_risk_usd": open_risk,
+        "daily_open_risk_usd": daily_open_risk,
+        "daily_cap_includes_open_risk": bool(tp_cfg.daily_cap_includes_open_risk),
         "max_daily_loss_usd": max_daily_loss,
         "daily_remaining_usd": daily_remaining,
         "risk_capped_by_day": capped_by_day,
@@ -2699,6 +3026,8 @@ def _build(
         "event_description": inputs.event_description,
         "available_margin_usd": inputs.available_margin_usd,
         "wallet_equity_usd": inputs.wallet_equity_usd,
+        "wallet_balance_usd": wallet_balance,
+        "wallet_balance_assumed": bool(inputs.wallet_balance_assumed),
     }
 
     return TradePlan(
@@ -2754,6 +3083,8 @@ def _build(
         correlation_summary=corr_summary,
         risk_capped_by_correlation=capped_by_corr,
         day_overrides=tuple(inputs.day_overrides),
+        open_risk_usd=open_risk,
+        daily_open_risk_usd=daily_open_risk,
     )
 
 
@@ -2846,6 +3177,7 @@ def _alternative(
 
 __all__ = [
     "DAILY_LOSS_CAP",
+    "DAILY_REMAINING_RULE",
     "ENTRY_LIMIT",
     "ENTRY_MARKET",
     "FLAG_TP1_BEYOND_TP2",
@@ -2860,6 +3192,7 @@ __all__ = [
     "STATUS_SHORT",
     "STOP_RULE",
     "TP2_DAILY_RANGE",
+    "WALLET_BALANCE_RULE",
     "AlternativeEntry",
     "FeesPlan",
     "FundingEstimate",

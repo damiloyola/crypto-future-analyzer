@@ -1,10 +1,12 @@
 """Estado de trading cargado a mano (Hito 5).
 
 Junta lo que el usuario carga en la base (operaciones cerradas, posiciones
-abiertas, movimientos de la billetera y eventos de alta volatilidad) y calcula
-los números que miran los circuit breakers (``safety.breakers``) y el panel de
-riesgo: pérdida del día y de la semana, operaciones de hoy, racha de pérdidas
-con su pausa, saldo de la billetera, su máximo del mes y cuánto cayó.
+abiertas, movimientos de la billetera, eventos de alta volatilidad y los
+bloqueos totales que escribió la app) y calcula los números que miran los
+circuit breakers (``safety.breakers``) y el panel de riesgo: pérdida del día y
+de la semana (la actual y la más grande a la que se llegó), operaciones de hoy,
+racha de pérdidas con su pausa, saldo de la billetera, su máximo del mes y
+cuánto cayó.
 
 En la fase 4 este módulo se reemplaza por datos reales de la cuenta, con la
 misma interfaz (``TradingState``).
@@ -15,15 +17,17 @@ Qué hay acá
       mismos métodos, ver ``TradingStateSource``) y llama a
       ``build_trading_state``.
     - ``build_trading_state(*, trades, open_positions, wallet_events,
-      volatility_events, settings, profile, now)``: arma ``TradingState``. Pura.
+      volatility_events, settings, profile, now, safety_locks=())``: arma
+      ``TradingState``. Pura.
     - Funciones puras sueltas (las usa ``build_trading_state`` y se pueden
       probar por separado): ``period_bounds``, ``period_pnl``,
       ``count_opened_in``, ``losing_streak_state`` y ``wallet_state``.
 
 Este módulo no importa ``storage`` (la capa de seguridad está debajo): lee los
 registros por "duck typing" (atributos o claves de un dict con los nombres de
-``storage``: ``StoredTrade``, ``StoredPosition``, ``StoredWalletEvent`` y
-``StoredVolatilityEvent``) y los copia a sus propias dataclasses inmutables.
+``storage``: ``StoredTrade``, ``StoredPosition``, ``StoredWalletEvent``,
+``StoredVolatilityEvent`` y ``StoredSafetyLock``) y los copia a sus propias
+dataclasses inmutables.
 Un registro inválido (fecha sin zona horaria, resultado que no es número)
 levanta ``ValueError``: un freno de seguridad no puede ignorar en silencio una
 pérdida que no entiende.
@@ -41,6 +45,13 @@ Reglas de cálculo (todos los números de ``config.yaml``)
       es ganancia, la pérdida es 0. Con ``"gross"`` es la suma de las
       operaciones perdidas, sin descontar las ganadas. Las sumas se redondean a
       centavos.
+    - **Pérdida más grande del período** (``PeriodPnl.max_loss_usd``, para
+      ``circuit_breakers.latch_until_period_end``): recorre lo cerrado en el
+      período en orden de cierre y se queda con el peor neto acumulado (con
+      ``"net"``) o con la suma de las pérdidas (con ``"gross"``, que solo
+      crece). Si hoy perdiste 60 y después ganaste 20, la pérdida actual es 40
+      y la más grande, 60: los frenos del día miran la más grande (siguen hasta
+      que termina el día) y el plan, la actual.
     - **Operaciones de hoy** (para ``max_trades_per_day``): las cerradas que se
       **abrieron** hoy más las posiciones abiertas que se abrieron hoy.
     - **Racha de pérdidas**: operaciones seguidas con resultado negativo (a
@@ -48,7 +59,9 @@ Reglas de cálculo (todos los números de ``config.yaml``)
       un empate la cortan. Cuando llega a ``losing_streak.consecutive_losses``
       empieza una pausa de ``cooldown_hours`` desde el cierre de esa pérdida. Si
       se pierde otra vez durante la pausa (la racha sigue), la pausa se estira
-      desde esa pérdida. Con ``reset_after_cooldown`` (decisión del usuario),
+      ``cooldown_hours`` desde esa pérdida (``extend_cooldown_on_loss``,
+      decisión del usuario; con ``false`` termina a la hora prevista). Con
+      ``reset_after_cooldown`` (decisión del usuario),
       terminada la pausa la cuenta vuelve a cero: las pérdidas cerradas antes del
       fin de la pausa ya no cuentan.
     - **Billetera**: el saldo en cada momento es el último "saldo" anotado más
@@ -59,11 +72,26 @@ Reglas de cálculo (todos los números de ``config.yaml``)
       restando lo que pasó en el medio). Si nunca anotó un saldo, se supone que
       empezó el mes con la billetera mensual del perfil
       (``monthly_wallet_usd``) y se avisa.
-    - **Máximo del mes** (decisión del usuario): arranca en el saldo del primer
-      instante del mes calendario y sube con cada ganancia, depósito o saldo
-      anotado más alto. Un **retiro** baja el máximo en lo mismo que se retiró:
-      sacar plata no es perder plata y no tiene que disparar el bloqueo. La
-      caída es ``(máximo - saldo actual) / máximo`` en %.
+    - **Máximo del mes** (decisiones del usuario,
+      ``circuit_breakers.monthly_drawdown_lock``): arranca en el saldo del
+      primer instante del mes calendario y sube cuando el saldo lo pasa (una
+      ganancia o un saldo anotado más alto). Un **depósito** sube el máximo en
+      lo mismo que se depositó (``deposit_raises_peak``): la pérdida de antes
+      sigue contando y depositar no esquiva el bloqueo (con ``false``, el
+      máximo sube solo si el saldo lo pasa). Un **retiro**
+      (``withdrawal_peak``): ``"proportional"`` baja el máximo en la misma
+      proporción que el saldo (máximo × saldo después / saldo antes; sacar
+      plata nunca cambia el % de caída; si el saldo antes del retiro ya era
+      0 o negativo, el máximo no cambia); ``"subtract"`` lo baja en lo mismo
+      que se retiró; ``"none"`` no lo toca (el retiro cuenta como caída). Un
+      saldo anotado más bajo que el calculado cuenta como caída. La caída es
+      ``(máximo - saldo actual) / máximo`` en %.
+    - **Caída después de desbloquear** (``restart_after_unlock``, decisión del
+      usuario): si en el mes hay un bloqueo total anotado en la base, también
+      se mide la caída desde el saldo justo después del último bloqueo (la
+      pérdida que lo disparó incluida), como si empezara un mes nuevo
+      (``WalletState.restart``). Los frenos la usan cuando el usuario ya borró
+      el LOCKED. Los bloqueos de meses anteriores no cuentan.
     - Lo que pasó después de ``now`` no cuenta (por ejemplo, con un reloj de
       prueba).
 
@@ -87,6 +115,8 @@ from app.risk.rules import fmt_usd, json_safe
 from app.safety.incident import fmt_month
 
 LossBasis = Literal["net", "gross"]
+WithdrawalPeak = Literal["proportional", "subtract", "none"]
+WITHDRAWAL_PEAK_RULES: tuple[str, ...] = ("proportional", "subtract", "none")
 
 #: Día de la semana de ``circuit_breakers.week_starts_on`` → ``date.weekday()``.
 WEEKDAY_INDEX: dict[str, int] = {
@@ -125,6 +155,16 @@ class TradingStateSource(Protocol):
     def list_wallet_events(self) -> Sequence[Any]: ...
 
     def list_volatility_events(self, *, ending_after: datetime | None = None) -> Sequence[Any]: ...
+
+
+class SafetyLockSource(Protocol):
+    """Opcional: la base sabe listar los bloqueos totales (``Repository.list_safety_locks``).
+
+    ``load_trading_state`` la usa si el objeto tiene ese método; si no, hace
+    como si no hubiera bloqueos anotados.
+    """
+
+    def list_safety_locks(self) -> Sequence[Any]: ...
 
 
 def _field(obj: Any, name: str) -> Any:
@@ -428,6 +468,59 @@ class VolatilityEventRecord:
 
 
 @dataclass(frozen=True)
+class SafetyLockRecord:
+    """Bloqueo total que escribió la app (copia de ``StoredSafetyLock``).
+
+    ``triggered_at``: cuándo se escribió el LOCKED. Los números son los del
+    disparo (``None`` si no se anotaron).
+    """
+
+    id: int | None
+    triggered_at: datetime
+    trigger_code: str
+    drawdown_pct: float | None = None
+    peak_usd: float | None = None
+    balance_usd: float | None = None
+    report_path: str | None = None
+    lock_path: str | None = None
+    created_at: datetime | None = None
+
+    @classmethod
+    def from_value(cls, value: Any) -> SafetyLockRecord:
+        """Desde un ``StoredSafetyLock``, un dict o un objeto con esos atributos."""
+        if isinstance(value, SafetyLockRecord):
+            return value
+        ident = _opt_int(_field(value, "id"))
+        label = f"El bloqueo {ident}" if ident is not None else "Un bloqueo total"
+        return cls(
+            id=ident,
+            triggered_at=_aware_utc(_field(value, "triggered_at"), f"{label}: la hora"),
+            trigger_code=_opt_text(_field(value, "trigger_code")) or "?",
+            drawdown_pct=_opt_number(_field(value, "drawdown_pct"), f"{label}: la caída"),
+            peak_usd=_opt_number(_field(value, "peak_usd"), f"{label}: el máximo"),
+            balance_usd=_opt_number(_field(value, "balance_usd"), f"{label}: el saldo"),
+            report_path=_opt_text(_field(value, "report_path")),
+            lock_path=_opt_text(_field(value, "lock_path")),
+            created_at=_opt_aware_utc(_field(value, "created_at"), f"{label}: la creación"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return json_safe(
+            {
+                "id": self.id,
+                "triggered_at": _iso(self.triggered_at),
+                "trigger_code": self.trigger_code,
+                "drawdown_pct": self.drawdown_pct,
+                "peak_usd": self.peak_usd,
+                "balance_usd": self.balance_usd,
+                "report_path": self.report_path,
+                "lock_path": self.lock_path,
+                "created_at": _iso(self.created_at),
+            }
+        )
+
+
+@dataclass(frozen=True)
 class ProfileLimits:
     """Lo que el estado y los breakers usan del perfil de riesgo (``EffectiveProfile``)."""
 
@@ -583,8 +676,13 @@ class PeriodPnl:
     - ``net_pnl_usd``: neto (ganancias menos pérdidas), siempre.
     - ``gross_profit_usd`` / ``gross_loss_usd``: suma de las ganadas y de las
       perdidas (las dos positivas).
-    - ``loss_usd``: la pérdida que miran los breakers según ``loss_basis``:
-      ``"net"`` → ``max(0, -neto)``; ``"gross"`` → ``gross_loss_usd``.
+    - ``loss_usd``: la pérdida **actual** según ``loss_basis``: ``"net"`` →
+      ``max(0, -neto)``; ``"gross"`` → ``gross_loss_usd``.
+    - ``max_loss_usd``: la pérdida **más grande** a la que se llegó en el
+      período: con ``"net"``, el peor neto acumulado recorriendo las
+      operaciones en orden de cierre (si perdiste 60 y después ganaste 20, es
+      60 aunque ``loss_usd`` sea 40); con ``"gross"`` es ``gross_loss_usd``
+      (solo crece). Siempre ``>= loss_usd``.
     """
 
     start: datetime
@@ -597,6 +695,7 @@ class PeriodPnl:
     gross_profit_usd: float
     gross_loss_usd: float
     loss_usd: float
+    max_loss_usd: float = 0.0
 
     @property
     def breakeven(self) -> int:
@@ -616,6 +715,7 @@ class PeriodPnl:
                 "gross_profit_usd": self.gross_profit_usd,
                 "gross_loss_usd": self.gross_loss_usd,
                 "loss_usd": self.loss_usd,
+                "max_loss_usd": self.max_loss_usd,
             }
         )
 
@@ -639,7 +739,7 @@ def period_pnl(
     cutoff = None if now is None else _aware_utc(now, "La hora actual")
     selected = [
         t
-        for t in (TradeRecord.from_value(x) for x in trades)
+        for t in _sorted_by_close(trades)
         if lo <= t.closed_at < hi and (cutoff is None or t.closed_at <= cutoff)
     ]
     wins = [t for t in selected if round(t.pnl_usd, 2) > 0]
@@ -648,6 +748,13 @@ def period_pnl(
     gross_profit = _cents(sum(t.pnl_usd for t in wins))
     gross_loss = _cents(-sum(t.pnl_usd for t in losses))
     loss = max(0.0, -net) if loss_basis == "net" else gross_loss
+    # El peor neto acumulado, en orden de cierre (empieza en 0: sin operaciones
+    # no hay pérdida).
+    running = worst = 0.0
+    for t in selected:
+        running += t.pnl_usd
+        worst = min(worst, round(running, 2))
+    max_loss = max(0.0, -worst) if loss_basis == "net" else gross_loss
     return PeriodPnl(
         start=lo,
         end=hi,
@@ -659,6 +766,7 @@ def period_pnl(
         gross_profit_usd=gross_profit,
         gross_loss_usd=gross_loss,
         loss_usd=_cents(loss),
+        max_loss_usd=_cents(max(max_loss, loss)),
     )
 
 
@@ -686,6 +794,7 @@ class LosingStreakState:
     - ``loss_trade_ids``: las operaciones de esa racha.
     - ``cooldown_started_at`` / ``cooldown_until``: la última pausa (aunque ya
       haya terminado; ``None`` si nunca hubo una).
+    - ``extend_cooldown_on_loss``: si una pérdida durante la pausa la estira.
     """
 
     as_of: datetime
@@ -697,6 +806,7 @@ class LosingStreakState:
     last_loss_at: datetime | None
     cooldown_started_at: datetime | None
     cooldown_until: datetime | None
+    extend_cooldown_on_loss: bool = True
 
     def cooldown_active(self, now: datetime | None = None) -> bool:
         """``True`` si la pausa está corriendo en ``now`` (por defecto, ``as_of``)."""
@@ -730,6 +840,7 @@ class LosingStreakState:
                 "required": self.required,
                 "cooldown_hours": self.cooldown_hours,
                 "reset_after_cooldown": self.reset_after_cooldown,
+                "extend_cooldown_on_loss": self.extend_cooldown_on_loss,
                 "loss_trade_ids": list(self.loss_trade_ids),
                 "last_loss_at": _iso(self.last_loss_at),
                 "cooldown_started_at": _iso(self.cooldown_started_at),
@@ -751,12 +862,15 @@ def losing_streak_state(
     consecutive_losses: int,
     cooldown_hours: float,
     reset_after_cooldown: bool = True,
+    extend_cooldown_on_loss: bool = True,
 ) -> LosingStreakState:
     """Racha de pérdidas en ``now`` y su pausa (ver las reglas en el docstring del módulo).
 
     Recorre todas las operaciones cerradas hasta ``now`` en orden de cierre:
     el estado de hoy depende de cuándo empezaron y terminaron las pausas
-    anteriores.
+    anteriores. Con ``extend_cooldown_on_loss``, una pérdida durante la pausa
+    la estira ``cooldown_hours`` desde esa pérdida; sin eso, la pausa termina a
+    la hora prevista (la pérdida igual suma a la racha).
     """
     moment = _aware_utc(now, "La hora actual")
     required = int(consecutive_losses)
@@ -789,7 +903,9 @@ def losing_streak_state(
             running = cd_start is not None and cd_until is not None and trade.closed_at < cd_until
             if not running:
                 cd_start = trade.closed_at
-            cd_until = trade.closed_at + pause
+                cd_until = trade.closed_at + pause
+            elif extend_cooldown_on_loss:
+                cd_until = trade.closed_at + pause
             pending_reset = reset_after_cooldown
     if pending_reset and cd_until is not None and moment >= cd_until:
         count, ids = 0, []
@@ -803,6 +919,7 @@ def losing_streak_state(
         last_loss_at=last_loss_at,
         cooldown_started_at=cd_start,
         cooldown_until=cd_until,
+        extend_cooldown_on_loss=extend_cooldown_on_loss,
     )
 
 
@@ -842,14 +959,60 @@ class WalletPoint:
 
 
 @dataclass(frozen=True)
+class DrawdownRestart:
+    """Caída medida de nuevo desde un bloqueo total (``restart_after_unlock``).
+
+    Después de que el usuario borra el LOCKED, la caída se mide como si el mes
+    empezara en ``locked_at`` (la hora del último bloqueo del mes): el máximo
+    arranca en el saldo de ese momento (``start_balance_usd``, con la pérdida
+    que disparó el bloqueo incluida) y sigue las mismas reglas que el máximo
+    del mes (depósitos, retiros, saldos anotados).
+    """
+
+    lock_id: int | None
+    locked_at: datetime
+    start_balance_usd: float
+    peak_usd: float
+    peak_at: datetime
+    current_balance_usd: float
+    drawdown_usd: float
+    drawdown_pct: float
+    deposits_usd: float = 0.0
+    withdrawals_usd: float = 0.0
+    trading_pnl_usd: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return json_safe(
+            {
+                "lock_id": self.lock_id,
+                "locked_at": _iso(self.locked_at),
+                "start_balance_usd": self.start_balance_usd,
+                "peak_usd": self.peak_usd,
+                "peak_at": _iso(self.peak_at),
+                "current_balance_usd": self.current_balance_usd,
+                "drawdown_usd": self.drawdown_usd,
+                "drawdown_pct": self.drawdown_pct,
+                "deposits_usd": self.deposits_usd,
+                "withdrawals_usd": self.withdrawals_usd,
+                "trading_pnl_usd": self.trading_pnl_usd,
+            }
+        )
+
+
+@dataclass(frozen=True)
 class WalletState:
     """Saldo de la billetera de futuros, su máximo del mes y la caída desde el máximo.
 
     - ``assumed``: ``True`` si el usuario nunca anotó un saldo y se supuso
       ``assumed_start_usd`` (la billetera mensual del perfil) al empezar el mes.
+    - ``month_peak_usd``: el máximo del mes, con las reglas de depósitos
+      (``deposit_raises_peak``) y retiros (``withdrawal_peak``) que se usaron
+      (ver el docstring del módulo).
     - ``drawdown_pct``: caída desde el máximo del mes, en % (0-100+).
     - ``anchor``: el saldo anotado que se usó de base (``None`` si es supuesto).
     - ``points``: historia del mes, empezando por el saldo del primer instante.
+    - ``restart``: la caída medida de nuevo desde el último bloqueo total del
+      mes (``None`` si no hubo o si ``restart_after_unlock`` está apagado).
     """
 
     assumed: bool
@@ -869,6 +1032,9 @@ class WalletState:
     anchor: WalletRecord | None
     points: tuple[WalletPoint, ...]
     warnings: tuple[str, ...] = ()
+    withdrawal_peak: WithdrawalPeak = "proportional"
+    deposit_raises_peak: bool = True
+    restart: DrawdownRestart | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return json_safe(
@@ -890,6 +1056,9 @@ class WalletState:
                 "anchor": self.anchor,
                 "points": list(self.points),
                 "warnings": list(self.warnings),
+                "withdrawal_peak": self.withdrawal_peak,
+                "deposit_raises_peak": self.deposit_raises_peak,
+                "restart": self.restart,
             }
         )
 
@@ -917,6 +1086,83 @@ class _Point:
         return self.rank != _RANK_MOVEMENT
 
 
+@dataclass
+class _PeakWalk:
+    """Resultado de recorrer la billetera desde un saldo inicial (uso interno)."""
+
+    peak: float
+    peak_at: datetime
+    deposits: float = 0.0
+    withdrawals: float = 0.0
+    trading: float = 0.0
+    lowest: float = 0.0
+    history: list[WalletPoint] | None = None
+
+
+def _walk_peak(
+    points: Sequence[_Point],
+    after: Sequence[float],
+    indices: Iterable[int],
+    *,
+    start_balance: float,
+    start_ts: datetime,
+    withdrawal_peak: WithdrawalPeak,
+    deposit_raises_peak: bool,
+    keep_history: bool,
+) -> _PeakWalk:
+    """Recorre los puntos ``indices`` (en orden) moviendo el máximo con las reglas del usuario."""
+    walk = _PeakWalk(
+        peak=start_balance,
+        peak_at=start_ts,
+        lowest=start_balance,
+        history=[] if keep_history else None,
+    )
+    for i in indices:
+        p = points[i]
+        bal = after[i]
+        if p.kind == POINT_WITHDRAWAL:
+            walk.withdrawals -= p.amount  # p.amount es negativo
+            if withdrawal_peak == "subtract":
+                walk.peak += p.amount
+            elif withdrawal_peak == "proportional":
+                before = bal - p.amount
+                if before > 0:
+                    # El máximo baja en la misma proporción que el saldo: el %
+                    # de caída no cambia. Sacar todo (o más) lo deja en 0.
+                    walk.peak *= max(0.0, bal) / before
+        elif p.kind == POINT_DEPOSIT:
+            walk.deposits += p.amount
+            if deposit_raises_peak:
+                walk.peak += p.amount
+        elif p.kind == POINT_TRADE:
+            walk.trading += p.amount
+        if bal > walk.peak:
+            walk.peak, walk.peak_at = bal, p.ts
+        walk.lowest = min(walk.lowest, bal)
+        if walk.history is not None:
+            walk.history.append(
+                WalletPoint(
+                    ts=p.ts,
+                    kind=p.kind,
+                    delta_usd=None if p.is_snapshot else _cents(p.amount),
+                    balance_usd=_cents(bal),
+                    peak_usd=_cents(walk.peak),
+                    ref_id=p.ref_id,
+                    symbol=p.symbol,
+                )
+            )
+    return walk
+
+
+def _drawdown(peak: float, current: float) -> tuple[float, float, float, float]:
+    """``(máximo, saldo, caída en USD, caída en %)`` a centavos."""
+    peak_c = _cents(peak)
+    current_c = _cents(current)
+    drawdown = _cents(max(0.0, peak_c - current_c))
+    pct = drawdown * 100.0 / peak_c if peak_c > 0 else 0.0
+    return peak_c, current_c, drawdown, pct
+
+
 def wallet_state(
     wallet_events: Iterable[Any],
     trades: Iterable[Any],
@@ -924,15 +1170,31 @@ def wallet_state(
     *,
     month_start: datetime,
     assumed_start_usd: float,
+    withdrawal_peak: WithdrawalPeak = "proportional",
+    deposit_raises_peak: bool = True,
+    restart_at: datetime | None = None,
+    restart_lock_id: int | None = None,
 ) -> WalletState:
     """Saldo, máximo del mes y caída (ver las reglas en el docstring del módulo).
 
-    ``assumed_start_usd`` es el saldo que se supone al empezar el mes si el
-    usuario nunca anotó un saldo (la billetera mensual del perfil).
+    - ``assumed_start_usd``: el saldo que se supone al empezar el mes si el
+      usuario nunca anotó un saldo (la billetera mensual del perfil).
+    - ``withdrawal_peak`` / ``deposit_raises_peak``: cómo mueven el máximo los
+      retiros y los depósitos (``circuit_breakers.monthly_drawdown_lock``).
+    - ``restart_at``: la hora del último bloqueo total del mes; si viene (y
+      cae entre el inicio del mes y ``now``), ``WalletState.restart`` trae la
+      caída medida de nuevo desde el saldo de ese momento. ``restart_lock_id``
+      es el número de ese bloqueo en la base (solo para mostrar).
     """
     moment = _aware_utc(now, "La hora actual")
     start = _aware_utc(month_start, "El inicio del mes")
     assumed_value = _number(assumed_start_usd, "El saldo supuesto")
+    if withdrawal_peak not in WITHDRAWAL_PEAK_RULES:
+        raise ValueError(
+            f"Regla de retiros desconocida: {withdrawal_peak!r} "
+            f"(opciones: {', '.join(WITHDRAWAL_PEAK_RULES)})."
+        )
+    restart_moment = _opt_aware_utc(restart_at, "La hora del bloqueo")
     events = sorted(
         (e for e in (WalletRecord.from_value(x) for x in wallet_events) if e.ts <= moment),
         key=lambda e: (e.ts, e.id if e.id is not None else 0),
@@ -982,49 +1244,63 @@ def wallet_state(
     month_start_balance = after[pre_month[-1]] if pre_month else initial
     current = after[-1]
 
-    peak = month_start_balance
-    peak_at = start
+    walk = _walk_peak(
+        points,
+        after,
+        (i for i, p in enumerate(points) if p.ts >= start and p.kind != POINT_ASSUMED_START),
+        start_balance=month_start_balance,
+        start_ts=start,
+        keep_history=True,
+        withdrawal_peak=withdrawal_peak,
+        deposit_raises_peak=deposit_raises_peak,
+    )
     history = [
         WalletPoint(
             ts=start,
             kind=POINT_ASSUMED_START if assumed else POINT_MONTH_START,
             delta_usd=None,
             balance_usd=_cents(month_start_balance),
-            peak_usd=_cents(peak),
-        )
+            peak_usd=_cents(month_start_balance),
+        ),
+        *(walk.history or []),
     ]
-    deposits = withdrawals = trading = 0.0
-    lowest = month_start_balance
-    for i, p in enumerate(points):
-        if p.ts < start or p.kind == POINT_ASSUMED_START:
-            continue
-        bal = after[i]
-        if p.kind == POINT_WITHDRAWAL:
-            peak += p.amount  # el retiro baja el máximo en lo mismo (p.amount es negativo)
-            withdrawals -= p.amount
-        elif p.kind == POINT_DEPOSIT:
-            deposits += p.amount
-        elif p.kind == POINT_TRADE:
-            trading += p.amount
-        if bal > peak:
-            peak, peak_at = bal, p.ts
-        lowest = min(lowest, bal)
-        history.append(
-            WalletPoint(
-                ts=p.ts,
-                kind=p.kind,
-                delta_usd=None if p.is_snapshot else _cents(p.amount),
-                balance_usd=_cents(bal),
-                peak_usd=_cents(peak),
-                ref_id=p.ref_id,
-                symbol=p.symbol,
-            )
-        )
+    peak_c, current_c, drawdown, drawdown_pct = _drawdown(walk.peak, current)
 
-    peak_c = _cents(peak)
-    current_c = _cents(current)
-    drawdown = _cents(max(0.0, peak_c - current_c))
-    drawdown_pct = drawdown * 100.0 / peak_c if peak_c > 0 else 0.0
+    restart: DrawdownRestart | None = None
+    if restart_moment is not None and start <= restart_moment <= moment:
+        # Como un mes nuevo que empieza en el bloqueo: la base es el saldo
+        # después de todo lo que pasó hasta esa hora (la pérdida del disparo
+        # incluida).
+        upto = [i for i, p in enumerate(points) if p.ts <= restart_moment]
+        base = after[upto[-1]] if upto else initial
+        rwalk = _walk_peak(
+            points,
+            after,
+            (
+                i
+                for i, p in enumerate(points)
+                if p.ts > restart_moment and p.kind != POINT_ASSUMED_START
+            ),
+            start_balance=base,
+            start_ts=restart_moment,
+            keep_history=False,
+            withdrawal_peak=withdrawal_peak,
+            deposit_raises_peak=deposit_raises_peak,
+        )
+        r_peak, r_current, r_dd, r_pct = _drawdown(rwalk.peak, current)
+        restart = DrawdownRestart(
+            lock_id=restart_lock_id,
+            locked_at=restart_moment,
+            start_balance_usd=_cents(base),
+            peak_usd=r_peak,
+            peak_at=rwalk.peak_at,
+            current_balance_usd=r_current,
+            drawdown_usd=r_dd,
+            drawdown_pct=r_pct,
+            deposits_usd=_cents(rwalk.deposits),
+            withdrawals_usd=_cents(rwalk.withdrawals),
+            trading_pnl_usd=_cents(rwalk.trading),
+        )
 
     warnings: list[str] = []
     if assumed:
@@ -1033,7 +1309,7 @@ def wallet_state(
             f"supongo que empezaste el mes con {fmt_usd(assumed_value)} (la billetera mensual "
             "del perfil). Anotá tu saldo real para que el cálculo sea exacto."
         )
-    if lowest < 0 or current < 0:
+    if walk.lowest < 0 or current < 0:
         warnings.append(
             "El saldo calculado de la billetera da negativo en algún momento del mes: "
             "revisá los movimientos y el saldo anotados."
@@ -1048,17 +1324,20 @@ def wallet_state(
         month_start_balance_usd=_cents(month_start_balance),
         current_balance_usd=current_c,
         month_peak_usd=peak_c,
-        month_peak_at=peak_at,
+        month_peak_at=walk.peak_at,
         drawdown_usd=drawdown,
         drawdown_pct=drawdown_pct,
-        month_deposits_usd=_cents(deposits),
-        month_withdrawals_usd=_cents(withdrawals),
-        month_trading_pnl_usd=_cents(trading),
+        month_deposits_usd=_cents(walk.deposits),
+        month_withdrawals_usd=_cents(walk.withdrawals),
+        month_trading_pnl_usd=_cents(walk.trading),
         last_balance_at=None if last_balance is None else last_balance.ts,
         last_balance_usd=None if last_balance is None else last_balance.amount_usd,
         anchor=anchor,
         points=tuple(history),
         warnings=tuple(warnings),
+        withdrawal_peak=withdrawal_peak,
+        deposit_raises_peak=deposit_raises_peak,
+        restart=restart,
     )
 
 
@@ -1070,7 +1349,11 @@ class TradingState:
     """Todo lo que la capa de seguridad necesita saber del estado de trading en ``now``.
 
     Los números ya vienen calculados (ver el docstring del módulo). Para el
-    plan (``risk.plan.PlanInputs``): ``trades_today`` y ``plan_pnl_today_usd``.
+    plan (``risk.plan.PlanInputs``): ``trades_today``, ``plan_pnl_today_usd``
+    (el resultado **actual** del día) y ``open_risk_usd``. Para los frenos del
+    día y de la semana: ``day_max_loss_usd`` / ``week_max_loss_usd`` (la
+    pérdida más grande a la que se llegó). ``month_locks``: los bloqueos
+    totales del mes anotados en la base (el último, ``latest_month_lock``).
     """
 
     now: datetime
@@ -1091,6 +1374,7 @@ class TradingState:
     month_trades: tuple[TradeRecord, ...]
     month_wallet_events: tuple[WalletRecord, ...]
     warnings: tuple[str, ...] = ()
+    month_locks: tuple[SafetyLockRecord, ...] = ()
 
     @property
     def day_pnl_usd(self) -> float:
@@ -1099,8 +1383,13 @@ class TradingState:
 
     @property
     def day_loss_usd(self) -> float:
-        """Pérdida del día según ``loss_basis`` (positiva; 0 si el día va ganando)."""
+        """Pérdida actual del día según ``loss_basis`` (positiva; 0 si el día va ganando)."""
         return self.day.loss_usd
+
+    @property
+    def day_max_loss_usd(self) -> float:
+        """La pérdida más grande a la que se llegó hoy (``PeriodPnl.max_loss_usd``)."""
+        return self.day.max_loss_usd
 
     @property
     def week_pnl_usd(self) -> float:
@@ -1109,6 +1398,16 @@ class TradingState:
     @property
     def week_loss_usd(self) -> float:
         return self.week.loss_usd
+
+    @property
+    def week_max_loss_usd(self) -> float:
+        """La pérdida más grande a la que se llegó en la semana."""
+        return self.week.max_loss_usd
+
+    @property
+    def latest_month_lock(self) -> SafetyLockRecord | None:
+        """El último bloqueo total del mes anotado en la base (``None`` si no hubo)."""
+        return self.month_locks[-1] if self.month_locks else None
 
     @property
     def plan_pnl_today_usd(self) -> float:
@@ -1121,8 +1420,13 @@ class TradingState:
 
     @property
     def open_risk_usd(self) -> float:
-        """Riesgo sumado de las posiciones abiertas (lo que se pierde si tocan todos los stops)."""
-        return _cents(sum(p.risk_usd for p in self.open_positions))
+        """Lo que se pierde si tocan todos los stops de las posiciones abiertas.
+
+        Suma ``max(0, riesgo)`` de cada una: un stop en la entrada o en
+        ganancia (riesgo 0 o negativo) cuenta 0, no resta. Una cobertura en la
+        misma moneda también suma (pueden saltar los dos stops).
+        """
+        return _cents(sum(max(0.0, p.risk_usd) for p in self.open_positions))
 
     def active_volatility_events(
         self, now: datetime | None = None
@@ -1152,8 +1456,10 @@ class TradingState:
                 "month": self.month,
                 "day_pnl_usd": self.day_pnl_usd,
                 "day_loss_usd": self.day_loss_usd,
+                "day_max_loss_usd": self.day_max_loss_usd,
                 "week_pnl_usd": self.week_pnl_usd,
                 "week_loss_usd": self.week_loss_usd,
+                "week_max_loss_usd": self.week_max_loss_usd,
                 "plan_pnl_today_usd": self.plan_pnl_today_usd,
                 "trades_today": self.trades_today,
                 "closed_trades_opened_today": self.closed_trades_opened_today,
@@ -1167,6 +1473,8 @@ class TradingState:
                 "upcoming_volatility_events": list(self.upcoming_volatility_events()),
                 "month_trades": list(self.month_trades),
                 "month_wallet_events": list(self.month_wallet_events),
+                "month_locks": list(self.month_locks),
+                "latest_month_lock": self.latest_month_lock,
                 "warnings": list(self.warnings),
             }
         )
@@ -1181,6 +1489,7 @@ def build_trading_state(
     settings: AppSettings,
     profile: Any,
     now: datetime,
+    safety_locks: Iterable[Any] = (),
 ) -> TradingState:
     """Arma ``TradingState`` con los registros ya leídos (pura: no lee nada).
 
@@ -1192,6 +1501,10 @@ def build_trading_state(
       que no terminaron en ``now``; los terminados se descartan).
     - ``profile``: el perfil de riesgo (``EffectiveProfile`` o algo con
       ``monthly_wallet_usd``, ``max_daily_loss_usd``, ...).
+    - ``safety_locks``: los bloqueos totales anotados en la base
+      (``StoredSafetyLock``); se usan los del mes hasta ``now``. Con
+      ``monthly_drawdown_lock.restart_after_unlock``, el último define
+      ``wallet.restart``.
     """
     moment = _aware_utc(now, "La hora actual")
     cb = settings.circuit_breakers
@@ -1230,13 +1543,31 @@ def build_trading_state(
         consecutive_losses=cb.losing_streak.consecutive_losses,
         cooldown_hours=cb.losing_streak.cooldown_hours,
         reset_after_cooldown=cb.losing_streak.reset_after_cooldown,
+        extend_cooldown_on_loss=cb.losing_streak.extend_cooldown_on_loss,
     )
+    month_locks = tuple(
+        sorted(
+            (
+                lk
+                for lk in (SafetyLockRecord.from_value(x) for x in safety_locks)
+                if periods.month_start <= lk.triggered_at <= moment
+            ),
+            key=lambda lk: (lk.triggered_at, lk.id if lk.id is not None else 0),
+        )
+    )
+    dd_cfg = cb.monthly_drawdown_lock
+    latest_lock = month_locks[-1] if month_locks else None
+    restart_from = latest_lock if dd_cfg.restart_after_unlock else None
     wallet = wallet_state(
         events,
         all_trades,
         moment,
         month_start=periods.month_start,
         assumed_start_usd=limits.monthly_wallet_usd,
+        withdrawal_peak=dd_cfg.withdrawal_peak,
+        deposit_raises_peak=dd_cfg.deposit_raises_peak,
+        restart_at=None if restart_from is None else restart_from.triggered_at,
+        restart_lock_id=None if restart_from is None else restart_from.id,
     )
     month_trades = tuple(t for t in all_trades if t.closed_at >= periods.month_start)
     month_events = [e for e in events if periods.month_start <= e.ts <= moment]
@@ -1262,6 +1593,7 @@ def build_trading_state(
         month_trades=month_trades,
         month_wallet_events=tuple(month_events),
         warnings=wallet.warnings,
+        month_locks=month_locks,
     )
 
 
@@ -1274,10 +1606,13 @@ def load_trading_state(
     """Lee la base y arma ``TradingState`` (única función con I/O del módulo).
 
     Lee todas las operaciones y movimientos (una app personal tiene pocos
-    cientos por año: es instantáneo), las posiciones abiertas y los eventos de
-    alta volatilidad que no terminaron en ``now``.
+    cientos por año: es instantáneo), las posiciones abiertas, los eventos de
+    alta volatilidad que no terminaron en ``now`` y, si la base sabe
+    listarlos (``SafetyLockSource``), los bloqueos totales anotados.
     """
     moment = _aware_utc(now, "La hora actual")
+    list_locks = getattr(repo, "list_safety_locks", None)
+    locks: Sequence[Any] = list_locks() if callable(list_locks) else ()
     return build_trading_state(
         trades=repo.list_trades(),
         open_positions=repo.list_open_positions(),
@@ -1286,6 +1621,7 @@ def load_trading_state(
         settings=settings,
         profile=profile,
         now=moment,
+        safety_locks=locks,
     )
 
 
@@ -1298,12 +1634,16 @@ __all__ = [
     "POINT_WITHDRAWAL",
     "WALLET_KINDS",
     "WEEKDAY_INDEX",
+    "WITHDRAWAL_PEAK_RULES",
+    "DrawdownRestart",
     "LosingStreakState",
     "LossBasis",
     "PeriodPnl",
     "Periods",
     "PositionRecord",
     "ProfileLimits",
+    "SafetyLockRecord",
+    "SafetyLockSource",
     "TradeRecord",
     "TradingState",
     "TradingStateSource",
@@ -1311,6 +1651,7 @@ __all__ = [
     "WalletPoint",
     "WalletRecord",
     "WalletState",
+    "WithdrawalPeak",
     "build_trading_state",
     "count_opened_in",
     "load_trading_state",

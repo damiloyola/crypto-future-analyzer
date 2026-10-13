@@ -24,6 +24,10 @@ Historial del esquema (``PRAGMA user_version``)
        toca ninguna tabla existente. Una base de la versión 1 se migra sola al
        abrirla (``MIGRATIONS[1]`` crea la tabla nueva y marca la versión 2), sin
        perder datos.
+    3. Hito 5, segunda ronda: agrega ``safety_locks`` (cada bloqueo total que
+       escribió la app, para medir de nuevo la caída del mes después de que el
+       usuario borra el LOCKED). También aditivo: ``MIGRATIONS[2]`` crea la
+       tabla. Una base de la versión 1 pasa por 1 → 2 → 3.
 
 Una base de una versión **más nueva** que la app (por ejemplo, abierta con un
 checkout viejo) se rechaza: la app vieja no sabe qué tablas o columnas espera.
@@ -52,7 +56,7 @@ IN_MEMORY = ":memory:"
 
 #: Versión del esquema. Se guarda en ``PRAGMA user_version`` al crear la base.
 #: Ver el historial en el docstring del módulo.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def default_db_path(settings: AppSettings) -> Path:
@@ -121,8 +125,14 @@ def _migrate_1_to_2(engine: Engine) -> None:
     table.create(engine, checkfirst=True)
 
 
+def _migrate_2_to_3(engine: Engine) -> None:
+    """Versión 2 → 3: crea ``safety_locks`` (aditivo, no toca datos)."""
+    table = SQLModel.metadata.tables[_models.SafetyLock.__tablename__]
+    table.create(engine, checkfirst=True)
+
+
 #: Migraciones: ``MIGRATIONS[n]`` lleva una base de la versión ``n`` a la ``n + 1``.
-MIGRATIONS: dict[int, Callable[[Engine], None]] = {1: _migrate_1_to_2}
+MIGRATIONS: dict[int, Callable[[Engine], None]] = {1: _migrate_1_to_2, 2: _migrate_2_to_3}
 
 
 def _set_user_version(engine: Engine, version: int) -> None:
@@ -135,7 +145,7 @@ def init_db(engine: Engine) -> None:
 
     - Base nueva (versión 0): crea todo y guarda ``SCHEMA_VERSION``. Si tiene
       solo tablas de la app (una creación que se cortó a la mitad), la completa.
-    - Base de una versión anterior (por ejemplo, la 1): aplica las migraciones
+    - Base de una versión anterior (la 1 o la 2): aplica las migraciones
       de ``MIGRATIONS`` en orden (todas aditivas) y marca ``SCHEMA_VERSION``.
     - Base con la misma versión: crea solo las tablas que falten (no toca datos).
     - Base de una versión más nueva que la app, o un archivo SQLite con tablas

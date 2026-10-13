@@ -26,6 +26,7 @@ from app.safety.state import (
     POINT_WITHDRAWAL,
     PositionRecord,
     ProfileLimits,
+    SafetyLockRecord,
     TradeRecord,
     TradingState,
     VolatilityEventRecord,
@@ -83,12 +84,17 @@ def with_streak(settings: AppSettings, **changes) -> AppSettings:
     return with_breakers(settings, losing_streak=streak)
 
 
+def with_drawdown(settings: AppSettings, **changes) -> AppSettings:
+    dd = settings.circuit_breakers.monthly_drawdown_lock.model_copy(update=changes)
+    return with_breakers(settings, monthly_drawdown_lock=dd)
+
+
 @pytest.fixture
 def profile(settings):
     return get_profile("agresivo", settings)
 
 
-def build(settings, profile, *, now=NOW, trades=(), positions=(), events=(), vol=()):
+def build(settings, profile, *, now=NOW, trades=(), positions=(), events=(), vol=(), locks=()):
     return build_trading_state(
         trades=list(trades),
         open_positions=list(positions),
@@ -97,6 +103,7 @@ def build(settings, profile, *, now=NOW, trades=(), positions=(), events=(), vol
         settings=settings,
         profile=profile,
         now=now,
+        safety_locks=list(locks),
     )
 
 
@@ -108,6 +115,15 @@ def test_config_uses_buenos_aires_and_monday(settings):
     assert settings.circuit_breakers.week_starts_on == "monday"
     assert settings.circuit_breakers.loss_basis == "net"
     assert settings.circuit_breakers.month_starts == "calendar"
+
+
+def test_config_has_the_second_round_decisions(settings):
+    cb = settings.circuit_breakers
+    assert cb.latch_until_period_end is True
+    assert cb.losing_streak.extend_cooldown_on_loss is True
+    assert cb.monthly_drawdown_lock.withdrawal_peak == "proportional"
+    assert cb.monthly_drawdown_lock.deposit_raises_peak is True
+    assert cb.monthly_drawdown_lock.restart_after_unlock is True
 
 
 def test_period_bounds_in_buenos_aires():
@@ -220,6 +236,58 @@ def test_a_winning_day_has_zero_loss(settings, profile):
     assert state.day_pnl_usd == 30.0
     assert state.day_loss_usd == 0.0
     assert state.plan_pnl_today_usd == 30.0
+
+
+def test_max_loss_keeps_the_worst_running_net_of_the_period(settings, profile):
+    """Decisión del usuario (latch): perdiste 60, después ganaste 20 → la más grande es 60."""
+    trades = [trade(local(10, 13, 9), -60.0), trade(local(10, 13, 11), 20.0)]
+    state = build(settings, profile, trades=trades)
+    assert state.day_loss_usd == 40.0  # actual
+    assert state.day_max_loss_usd == 60.0  # la más grande
+    assert state.plan_pnl_today_usd == -40.0  # el plan mira la actual
+    assert state.week_max_loss_usd == 60.0
+    d = state.to_dict()
+    assert (d["day_max_loss_usd"], d["week_max_loss_usd"], d["day"]["max_loss_usd"]) == (
+        60.0,
+        60.0,
+        60.0,
+    )
+
+
+def test_max_loss_walks_the_trades_in_close_order(settings, profile):
+    # Cargadas desordenadas: +30 (9:00), -50 (10:00), -20 (11:00), +45 (12:00).
+    trades = [
+        trade(local(10, 13, 12), 45.0),
+        trade(local(10, 13, 10), -50.0),
+        trade(local(10, 13, 9), 30.0),
+        trade(local(10, 13, 11), -20.0),
+    ]
+    day = build(settings, profile, trades=trades).day
+    assert day.net_pnl_usd == 5.0 and day.loss_usd == 0.0
+    assert day.max_loss_usd == 40.0  # 30 - 50 - 20 = -40 fue lo peor
+
+
+def test_max_loss_with_a_win_first_never_goes_below_zero():
+    p = period_pnl(
+        [trade(local(10, 13, 9), 80.0), trade(local(10, 13, 10), -30.0)],
+        local(10, 13),
+        local(10, 14),
+    )
+    assert (p.loss_usd, p.max_loss_usd) == (0.0, 0.0)
+    assert period_pnl([], local(10, 13), local(10, 14)).max_loss_usd == 0.0
+
+
+def test_max_loss_with_gross_basis_is_the_sum_of_the_losses():
+    trades = [trade(local(10, 13, 9), -60.0), trade(local(10, 13, 11), 20.0)]
+    p = period_pnl(trades, local(10, 13), local(10, 14), loss_basis="gross")
+    assert (p.loss_usd, p.max_loss_usd) == (60.0, 60.0)
+
+
+def test_max_loss_of_the_week_spans_several_days(settings, profile):
+    trades = [trade(local(10, 12, 10), -150.0), trade(local(10, 13, 9), 60.0)]
+    state = build(settings, profile, trades=trades)
+    assert (state.week_loss_usd, state.week_max_loss_usd) == (90.0, 150.0)
+    assert (state.day_loss_usd, state.day_max_loss_usd) == (0.0, 0.0)  # hoy solo ganó
 
 
 def test_period_sums_are_rounded_to_cents():
@@ -348,6 +416,63 @@ def test_a_loss_during_the_pause_stretches_it():
     assert s.count == 4
 
 
+def test_without_extension_a_loss_during_the_pause_does_not_stretch_it():
+    """``extend_cooldown_on_loss: false``: la pausa termina a la hora prevista."""
+    trades = [trade(local(10, 13, h), -10.0) for h in (10, 11, 12)]  # pausa hasta 16:00
+    trades.append(trade(local(10, 13, 13), -10.0))
+    s = losing_streak_state(
+        trades,
+        local(10, 13, 15, 59),
+        consecutive_losses=3,
+        cooldown_hours=4,
+        extend_cooldown_on_loss=False,
+    )
+    assert s.cooldown_started_at == local(10, 13, 12)
+    assert s.cooldown_until == local(10, 13, 16)
+    assert s.cooldown_active()
+    assert s.count == 4  # la pérdida igual suma
+    assert s.extend_cooldown_on_loss is False
+    later = losing_streak_state(
+        trades,
+        local(10, 13, 16),
+        consecutive_losses=3,
+        cooldown_hours=4,
+        extend_cooldown_on_loss=False,
+    )
+    assert not later.cooldown_active()
+    assert later.count == 0  # terminó la pausa: la cuenta vuelve a cero
+
+
+def test_without_extension_and_without_reset_a_new_loss_after_the_pause_starts_another():
+    trades = [trade(local(10, 13, h), -10.0) for h in (8, 9, 10)]  # pausa 10:00-14:00
+    trades.append(trade(local(10, 13, 11), -10.0))  # durante la pausa: no la estira
+    trades.append(trade(local(10, 13, 14, 30), -10.0))  # después: pausa nueva
+    s = losing_streak_state(
+        trades,
+        local(10, 13, 15),
+        consecutive_losses=3,
+        cooldown_hours=4,
+        reset_after_cooldown=False,
+        extend_cooldown_on_loss=False,
+    )
+    assert s.count == 5
+    assert s.cooldown_started_at == local(10, 13, 14, 30)
+    assert s.cooldown_until == local(10, 13, 18, 30)
+
+
+def test_state_uses_the_cooldown_extension_setting(settings, profile):
+    trades = [trade(local(10, 13, h), -10.0) for h in (9, 10, 11)]  # pausa hasta 15:00
+    trades.append(trade(local(10, 13, 12), -10.0))
+    on = build(settings, profile, trades=trades, now=local(10, 13, 15, 30))
+    assert on.streak.cooldown_until == local(10, 13, 16)
+    assert on.streak.cooldown_active()
+    assert on.to_dict()["streak"]["extend_cooldown_on_loss"] is True
+    off_settings = with_streak(settings, extend_cooldown_on_loss=False)
+    off = build(off_settings, profile, trades=trades, now=local(10, 13, 15, 30))
+    assert off.streak.cooldown_until == local(10, 13, 15)
+    assert not off.streak.cooldown_active()
+
+
 def test_a_win_or_breakeven_breaks_the_streak():
     trades = [
         trade(local(10, 13, 8), -10.0),
@@ -460,7 +585,8 @@ def test_balance_loaded_mid_month_is_projected_back_to_the_first_instant():
     assert w.last_balance_usd == 250.0
 
 
-def test_deposits_raise_the_peak():
+def test_deposits_raise_the_peak_by_the_same_amount():
+    """Decisión del usuario: la pérdida de antes sigue contando (300 - 100 + 200 - 50)."""
     events = [
         wallet(local(10, 1, 9), "balance", 300.0),
         wallet(local(10, 6), "deposit", 200.0),
@@ -468,18 +594,50 @@ def test_deposits_raise_the_peak():
     trades = [trade(local(10, 5), -100.0), trade(local(10, 8), -50.0)]
     w = wallet_of(events, trades)
     assert w.current_balance_usd == 350.0
-    assert w.month_peak_usd == 400.0
-    assert w.month_peak_at == local(10, 6).astimezone(UTC)
-    assert w.drawdown_usd == 50.0
-    assert w.drawdown_pct == 12.5
+    assert w.month_peak_usd == 500.0  # 300 + 200
+    assert w.month_peak_at == MONTH_START.astimezone(UTC)  # el máximo es el mismo, corrido
+    assert w.drawdown_usd == 150.0
+    assert w.drawdown_pct == 30.0
     assert w.month_deposits_usd == 200.0
+    assert w.deposit_raises_peak is True
     kinds = [p.kind for p in w.points]
     assert kinds == [POINT_MONTH_START, "balance", POINT_TRADE, POINT_DEPOSIT, POINT_TRADE]
-    assert [p.peak_usd for p in w.points] == [300.0, 300.0, 300.0, 400.0, 400.0]
+    assert [p.peak_usd for p in w.points] == [300.0, 300.0, 300.0, 500.0, 500.0]
 
 
-def test_withdrawals_lower_the_peak_by_the_same_amount():
-    """Sacar plata no es perder plata: no tiene que disparar el bloqueo."""
+def test_without_deposit_raises_peak_the_peak_only_moves_when_the_balance_passes_it():
+    events = [
+        wallet(local(10, 1, 9), "balance", 300.0),
+        wallet(local(10, 6), "deposit", 200.0),
+    ]
+    trades = [trade(local(10, 5), -100.0), trade(local(10, 8), -50.0)]
+    w = wallet_state(
+        events,
+        trades,
+        NOW,
+        month_start=MONTH_START,
+        assumed_start_usd=300.0,
+        deposit_raises_peak=False,
+    )
+    assert w.month_peak_usd == 400.0
+    assert w.month_peak_at == local(10, 6).astimezone(UTC)
+    assert w.drawdown_pct == 12.5
+
+
+def test_a_deposit_after_a_big_loss_does_not_erase_the_drawdown():
+    """Hallazgo 3: depositar no esquiva el bloqueo (300 → 100, +200, -205 → 81 %)."""
+    events = [wallet(local(10, 1, 9), "balance", 300.0), wallet(local(10, 6), "deposit", 200.0)]
+    only_deposit = wallet_of(events, [trade(local(10, 5), -200.0)])
+    assert only_deposit.current_balance_usd == 300.0
+    assert only_deposit.month_peak_usd == 500.0
+    assert math.isclose(only_deposit.drawdown_pct, 40.0)  # la caída de 200 sigue ahí
+    w = wallet_of(events, [trade(local(10, 5), -200.0), trade(local(10, 8), -205.0)])
+    assert w.current_balance_usd == 95.0
+    assert math.isclose(w.drawdown_pct, 81.0)
+
+
+def test_a_withdrawal_at_the_peak_lowers_it_by_the_same_amount():
+    """Sacar plata no es perder plata: en el máximo, proporcional y "restar" coinciden."""
     events = [
         wallet(local(10, 1, 9), "balance", 300.0),
         wallet(local(10, 7), "withdrawal", 400.0),
@@ -491,6 +649,81 @@ def test_withdrawals_lower_the_peak_by_the_same_amount():
     assert w.drawdown_pct == 10.0
     assert w.month_withdrawals_usd == 400.0
     assert [p.kind for p in w.points][-2:] == [POINT_WITHDRAWAL, POINT_TRADE]
+
+
+def withdrawal_case(rule: str):
+    """300 el 01/10, -150 el 05/10 (50 % abajo) y un retiro de 100 el 06/10 sin operar."""
+    events = [
+        wallet(local(10, 1, 9), "balance", 300.0),
+        wallet(local(10, 6), "withdrawal", 100.0),
+    ]
+    return wallet_state(
+        events,
+        [trade(local(10, 5), -150.0)],
+        NOW,
+        month_start=MONTH_START,
+        assumed_start_usd=300.0,
+        withdrawal_peak=rule,
+    )
+
+
+def test_a_withdrawal_below_the_peak_does_not_change_the_drawdown_percent():
+    """Hallazgo 2 / decisión del usuario: el máximo baja en la misma proporción que el saldo."""
+    w = withdrawal_case("proportional")
+    assert w.current_balance_usd == 50.0
+    assert w.month_peak_usd == 100.0  # 300 × 50 / 150
+    assert w.drawdown_pct == 50.0  # igual que antes del retiro
+    assert w.withdrawal_peak == "proportional"
+    assert w.points[-1].peak_usd == 100.0
+
+
+def test_withdrawal_rules_subtract_and_none():
+    subtract = withdrawal_case("subtract")
+    assert subtract.month_peak_usd == 200.0  # 300 - 100 (lo de antes)
+    assert subtract.drawdown_pct == 75.0
+    none = withdrawal_case("none")
+    assert none.month_peak_usd == 300.0  # el retiro cuenta como caída
+    assert math.isclose(none.drawdown_pct, 250 / 3)
+    with pytest.raises(ValueError, match="Regla de retiros desconocida"):
+        withdrawal_case("half")
+
+
+def test_withdrawing_everything_leaves_no_drawdown():
+    events = [wallet(local(10, 1, 9), "balance", 300.0), wallet(local(10, 6), "withdrawal", 150.0)]
+    w = wallet_of(events, [trade(local(10, 5), -150.0)])
+    assert w.current_balance_usd == 0.0
+    assert w.month_peak_usd == 0.0
+    assert w.drawdown_pct == 0.0  # sacar todo no es una caída
+
+
+def test_a_withdrawal_with_the_balance_already_at_zero_or_below():
+    """Saldo antes del retiro <= 0 (un error de carga): el máximo no cambia y se avisa."""
+    events = [wallet(local(10, 1, 9), "balance", 100.0), wallet(local(10, 6), "withdrawal", 20.0)]
+    w = wallet_of(events, [trade(local(10, 5), -100.0)])
+    assert w.current_balance_usd == -20.0
+    assert w.month_peak_usd == 100.0
+    assert w.drawdown_pct == 120.0
+    assert any("negativo" in x for x in w.warnings)
+    more = [wallet(local(10, 1, 9), "balance", 100.0), wallet(local(10, 6), "withdrawal", 130.0)]
+    w = wallet_of(more, [trade(local(10, 5), -50.0)])  # 50 de saldo y retira 130
+    assert w.current_balance_usd == -80.0
+    assert w.month_peak_usd == 0.0 and w.drawdown_pct == 0.0
+    assert any("negativo" in x for x in w.warnings)
+
+
+def test_state_uses_the_wallet_rules_of_the_config(settings, profile):
+    events = [wallet(local(10, 1, 9), "balance", 300.0), wallet(local(10, 6), "withdrawal", 100.0)]
+    trades = [trade(local(10, 5), -150.0)]
+    state = build(settings, profile, trades=trades, events=events)
+    assert state.wallet.drawdown_pct == 50.0
+    old = with_drawdown(settings, withdrawal_peak="subtract", deposit_raises_peak=False)
+    assert build(old, profile, trades=trades, events=events).wallet.drawdown_pct == 75.0
+    d = state.to_dict()["wallet"]
+    assert (d["withdrawal_peak"], d["deposit_raises_peak"], d["restart"]) == (
+        "proportional",
+        True,
+        None,
+    )
 
 
 def test_a_lower_balance_correction_counts_as_a_drop():
@@ -627,6 +860,147 @@ def test_state_rejects_naive_now(settings, profile):
         build(settings, profile, now=datetime(2026, 10, 13, 15, 0))
 
 
+# --- bloqueo total anotado: la caída se mide de nuevo (restart_after_unlock) ---------
+
+
+def lock(ts: datetime, **kw) -> dict:
+    return {"id": next(_ids), "triggered_at": ts, "trigger_code": "monthly_drawdown_lock", **kw}
+
+
+LOCK_EVENTS = [wallet(local(10, 1, 9), "balance", 300.0)]
+LOCK_TRADES = [trade(local(10, 5, 10), -220.0)]  # 300 → 80: 73 %, bloqueo el 05/10 12:00
+
+
+def test_wallet_restart_measures_from_the_balance_right_after_the_lock():
+    trades = [*LOCK_TRADES, trade(local(10, 6), 20.0), trade(local(10, 7), -40.0)]
+    w = wallet_state(
+        LOCK_EVENTS,
+        trades,
+        NOW,
+        month_start=MONTH_START,
+        assumed_start_usd=300.0,
+        restart_at=local(10, 5, 12),
+        restart_lock_id=7,
+    )
+    assert math.isclose(w.drawdown_pct, (300 - 60) / 300 * 100)  # el mes sigue igual
+    r = w.restart
+    assert r is not None
+    assert r.lock_id == 7
+    assert r.locked_at == local(10, 5, 12).astimezone(UTC)
+    assert r.start_balance_usd == 80.0  # con la pérdida que disparó el bloqueo
+    assert r.peak_usd == 100.0 and r.peak_at == local(10, 6).astimezone(UTC)
+    assert r.current_balance_usd == 60.0
+    assert (r.drawdown_usd, r.drawdown_pct) == (40.0, 40.0)
+    assert r.trading_pnl_usd == -20.0
+    d = r.to_dict()
+    assert json.loads(json.dumps(d, allow_nan=False)) == d
+
+
+def test_wallet_restart_includes_a_trade_closed_exactly_at_the_lock_time():
+    w = wallet_state(
+        LOCK_EVENTS,
+        [trade(local(10, 5, 12), -220.0)],
+        NOW,
+        month_start=MONTH_START,
+        assumed_start_usd=300.0,
+        restart_at=local(10, 5, 12),
+    )
+    assert w.restart is not None
+    assert w.restart.start_balance_usd == 80.0 and w.restart.drawdown_pct == 0.0
+
+
+def test_wallet_restart_follows_the_deposit_and_withdrawal_rules():
+    events = [
+        *LOCK_EVENTS,
+        wallet(local(10, 6), "deposit", 120.0),  # 80 → 200, máximo 80 + 120 = 200
+        wallet(local(10, 9), "withdrawal", 50.0),  # después de -100: 100 → 50, máximo × 0,5
+    ]
+    trades = [*LOCK_TRADES, trade(local(10, 8), -100.0)]
+    w = wallet_state(
+        events,
+        trades,
+        NOW,
+        month_start=MONTH_START,
+        assumed_start_usd=300.0,
+        restart_at=local(10, 5, 12),
+    )
+    assert w.restart is not None
+    assert w.restart.peak_usd == 100.0
+    assert w.restart.current_balance_usd == 50.0
+    assert w.restart.drawdown_pct == 50.0
+    assert (w.restart.deposits_usd, w.restart.withdrawals_usd) == (120.0, 50.0)
+
+
+def test_wallet_restart_outside_the_month_or_in_the_future_is_ignored():
+    for when in (local(9, 28), NOW + timedelta(hours=1)):
+        w = wallet_state(
+            LOCK_EVENTS,
+            LOCK_TRADES,
+            NOW,
+            month_start=MONTH_START,
+            assumed_start_usd=300.0,
+            restart_at=when,
+        )
+        assert w.restart is None
+
+
+def test_state_restart_uses_the_latest_lock_of_the_month(settings, profile):
+    old = lock(local(9, 20))  # mes anterior: no cuenta
+    first = lock(local(10, 5, 12), drawdown_pct=73.33, peak_usd=300.0, balance_usd=80.0)
+    second = lock(local(10, 10, 9))
+    trades = [*LOCK_TRADES, trade(local(10, 9), 40.0), trade(local(10, 11), -10.0)]
+    state = build(settings, profile, trades=trades, events=LOCK_EVENTS, locks=[second, old, first])
+    assert [lk.id for lk in state.month_locks] == [first["id"], second["id"]]
+    assert state.latest_month_lock is not None and state.latest_month_lock.id == second["id"]
+    r = state.wallet.restart
+    assert r is not None and r.lock_id == second["id"]
+    assert r.start_balance_usd == 120.0  # 80 + 40 antes del segundo bloqueo
+    assert r.current_balance_usd == 110.0
+    d = state.to_dict()
+    assert json.loads(json.dumps(d, allow_nan=False)) == d
+    assert d["latest_month_lock"]["id"] == second["id"]
+    assert d["wallet"]["restart"]["lock_id"] == second["id"]
+
+
+def test_state_ignores_locks_of_previous_months_and_after_now(settings, profile):
+    locks = [lock(local(9, 30, 23)), lock(NOW + timedelta(minutes=1))]
+    state = build(settings, profile, trades=LOCK_TRADES, events=LOCK_EVENTS, locks=locks)
+    assert state.month_locks == ()
+    assert state.latest_month_lock is None
+    assert state.wallet.restart is None
+
+
+def test_state_without_restart_after_unlock_has_no_restart(settings, profile):
+    off = with_drawdown(settings, restart_after_unlock=False)
+    state = build(
+        off, profile, trades=LOCK_TRADES, events=LOCK_EVENTS, locks=[lock(local(10, 5, 12))]
+    )
+    assert len(state.month_locks) == 1  # se informa igual
+    assert state.wallet.restart is None
+
+
+def test_safety_lock_records_accept_objects_and_reject_bad_dates():
+    rec = SafetyLockRecord.from_value(lock(local(10, 5, 12), report_path="  ", balance_usd=80))
+    assert rec.triggered_at == local(10, 5, 12).astimezone(UTC)
+    assert rec.report_path is None and rec.balance_usd == 80.0
+    assert SafetyLockRecord.from_value(rec) is rec
+    assert json.loads(json.dumps(rec.to_dict())) == rec.to_dict()
+    with pytest.raises(ValueError, match="zona horaria"):
+        SafetyLockRecord.from_value({"id": 1, "triggered_at": datetime(2026, 10, 5, 12)})
+
+
+def test_open_risk_counts_zero_for_stops_at_entry_or_in_profit(settings, profile):
+    positions = [
+        {"id": 1, "symbol": "BTC", "side": "long", "risk_usd": 30.0, "opened_at": NOW},
+        {"id": 2, "symbol": "BTC", "side": "short", "risk_usd": 20.0, "opened_at": NOW},
+        {"id": 3, "symbol": "ETH", "side": "long", "risk_usd": 0.0, "opened_at": NOW},
+        {"id": 4, "symbol": "SOL", "side": "long", "risk_usd": -15.0, "opened_at": NOW},
+    ]
+    state = build(settings, profile, positions=positions)
+    assert state.open_risk_usd == 50.0  # la cobertura suma; 0 y negativo cuentan 0
+    assert state.to_dict()["open_risk_usd"] == 50.0
+
+
 # --- lectura de la base ---------------------------------------------------------------
 
 
@@ -669,3 +1043,41 @@ def test_load_trading_state_from_a_real_database(tmp_path: Path, settings, profi
     assert [e.note for e in state.active_volatility_events()] == ["Fed"]
     assert expired.id not in [e.id for e in state.volatility_events]
     json.dumps(state.to_dict(), allow_nan=False)
+
+
+def test_load_trading_state_reads_the_safety_locks(tmp_path: Path, settings, profile):
+    repo = Repository.open(tmp_path / "locks.db", clock=lambda: NOW)
+    repo.add_wallet_event(kind="balance", amount_usd=300.0, ts=local(10, 1, 9))
+    repo.add_trade(
+        symbol="BTC",
+        side="long",
+        pnl_usd=-220.0,
+        opened_at=local(10, 5, 9),
+        closed_at=local(10, 5, 10),
+    )
+    stored = repo.add_safety_lock(triggered_at=local(10, 5, 12), drawdown_pct=73.33)
+    repo.add_safety_lock(triggered_at=local(9, 15))  # mes anterior
+    state = load_trading_state(repo, settings, profile, NOW)
+    assert [lk.id for lk in state.month_locks] == [stored.id]
+    assert state.wallet.restart is not None
+    assert state.wallet.restart.start_balance_usd == 80.0
+
+
+def test_load_trading_state_works_with_a_source_without_locks(settings, profile):
+    """Una fuente sin ``list_safety_locks`` (por ejemplo, un doble de prueba) sigue andando."""
+
+    class Source:
+        def list_trades(self):
+            return LOCK_TRADES
+
+        def list_open_positions(self):
+            return []
+
+        def list_wallet_events(self):
+            return LOCK_EVENTS
+
+        def list_volatility_events(self, *, ending_after=None):
+            return []
+
+    state = load_trading_state(Source(), settings, profile, NOW)
+    assert state.month_locks == () and state.wallet.restart is None

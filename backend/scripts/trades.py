@@ -21,9 +21,15 @@ Comandos
       último análisis de esa moneda hecho en las
       ``circuit_breakers.link_analysis_within_hours`` horas antes de abrir
       (régimen, score y plan del momento, para el informe del incidente); un
-      número liga ese análisis; ``none``, ninguno.
+      número liga ese análisis (tiene que ser anterior a la apertura); ``none``,
+      ninguno.
     - ``open``: una posición abierta. ``--symbol --side --risk`` (lo que perdés
-      si toca el stop) y ``--entry --opened --note --analysis``.
+      si toca el stop; 0 si el stop está en la entrada o en ganancia) y
+      ``--entry --opened --note --analysis``.
+    - ``update N``: cambia una posición abierta sin cerrarla: ``--risk`` (por
+      ejemplo, después de mover el stop: 0 si quedó en la entrada o en
+      ganancia, así deja de contar para el límite del día y para el tope de
+      posiciones correlacionadas), ``--entry`` y ``--note`` (``""`` la borra).
     - ``close [N]``: cierra la posición ``N`` (si hay una sola, no hace falta el
       número) y la guarda como operación: ``--pnl`` y ``--exit --closed --note``.
     - ``list``: últimas operaciones (``--limit``), posiciones abiertas,
@@ -31,40 +37,58 @@ Comandos
     - ``deposit`` / ``withdraw`` / ``balance``: ``--amount`` (y ``--date
       --note``). ``balance`` anota el saldo que ves en Nexo.
     - ``event``: evento de alta volatilidad. ``--note "CPI de EE. UU." --until
-      "mañana 11:00"`` (y ``--from``). Mientras dura no se generan planes.
+      "mañana 11:00"`` (y ``--from``; sin ``--from`` empieza ahora). Mientras
+      dura no se generan planes.
     - ``delete trade|position|event|wallet N``: borra lo cargado por error (pide
       confirmación, salvo ``--yes``).
     - ``status``: el estado y los frenos de seguridad (si la caída del mes llegó
       al tope, escribe el informe y el archivo LOCKED, como la consola).
 
+Confirmación con ``--yes`` (``app.manual_input``): un resultado (``add``,
+``close``) más grande, en valor absoluto, que el saldo de la billetera o que
+``confirm_pnl_over_risk_multiple`` veces el riesgo por operación, y un evento
+de más de ``confirm_event_longer_than_days`` días, no se guardan sin ``--yes``
+(casi siempre son un error de tipeo): se explica y sale con 1.
+
 Opciones de todos los comandos: ``--db RUTA`` (otra base; el LOCKED y los
 informes van en su misma carpeta), ``--offline`` (la base de prueba de los
 datos sintéticos, la misma que usa ``make cli ARGS="--offline"``), ``--profile``
-y ``--config``.
+y ``--config``. Una ruta relativa es relativa a la carpeta desde donde corriste
+``make`` (el Makefile la pasa en ``ANALYZER_INVOCATION_DIR``) o, sin ``make``, a
+la carpeta actual. ``list``, ``status``, ``close``, ``update`` y ``delete`` con
+una ``--db`` que no existe salen con 1 sin crearla (¿ruta mal escrita?); los comandos que
+cargan algo la crean y lo avisan.
 
 Fechas y horas: en la zona del usuario (``app.user_timezone``), se guardan en
 UTC. Se aceptan ``"2026-10-13 14:30"``, ``"13/10 14:30"``, ``"14:30"`` (hoy),
 ``"ayer 22:00"``, ``"mañana 11:00"``, ``"ahora"`` y fechas ISO con zona
-(``2026-10-13T17:30:00Z``). Montos con coma o punto decimal (``-32,5``).
+(``2026-10-13T17:30:00Z``). Montos con coma o punto decimal (``-32,5``). Una
+fecha sin año es, para aperturas, cierres y movimientos, la pasada más reciente
+(el 1/1, ``"31/12 23:00"`` es de ayer) y, para eventos, la más cercana. Una hora
+hasta ``MAX_CLOCK_SKEW`` (5 min) adelante del reloj se guarda como ahora (si no,
+los frenos la ignorarían hasta esa hora); más adelante, es un error.
 
 Después de cargar algo muestra en una línea cómo quedaron los frenos (sin
 escribir el LOCKED: así podés terminar de cargar, por ejemplo, un depósito que
-faltaba; el bloqueo lo escriben ``status`` y el análisis).
+faltaba; el bloqueo lo escriben ``status`` y el análisis). Si ya hiciste las
+operaciones permitidas del día, también lo avisa.
 
-Sale con 0 si salió bien, 1 si no existe lo que se pidió o la base no se puede
-usar, y 2 si los argumentos no son válidos (fecha futura, monto inválido...).
+Sale con 0 si salió bien; 1 si no existe lo que se pidió, la base no existe o no
+se puede usar, o falta confirmar con ``--yes``; y 2 si los argumentos no son
+válidos (fecha futura, monto inválido...).
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import re
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import TextIO
+from typing import Any, Literal, TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -72,7 +96,9 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import DEFAULT_CONFIG_PATH, AppSettings, load_settings
 from app.risk.profiles import EffectiveProfile, get_profile
-from app.safety.incident import timezone_label
+from app.safety.breakers import MONTHLY_DRAWDOWN_LOCK
+from app.safety.incident import analysis_test_marks, fmt_analysis_marks, timezone_label
+from app.safety.state import load_trading_state
 from app.storage import Repository
 from app.storage.repository import MAX_CLOCK_SKEW, StoredAnalysis, StoredTrade
 from scripts.analyze_cli import (
@@ -80,8 +106,10 @@ from scripts.analyze_cli import (
     EXIT_DATA,
     EXIT_OK,
     EXIT_USAGE,
+    INVOCATION_DIR_ENV,  # noqa: F401 (se reexporta: las dos consolas usan la misma)
     SAFETY_TITLE,
     Cell,
+    SafetyContext,
     StatePaths,
     Style,
     _join_negative_amounts,
@@ -94,11 +122,13 @@ from scripts.analyze_cli import (
     evaluate_safety,
     fmt_num,
     fmt_usd,
+    missing_db_message,
     parse_price,
     printable,
     render_safety_section,
     render_table,
     resolve_state_paths,
+    resolve_user_path,
     safety_to_dict,
 )
 
@@ -138,6 +168,7 @@ _TIME = r"(?P<h>\d{1,2})[:.](?P<m>\d{2})(?::(?P<s>\d{2}))?"
 _RELATIVE = {"hoy": 0, "ayer": -1, "anteayer": -2, "mañana": 1, "manana": 1}
 _RE_RELATIVE = re.compile(rf"(?P<word>{'|'.join(_RELATIVE)})(?:\s+(?:a\s+las\s+)?{_TIME})?")
 _RE_TIME = re.compile(_TIME)
+_RE_TODAY = re.compile(rf"hoy(?:\s+(?:a\s+las\s+)?){_TIME}")
 _RE_ISO = re.compile(
     rf"(?P<y>\d{{4}})-(?P<mo>\d{{1,2}})-(?P<d>\d{{1,2}})(?:[ t]+{_TIME}"
     r"(?P<tz>z|[+-]\d{2}:?\d{2})?)?"
@@ -171,11 +202,49 @@ def _at(day: date, m: re.Match[str], zone: tzinfo, text: str) -> datetime:
         ) from None
 
 
-def parse_user_datetime(text: str, tz: tzinfo, now: datetime) -> datetime:
+YearChoice = Literal["past", "nearest"]
+
+
+def _day_without_year(
+    day: int, month: int, m: re.Match[str], tz: tzinfo, now: datetime, text: str, year: YearChoice
+) -> datetime:
+    """``"31/12 23:00"`` sin año: ¿de qué año es?
+
+    - ``"past"`` (apertura, cierre, movimientos): la fecha pasada más reciente;
+      si este año queda en el futuro (más allá de ``MAX_CLOCK_SKEW``), la del
+      año anterior. Así, el 1/1 a la 01:00, "31/12 23:00" es de hace dos horas.
+    - ``"nearest"`` (eventos): la más cercana a ``now`` entre el año anterior,
+      este y el siguiente. Así, el 28/12, "05/01 10:00" es del año que viene.
+    """
+    this_year = now.astimezone(tz).year
+    candidates: list[datetime] = []
+    for y in (this_year - 1, this_year, this_year + 1):
+        try:
+            candidates.append(_at(date(y, month, day), m, tz, text))
+        except ValueError:
+            continue  # 29/02 de un año no bisiesto, o una hora que no existe
+    if not candidates:
+        try:
+            date(2000, month, day)  # 2000 fue bisiesto: si acá tampoco existe, la fecha no existe
+        except ValueError:
+            raise ValueError(f"La fecha {text!r} no existe.") from None
+        return _at(date(2000, month, day), m, tz, text)  # lanza el error de la hora
+    if year == "past":
+        past = [c for c in candidates if c <= now + MAX_CLOCK_SKEW]
+        if past:
+            return max(past)
+        raise ValueError(f"La fecha {text!r} no existe en el último año: poné el año.")
+    return min(candidates, key=lambda c: abs(c - now))
+
+
+def parse_user_datetime(
+    text: str, tz: tzinfo, now: datetime, *, year: YearChoice = "nearest"
+) -> datetime:
     """Fecha y hora escritas por el usuario, en su zona ``tz`` (ver el docstring del módulo).
 
-    ``now`` es el "ahora" (para "hoy", "ayer" y "14:30"). Lanza ``ValueError``
-    con ejemplos si no se entiende.
+    ``now`` es el "ahora" (para "hoy", "ayer" y "14:30"). ``year``: de qué año
+    es una fecha escrita sin año, como ``"13/10 14:30"`` (ver
+    ``_day_without_year``). Lanza ``ValueError`` con ejemplos si no se entiende.
     """
     raw = " ".join(str(text).strip().lower().split())
     today = now.astimezone(tz).date()
@@ -201,11 +270,13 @@ def parse_user_datetime(text: str, tz: tzinfo, now: datetime) -> datetime:
         return _at(day, m, zone, text)
     m = _RE_DMY.fullmatch(raw)
     if m:
-        year = today.year if m.group("y") is None else int(m.group("y"))
-        if year < 100:
-            year += 2000
+        if m.group("y") is None:
+            return _day_without_year(int(m.group("d")), int(m.group("mo")), m, tz, now, text, year)
+        full_year = int(m.group("y"))
+        if full_year < 100:
+            full_year += 2000
         try:
-            day = date(year, int(m.group("mo")), int(m.group("d")))
+            day = date(full_year, int(m.group("mo")), int(m.group("d")))
         except ValueError:
             raise ValueError(f"La fecha {text!r} no existe.") from None
         return _at(day, m, tz, text)
@@ -288,34 +359,67 @@ class Context:
     err: TextIO
     style: Style
     ask: Callable[[str], str]
+    # Avisos de lo que se ajustó al leer las fechas (se muestran después de guardar).
+    notes: list[str] = field(default_factory=list)
 
     def print(self, text: str = "", color: str | None = None) -> None:
         print(self.style.paint(text, color), file=self.out)
 
     def when(self, text: str | None, default: datetime | None = None) -> datetime:
+        """Una fecha cualquiera (eventos): sin año, la más cercana a ahora."""
         if text is None:
             if default is None:
                 raise ValueError("Falta la fecha.")
             return default
-        return parse_user_datetime(text, self.tz, self.now)
+        return parse_user_datetime(text, self.tz, self.now, year="nearest")
 
     def past(self, text: str | None, label: str, default: datetime) -> datetime:
-        """Una fecha que ya pasó (apertura, cierre, movimiento); si es futura, ``ValueError``."""
-        moment = self.when(text, default)
+        """Una fecha que ya pasó (apertura, cierre, movimiento).
+
+        - Sin año (``"31/12 23:00"``), la fecha pasada más reciente.
+        - Más de ``MAX_CLOCK_SKEW`` en el futuro: ``ValueError`` con el año a la
+          vista y, si era solo una hora (``"22:00"``), la sugerencia de "ayer".
+        - Unos minutos adelante del reloj (dentro de ``MAX_CLOCK_SKEW``): se
+          guarda como ahora, así los frenos la cuentan ya (si quedara en el
+          futuro, la ignorarían hasta esa hora) y se avisa en ``notes``.
+        """
+        if text is None:
+            return default
+        moment = parse_user_datetime(text, self.tz, self.now, year="past")
         if moment > self.now + MAX_CLOCK_SKEW:
+            hint = ""
+            raw = " ".join(str(text).strip().lower().split())
+            bare = _RE_TIME.fullmatch(raw) or _RE_TODAY.fullmatch(raw)
+            if bare:
+                hhmm = f"{int(bare.group('h')):02d}:{bare.group('m')}"
+                hint = f' Si fue ayer, escribí "ayer {hhmm}".'
             raise ValueError(
-                f"{label} ({self.fmt_dt(moment)}) está en el futuro: ahora son las "
-                f"{self.fmt_dt(self.now)} ({timezone_label(self.tz)}). Revisá la fecha y la hora."
+                f"{label} ({self.fmt_dt(moment, year=True)}) está en el futuro: ahora son las "
+                f"{self.fmt_dt(self.now, year=True)} ({timezone_label(self.tz)}). Revisá la fecha "
+                f"y la hora.{hint}"
             )
+        if moment > self.now:
+            self.notes.append(
+                f"{label} que pusiste ({self.fmt_dt(moment)}) está unos minutos adelante del reloj "
+                f"de la computadora: la guardé como ahora ({self.fmt_dt(self.now)}), así los "
+                "frenos ya la cuentan."
+            )
+            return self.now
         return moment
 
-    def fmt_dt(self, dt: datetime | None) -> str:
-        """``"13/10 14:30"`` en la zona del usuario (con el año si no es el actual)."""
+    def fmt_dt(self, dt: datetime | None, *, year: bool = False) -> str:
+        """``"13/10 14:30"`` en tu zona (con el año si no es el actual, o siempre con ``year``)."""
         if dt is None:
             return DASH
         local = dt.astimezone(self.tz)
         same_year = local.year == self.now.astimezone(self.tz).year
-        return local.strftime("%d/%m %H:%M" if same_year else "%d/%m/%Y %H:%M")
+        return local.strftime("%d/%m %H:%M" if same_year and not year else "%d/%m/%Y %H:%M")
+
+    def print_notes(self) -> None:
+        """Muestra (y vacía) los avisos de ``notes``."""
+        for note in self.notes:
+            self.print(f"  {note}", "yellow")
+        self.notes.clear()
 
 
 def _tz(settings: AppSettings) -> ZoneInfo:
@@ -334,16 +438,28 @@ def _analysis_text(ctx: Context, a: StoredAnalysis) -> str:
     regime = a.regime_name or "no disponible"
     score = DASH if a.score_total is None else fmt_num(a.score_total, 1, sign=True)
     status = _STATUS_TEXT.get(a.plan_status, a.plan_status)
+    marks = fmt_analysis_marks(analysis_test_marks(a.inputs))
     return (
-        f"análisis #{a.id} del {ctx.fmt_dt(a.created_at)} (régimen {regime}, score {score}, "
-        f"plan {status})"
+        f"análisis #{a.id} del {ctx.fmt_dt(a.created_at)}{f' {marks}' if marks else ''} "
+        f"(régimen {regime}, score {score}, plan {status})"
     )
+
+
+# Cuántos análisis de la ventana se miran para saltear los de prueba (una app
+# personal hace pocos por hora: es solo un tope de la consulta, no una regla).
+_LINK_CANDIDATES = 200
 
 
 def _resolve_analysis(
     ctx: Context, symbol: str, opened_at: datetime, value: str | None
 ) -> tuple[int | None, str]:
-    """El análisis a ligar y una línea que lo explica."""
+    """El análisis a ligar y una línea que lo explica.
+
+    ``auto`` liga el último análisis real de la moneda en la ventana: los de
+    prueba (datos sintéticos, o con números del día puestos a mano) se
+    saltean, porque no dicen nada del mercado real. Un número los liga igual,
+    con un aviso.
+    """
     choice = "auto" if value is None else str(value).strip().lower()
     if choice in _NO_LINK:
         return None, "Sin análisis ligado (lo pediste así)."
@@ -351,14 +467,26 @@ def _resolve_analysis(
         hours = ctx.settings.circuit_breakers.link_analysis_within_hours
         window = timedelta(hours=hours)
         found = ctx.repo.list_analyses(
-            limit=1, symbol=symbol, since=opened_at - window, until=opened_at + _LINK_GRACE
+            limit=_LINK_CANDIDATES,
+            symbol=symbol,
+            since=opened_at - window,
+            until=opened_at + _LINK_GRACE,
         )
-        if not found:
+        real = next((a for a in found if not analysis_test_marks(a.inputs)), None)
+        if real is not None:
+            return real.id, f"Ligada al {_analysis_text(ctx, real)}."
+        if found:
+            test = found[0]
+            marks = fmt_analysis_marks(analysis_test_marks(test.inputs))
             return None, (
-                f"No había un análisis de {symbol} en las {fmt_num(hours, 0)} h antes de abrir: "
-                "queda sin análisis ligado."
+                f"No había un análisis real de {symbol} en las {fmt_num(hours, 0)} h antes de "
+                f"abrir: el #{test.id} es de prueba {marks} y no se liga solo (si de verdad "
+                f"seguiste ese, cargalo con --analysis {test.id}). Queda sin análisis ligado."
             )
-        return found[0].id, f"Ligada al {_analysis_text(ctx, found[0])}."
+        return None, (
+            f"No había un análisis de {symbol} en las {fmt_num(hours, 0)} h antes de abrir: "
+            "queda sin análisis ligado."
+        )
     try:
         analysis_id = _positive_int(choice)
     except argparse.ArgumentTypeError:
@@ -368,7 +496,73 @@ def _resolve_analysis(
     found_one = ctx.repo.get_analysis(analysis_id)
     if found_one is None:
         raise NotFoundError(f"No existe el análisis #{analysis_id}.")
-    return analysis_id, f"Ligada al {_analysis_text(ctx, found_one)}."
+    if found_one.created_at > opened_at + _LINK_GRACE:
+        # El informe del incidente lo mostraría como "el régimen en ese momento".
+        raise ValueError(
+            f"El análisis #{analysis_id} es del {ctx.fmt_dt(found_one.created_at)}, después de "
+            f"que abriste ({ctx.fmt_dt(opened_at)}): no puede ser el que seguiste para entrar. "
+            "Poné el número de un análisis anterior a la apertura, --analysis auto (busca solo) "
+            "o --analysis none."
+        )
+    link = f"Ligada al {_analysis_text(ctx, found_one)}."
+    marks = analysis_test_marks(found_one.inputs)
+    if marks:
+        link += (
+            f" Ojo: ese análisis es de prueba {fmt_analysis_marks(marks)}; en el informe del "
+            "incidente va a figurar marcado así."
+        )
+    return analysis_id, link
+
+
+_PENDING_LOCK = (
+    "al analizar o con make safety la app se va a bloquear y va a escribir el informe del incidente"
+)
+_PENDING_LOCK_HINT = (
+    "Si falta cargar un depósito o el saldo real de la billetera, cargalo antes de analizar."
+)
+
+
+def _trades_limit_text(trades_today: int, max_trades: int | None) -> str | None:
+    """``"ya hiciste 3 de 3 operaciones permitidas hoy: ..."`` si se llegó al máximo del día."""
+    if max_trades is None or trades_today < max_trades:
+        return None
+    if max_trades == 0:
+        return "tu perfil no permite operaciones (máximo 0 por día): no va a haber planes"
+    return (
+        f"ya hiciste {trades_today} de {max_trades} operaciones permitidas hoy: no va a haber "
+        "planes hasta mañana"
+    )
+
+
+def safety_view(sc: SafetyContext) -> dict[str, Any]:
+    """El dict de los frenos (``safety_to_dict``) listo para mostrar desde esta consola.
+
+    - La caída del mes ya viene recortada a 100 % en los textos de
+      ``safety.breakers`` y en la sección de la consola (más solo pasa con el
+      saldo calculado negativo, que ya tiene su aviso).
+    - Si la caída del mes llegó al tope pero todavía no hay LOCKED (cargar no
+      lo escribe), el titular dice que el bloqueo está pendiente en vez de
+      mandar a borrar un LOCKED que no existe.
+    - Si ya se hicieron las operaciones permitidas del día, el titular lo
+      avisa (el plan va a decir No operar aunque ningún freno haya saltado).
+    """
+    data = copy.deepcopy(safety_to_dict(sc))
+    v = sc.verdict
+    verdict = data.setdefault("verdict", {})
+    headline = v.headline
+    if v.needs_lock and not v.locked:
+        monthly = v.breaker(MONTHLY_DRAWDOWN_LOCK)
+        others = len([c for c in v.block_codes if c != MONTHLY_DRAWDOWN_LOCK])
+        tail = "" if others == 0 else f" (y {others} {'freno' if others == 1 else 'frenos'} más)"
+        headline = f"No se generan planes: {monthly.summary}{tail}; {_PENDING_LOCK}."
+    limit = _trades_limit_text(sc.state.trades_today, sc.state.profile.max_trades_per_day)
+    if limit is not None:
+        if v.status == "verde":
+            headline = f"Ningún freno activo, pero ojo: {limit}."
+        else:
+            headline = f"{headline} Ojo: {limit}."
+    data["headline"] = verdict["headline"] = headline
+    return data
 
 
 def _safety_lines(ctx: Context) -> None:
@@ -377,21 +571,71 @@ def _safety_lines(ctx: Context) -> None:
         sc = evaluate_safety(
             ctx.repo, ctx.settings, ctx.profile, ctx.now, ctx.paths, trigger_lock=False
         )
+        data = safety_view(sc)
     except (OSError, ValueError, SQLAlchemyError) as exc:
         ctx.print(f"No se pudieron evaluar los frenos de seguridad: {exc}", "yellow")
         return
-    v = sc.verdict
+    status = sc.verdict.status
     ctx.print(
-        f"Frenos de seguridad: {_VERDICT_TEXT.get(v.status, v.status)} · {v.headline}",
-        _VERDICT_COLOR.get(v.status),
+        f"Frenos de seguridad: {_VERDICT_TEXT.get(status, status)} · {data['headline']}",
+        _VERDICT_COLOR.get(status),
     )
-    if v.needs_lock:
-        ctx.print(
-            "La caída de la billetera del mes llegó al tope: la próxima vez que analices o mires "
-            "los frenos (make safety) la app se bloquea y escribe el informe del incidente. Si "
-            "falta cargar un depósito o el saldo real, cargalo antes.",
-            "alert",
+    if sc.verdict.needs_lock and not sc.verdict.locked:
+        ctx.print(_PENDING_LOCK_HINT, "alert")
+
+
+# --- confirmaciones ---------------------------------------------------------------------
+
+
+class NeedsConfirmationError(Exception):
+    """Un dato fuera de lo normal que hay que confirmar con ``--yes`` (sale con código 1)."""
+
+
+def _check_pnl(ctx: Context, pnl: float, confirmed: bool) -> None:
+    """Pide ``--yes`` si el resultado parece un error de tipeo.
+
+    Un resultado más grande (en valor absoluto) que el saldo actual de la
+    billetera o que ``app.manual_input.confirm_pnl_over_risk_multiple`` veces
+    el riesgo por operación del perfil.
+    """
+    if confirmed:
+        return
+    multiple = ctx.settings.app.manual_input.confirm_pnl_over_risk_multiple
+    risk_cap = multiple * ctx.profile.risk_per_trade_usd
+    wallet = load_trading_state(ctx.repo, ctx.settings, ctx.profile, ctx.now).wallet
+    size = abs(pnl)
+    reasons: list[str] = []
+    if size > wallet.current_balance_usd:
+        assumed = " (supuesto: nunca lo anotaste)" if wallet.assumed else ""
+        reasons.append(
+            f"que el saldo de tu billetera ({fmt_usd(wallet.current_balance_usd)}{assumed})"
         )
+    if size > risk_cap:
+        times = fmt_num(multiple, 0 if float(multiple).is_integer() else 1)
+        reasons.append(f"que {times} veces tu riesgo por operación ({fmt_usd(risk_cap)})")
+    if reasons:
+        raise NeedsConfirmationError(
+            f"Ojo: el resultado {_signed_usd(pnl)} es más grande {' y '.join(reasons)}. "
+            "¿No será un error de tipeo (una coma o un cero de más)? Un resultado así puede "
+            "disparar los frenos o bloquear la app. Si está bien, cargalo de nuevo agregando "
+            "--yes. No se guardó nada."
+        )
+
+
+def _check_event_length(ctx: Context, start: datetime, until: datetime, confirmed: bool) -> None:
+    """Pide ``--yes`` si el evento dura más de ``manual_input.confirm_event_longer_than_days``."""
+    days = ctx.settings.app.manual_input.confirm_event_longer_than_days
+    length = until - start
+    if confirmed or length <= timedelta(days=days):
+        return
+    total_days = length / timedelta(days=1)
+    raise NeedsConfirmationError(
+        f"Ojo: el evento duraría {fmt_num(total_days, 0 if total_days >= 10 else 1)} días "
+        f"(del {ctx.fmt_dt(start, year=True)} al {ctx.fmt_dt(until, year=True)}), y mientras "
+        "dure no vas a tener planes. "
+        f"¿Está bien la fecha (el año, el mes)? Los eventos suelen durar horas. Si está bien, "
+        "cargalo de nuevo agregando --yes. No se guardó nada."
+    )
 
 
 # --- comandos --------------------------------------------------------------------------
@@ -406,6 +650,7 @@ def cmd_add(args: argparse.Namespace, ctx: Context) -> int:
             f"({ctx.fmt_dt(opened)})."
         )
     analysis_id, link = _resolve_analysis(ctx, args.symbol, opened, args.analysis)
+    _check_pnl(ctx, args.pnl, args.yes)
     trade = ctx.repo.add_trade(
         symbol=args.symbol,
         side=args.side,
@@ -419,6 +664,7 @@ def cmd_add(args: argparse.Namespace, ctx: Context) -> int:
         analysis_id=analysis_id,
     )
     _print_trade_saved(ctx, trade, f"Operación #{trade.id} guardada")
+    ctx.print_notes()
     ctx.print(f"  {link}")
     _safety_lines(ctx)
     return EXIT_OK
@@ -456,10 +702,58 @@ def cmd_open(args: argparse.Namespace, ctx: Context) -> int:
         f"Posición #{pos.id} abierta: {pos.symbol} {pos.side}, riesgo {fmt_usd(pos.risk_usd)} "
         f"(lo que perdés si toca el stop), desde {ctx.fmt_dt(pos.opened_at)}."
     )
+    if round(pos.risk_usd, 2) <= 0:
+        ctx.print(f"  {_ZERO_RISK_NOTE}")
+    ctx.print_notes()
     ctx.print(f"  {link}")
-    ctx.print(f'  Cuando la cierres: make trade ARGS="close {pos.id} --pnl <resultado>"')
+    ctx.print(
+        f'  Si movés el stop: make trade ARGS="update {pos.id} --risk <lo que perdés ahora>". '
+        f'Cuando la cierres: make trade ARGS="close {pos.id} --pnl <resultado>".'
+    )
     _safety_lines(ctx)
     return EXIT_OK
+
+
+_ZERO_RISK_NOTE = (
+    "Riesgo 0: el stop está en la entrada o en ganancia (si salta, no perdés). Ya no cuenta "
+    "para el límite de pérdida del día ni para el tope de posiciones correlacionadas."
+)
+
+
+def cmd_update(args: argparse.Namespace, ctx: Context) -> int:
+    """Cambia el riesgo (stop movido), la entrada o la nota de una posición abierta."""
+    position = ctx.repo.get_open_position(args.id)
+    if position is None:
+        raise NotFoundError(f"No existe la posición abierta #{args.id}.")
+    if args.risk is None and args.entry is None and args.note is None:
+        raise ValueError(
+            "No hay nada para cambiar: poné --risk (lo que perdés ahora si toca el stop; 0 si "
+            "lo moviste a la entrada o a ganancia), --entry o --note."
+        )
+    updated = ctx.repo.update_position(
+        args.id, risk_usd=args.risk, entry_price=args.entry, note=args.note
+    )
+    changes: list[str] = []
+    if args.risk is not None:
+        changes.append(f"riesgo {fmt_usd(position.risk_usd)} → {fmt_usd(updated.risk_usd)}")
+    if args.entry is not None:
+        changes.append(f"entrada {_price_text(position)} → {_price_text(updated)}")
+    if args.note is not None:
+        changes.append("nota borrada" if updated.notes is None else "nota cambiada")
+    ctx.print(
+        f"Posición #{updated.id} ({updated.symbol} {updated.side}) actualizada: "
+        f"{'; '.join(changes)}."
+    )
+    if args.risk is not None and round(updated.risk_usd, 2) <= 0:
+        ctx.print(f"  {_ZERO_RISK_NOTE}")
+    _safety_lines(ctx)
+    return EXIT_OK
+
+
+def _price_text(position: Any) -> str:
+    """Precio de entrada sin ceros de más (``"61.000,5"``) o ``"—"``."""
+    price = position.entry_price
+    return DASH if price is None else fmt_num(price, 4).rstrip("0").rstrip(",")
 
 
 def cmd_close(args: argparse.Namespace, ctx: Context) -> int:
@@ -481,6 +775,7 @@ def cmd_close(args: argparse.Namespace, ctx: Context) -> int:
             f"La posición #{position_id} se abrió el {ctx.fmt_dt(position.opened_at)}: no puede "
             f"cerrar antes ({ctx.fmt_dt(closed)})."
         )
+    _check_pnl(ctx, args.pnl, args.yes)
     trade = ctx.repo.close_position_with_result(
         position_id,
         pnl_usd=args.pnl,
@@ -491,6 +786,7 @@ def cmd_close(args: argparse.Namespace, ctx: Context) -> int:
     _print_trade_saved(
         ctx, trade, f"Posición #{position_id} cerrada y guardada como operación #{trade.id}"
     )
+    ctx.print_notes()
     _safety_lines(ctx)
     return EXIT_OK
 
@@ -508,23 +804,28 @@ def cmd_wallet(args: argparse.Namespace, ctx: Context) -> int:
     else:
         amount = _signed_usd(event.amount_usd if kind == "deposit" else -event.amount_usd)
     ctx.print(f"{_KIND_NAMES[kind]} #{event.id} guardado: {amount} ({ctx.fmt_dt(event.ts)}).")
+    ctx.print_notes()
     _safety_lines(ctx)
     return EXIT_OK
 
 
 def cmd_event(args: argparse.Namespace, ctx: Context) -> int:
-    start = None if args.start is None else ctx.when(args.start)
+    # Sin --from empieza "ahora" (la misma hora con la que se evalúan los frenos
+    # después: si lo pusiera la base, con su propio reloj, quedaría unos
+    # milisegundos más tarde y la línea de abajo lo vería "programado").
+    start = ctx.now if args.start is None else ctx.when(args.start)
     until = ctx.when(args.until)
     if until <= ctx.now:
         raise ValueError(
             f"La hora de fin del evento ({ctx.fmt_dt(until)}) ya pasó: ahora son las "
             f'{ctx.fmt_dt(ctx.now)}. Poné una hora futura (ej. "mañana 11:00").'
         )
-    if start is not None and until <= start:
+    if until <= start:
         raise ValueError(
             f"La hora de fin del evento ({ctx.fmt_dt(until)}) tiene que ser después del inicio "
             f"({ctx.fmt_dt(start)})."
         )
+    _check_event_length(ctx, start, until, args.yes)
     event = ctx.repo.add_volatility_event(args.note, until, starts_at=start)
     ctx.print(
         f"Evento #{event.id} guardado: «{printable(event.note)}», desde "
@@ -582,9 +883,7 @@ def cmd_list(args: argparse.Namespace, ctx: Context) -> int:
                 p.symbol,
                 p.side,
                 fmt_usd(p.risk_usd),
-                DASH
-                if p.entry_price is None
-                else fmt_num(p.entry_price, 4).rstrip("0").rstrip(","),
+                _price_text(p),
                 DASH if p.analysis_id is None else f"#{p.analysis_id}",
                 _truncate(printable(p.notes or ""), 30),
             ]
@@ -717,7 +1016,7 @@ def cmd_delete(args: argparse.Namespace, ctx: Context) -> int:
 
 def cmd_status(args: argparse.Namespace, ctx: Context) -> int:
     sc = evaluate_safety(ctx.repo, ctx.settings, ctx.profile, ctx.now, ctx.paths)
-    lines = render_safety_section(safety_to_dict(sc), ctx.style, ctx.tz, title=SAFETY_TITLE)
+    lines = render_safety_section(safety_view(sc), ctx.style, ctx.tz, title=SAFETY_TITLE)
     print("\n".join(lines), file=ctx.out)
     return EXIT_OK
 
@@ -745,6 +1044,9 @@ def _common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--profile", default=sup, help="perfil de riesgo (por defecto el de config)"
     )
+
+
+_YES_HELP_PNL = "confirmar un resultado muy grande (más que tu saldo o que varias veces tu riesgo)"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -784,21 +1086,33 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N|auto|none",
         help="análisis que seguiste (auto, por omisión: el último de esa moneda antes de abrir)",
     )
+    add.add_argument("--yes", action="store_true", help=_YES_HELP_PNL)
 
     op = command("open", "carga una posición abierta")
     op.add_argument("--symbol", type=symbol_arg, required=True, help="moneda, ej. BTC")
     op.add_argument("--side", type=side_arg, required=True, help="long o short")
     op.add_argument(
         "--risk",
-        type=positive_amount,
+        type=non_negative_amount,
         required=True,
         metavar="USD",
-        help="lo que perdés si toca el stop",
+        help="lo que perdés si toca el stop (0 si el stop está en la entrada o en ganancia)",
     )
     op.add_argument("--entry", type=positive_amount, metavar="PRECIO", help="precio de entrada")
     op.add_argument("--opened", metavar="FECHA", help="cuándo abriste (por defecto, ahora)")
     op.add_argument("--note", help="nota")
     op.add_argument("--analysis", metavar="N|auto|none", help="análisis que seguiste")
+
+    up = command("update", "cambia una posición abierta (por ejemplo, después de mover el stop)")
+    up.add_argument("id", type=_positive_int, metavar="N", help="número de la posición")
+    up.add_argument(
+        "--risk",
+        type=non_negative_amount,
+        metavar="USD",
+        help="lo que perdés ahora si toca el stop (0 si lo moviste a la entrada o a ganancia)",
+    )
+    up.add_argument("--entry", type=positive_amount, metavar="PRECIO", help="precio de entrada")
+    up.add_argument("--note", help='nota nueva ("" la borra)')
 
     close = command("close", "cierra una posición abierta y la guarda como operación")
     close.add_argument(
@@ -813,6 +1127,7 @@ def build_parser() -> argparse.ArgumentParser:
     close.add_argument("--exit", type=positive_amount, metavar="PRECIO", help="precio de salida")
     close.add_argument("--closed", metavar="FECHA", help="cuándo cerraste (por defecto, ahora)")
     close.add_argument("--note", help="nota (si no, queda la de la posición)")
+    close.add_argument("--yes", action="store_true", help=_YES_HELP_PNL)
 
     lst = command("list", "muestra lo cargado")
     lst.add_argument("--limit", type=_positive_int, default=10, help="cuántas operaciones mostrar")
@@ -833,6 +1148,9 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument(
         "--from", dest="start", metavar="FECHA", help="desde cuándo (por defecto, ahora)"
     )
+    ev.add_argument(
+        "--yes", action="store_true", help="confirmar un evento de varios días (¿año mal puesto?)"
+    )
 
     de = command("delete", "borra algo cargado por error")
     de.add_argument("kind", metavar="QUÉ", help="trade, position, event o wallet")
@@ -843,10 +1161,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: Comandos que solo leen (o que no tienen nada que hacer en una base vacía): con
+#: una ``--db`` que no existe salen con 1 en vez de crear una base vacía (un error
+#: de tipeo en la ruta mostraría todo en VERDE).
+_NEEDS_EXISTING_DB = frozenset({"list", "status", "close", "update", "delete"})
+# ``INVOCATION_DIR_ENV`` y ``resolve_user_path`` (rutas relativas a la carpeta
+# desde donde se corrió ``make``) vienen de ``scripts.analyze_cli``: las dos
+# consolas resuelven ``--db`` igual.
+
 _HANDLERS: dict[str, Callable[[argparse.Namespace, Context], int]] = {
     "add": cmd_add,
     "open": cmd_open,
     "close": cmd_close,
+    "update": cmd_update,
     "list": cmd_list,
     "deposit": cmd_wallet,
     "withdraw": cmd_wallet,
@@ -879,10 +1206,13 @@ def main(
         return EXIT_USAGE
     db = getattr(args, "db", None)
     offline = bool(getattr(args, "offline", False))
-    config = getattr(args, "config", DEFAULT_CONFIG_PATH)
+    config = getattr(args, "config", None)
+    config = DEFAULT_CONFIG_PATH if config is None else resolve_user_path(config)
     if db is not None and offline:
         print("Usá --db o --offline, no los dos.", file=err)
         return EXIT_USAGE
+    if db is not None:
+        db = resolve_user_path(db)
     try:
         settings = load_settings(config)
     except (OSError, ValueError, yaml.YAMLError) as exc:
@@ -896,6 +1226,10 @@ def main(
 
     now_fn = clock or (lambda: datetime.now(UTC))
     paths = resolve_state_paths(settings, offline=offline, db=db)
+    is_new = not paths.database.exists()
+    if is_new and db is not None and args.command in _NEEDS_EXISTING_DB:
+        print(missing_db_message(paths.database), file=err)
+        return EXIT_DATA
     try:
         repo = Repository.open(paths.database, clock=now_fn)
     except (OSError, ValueError, RuntimeError, SQLAlchemyError) as exc:
@@ -913,9 +1247,11 @@ def main(
         style=Style(enabled=bool(getattr(out, "isatty", lambda: False)())),
         ask=ask or input,
     )
+    if is_new:
+        ctx.print(f"Base nueva: se creó {display_path(paths.database)}.", "dim")
     try:
         return _HANDLERS[args.command](args, ctx)
-    except NotFoundError as exc:
+    except (NotFoundError, NeedsConfirmationError) as exc:
         print(str(exc), file=err)
         return EXIT_DATA
     except ValueError as exc:

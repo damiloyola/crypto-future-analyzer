@@ -1449,6 +1449,9 @@ def test_day_state_is_returned_as_data(settings):
         "max_trades_per_day": 3,
         "pnl_today_usd": -40.0,
         "loss_today_usd": 40.0,
+        "open_risk_usd": 0.0,
+        "daily_open_risk_usd": 0.0,
+        "daily_cap_includes_open_risk": True,
         "max_daily_loss_usd": 100.0,
         "daily_remaining_usd": 60.0,
         "risk_capped_by_day": False,
@@ -1457,6 +1460,8 @@ def test_day_state_is_returned_as_data(settings):
         "event_description": "CPI",
         "available_margin_usd": 150.0,
         "wallet_equity_usd": None,
+        "wallet_balance_usd": None,
+        "wallet_balance_assumed": False,
     }
     json.dumps(d, allow_nan=False)
 
@@ -1542,6 +1547,12 @@ def test_plan_inputs_from_analysis_fallbacks(settings, offline_market):
     # Sin precio de Nexo no hay diferencia contra la referencia.
     assert inputs.price_diff_pct is None
     assert inputs.reference_price == snap.execution_price.binance_price
+    # El riesgo de las posiciones abiertas (Hito 5) pasa tal cual; por omisión, 0.
+    assert inputs.open_risk_usd == 0.0
+    inputs = plan_inputs_from_analysis(
+        analysis, snap, score, None, profile, settings, open_risk_usd=42.5
+    )
+    assert inputs.open_risk_usd == 42.5
 
 
 def test_plan_inputs_carry_the_manual_price_difference(settings):

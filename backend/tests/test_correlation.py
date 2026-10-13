@@ -19,6 +19,7 @@ from app.safety.correlation import (
     REASON_HEDGE,
     REASON_HIGH_CORRELATION,
     REASON_LOW_CORRELATION,
+    REASON_OPPOSITE_SIDE,
     REASON_SAME_SYMBOL,
     REASON_UNKNOWN_CORRELATION,
     CorrelationMatrix,
@@ -551,16 +552,51 @@ def test_exposure_counts_same_side_correlated_positions():
     assert exp.matrix_as_of == FIXED_NOW
 
 
-def test_exposure_skips_opposite_side_as_hedge():
+def test_exposure_skips_opposite_side_and_only_the_same_coin_is_a_hedge():
     positions = [Pos("BTC", "short", 50.0), Pos("ETH", "short", 30.0)]
     exp = correlated_exposure("ETH", "long", positions, MATRIX, 0.8)
     assert exp.counted == ()
-    assert [e.reason for e in exp.skipped] == [REASON_HEDGE, REASON_HEDGE]
+    # Cobertura es solo la misma moneda al revés (CLAUDE.md); BTC va al revés pero es otra.
+    assert [e.reason for e in exp.skipped] == [REASON_OPPOSITE_SIDE, REASON_HEDGE]
     assert all(not e.counted for e in exp.skipped)
-    assert "cobertura" in exp.skipped[0].explanation
+    assert exp.skipped[1].explanation == (
+        "ETH está en short (venta), al revés del plan en la misma moneda: funciona como "
+        "cobertura y no suma riesgo."
+    )
+    assert "cobertura" not in exp.skipped[0].explanation
     assert exp.existing_risk_usd == 0.0
     assert exp.combined_risk_usd(50.0) == 50.0
     assert "No hay posiciones abiertas" in exp.explanation
+
+
+def test_other_coin_in_the_opposite_direction_is_explained_by_its_correlation():
+    """Revisión del Hito 5 (hallazgo 15): otra moneda al revés no es "cobertura"."""
+    positions = [
+        Pos("ETH", "short", 30.0),  # 0,92 con BTC: se mueve parecido
+        Pos("XRP", "short", 10.0),  # 0,5: no se mueve junto
+        Pos("NEW", "short", 5.0),  # en la matriz sin dato
+        Pos("PEPE", "short", 5.0),  # fuera de la matriz
+    ]
+    exp = correlated_exposure("BTC", "long", positions, MATRIX, 0.8)
+    assert exp.counted == () and exp.existing_risk_usd == 0.0
+    assert all(e.reason == REASON_OPPOSITE_SIDE for e in exp.skipped)
+    texts = [e.explanation for e in exp.skipped]
+    assert texts == [
+        "ETH está en short (venta): va al revés del plan y se mueve parecido a BTC "
+        "(correlación 0,92): no suma riesgo.",
+        "XRP está en short (venta): va al revés del plan y no se mueve junto con BTC "
+        "(correlación 0,5): no suma riesgo.",
+        "NEW está en short (venta): va al revés del plan (no hay datos para saber si se mueve "
+        "junto con BTC): no suma riesgo.",
+        "PEPE está en short (venta): va al revés del plan (no hay datos para saber si se mueve "
+        "junto con BTC): no suma riesgo.",
+    ]
+    assert not any("cobertura" in t for t in texts)
+    # Sin matriz (falló la descarga), igual: sin dato, sin "cobertura".
+    exp2 = correlated_exposure("BTC", "long", [Pos("DOGE", "short", 10.0)], None, 0.8)
+    assert exp2.skipped[0].reason == REASON_OPPOSITE_SIDE
+    assert "no hay datos" in exp2.skipped[0].explanation
+    assert exp2.to_dict()["skipped"][0]["reason"] == "opposite_side"
 
 
 def test_exposure_counts_same_symbol_even_outside_matrix():
@@ -605,9 +641,43 @@ def test_exposure_counts_unknown_correlation_conservatively():
         0.8,
     )
     assert [e.reason for e in exp3.counted] == [REASON_UNKNOWN_CORRELATION, REASON_SAME_SYMBOL]
-    assert [e.reason for e in exp3.skipped] == [REASON_HEDGE]
+    assert [e.reason for e in exp3.skipped] == [REASON_OPPOSITE_SIDE]
     assert exp3.existing_risk_usd == 50.0
     assert exp3.matrix_as_of is None
+
+
+def test_exposure_explanation_never_claims_an_unknown_correlation():
+    """Revisión del Hito 5 (hallazgo 8): sin dato no se dice "se mueve junto con"."""
+    only_unknown = correlated_exposure("BTC", "long", [Pos("ETH", "long", 40.0)], None, 0.8)
+    assert only_unknown.explanation == (
+        "Ya tenés una posición en long (compra): ETH (40 USD). No hay datos para saber si ETH "
+        "se mueve junto con BTC; por las dudas se cuenta. Su riesgo (40 USD) cuenta junto con "
+        "el del plan nuevo porque si el mercado se da vuelta pueden perder las dos juntas."
+    )
+    mixed = correlated_exposure(
+        "ETH",
+        "long",
+        [Pos("BTC", "long", 50.0), Pos("ETH", "long", 30.0), Pos("NEW", "long", 5.0)],
+        MATRIX,
+        0.8,
+    )
+    assert mixed.explanation == (
+        "Ya tenés 3 posiciones en long (compra): BTC (50 USD), ETH (30 USD), NEW (5 USD). ETH "
+        "es la misma moneda y BTC se mueve junto con ETH. De NEW no hay datos para saber si se "
+        "mueve junto con ETH; por las dudas se cuenta. Suman 85 USD de riesgo, que cuenta junto "
+        "con el del plan nuevo porque si el mercado se da vuelta pueden perder todas juntas."
+    )
+    # Con todas conocidas, el texto de siempre (en singular si es una sola).
+    known = correlated_exposure("ETH", "long", [Pos("BTC", "long", 50.0)], MATRIX, 0.8)
+    assert known.explanation == (
+        "Ya tenés una posición en long (compra) que se mueve junto con ETH: BTC (50 USD). Su "
+        "riesgo (50 USD) cuenta junto con el del plan nuevo porque si el mercado se da vuelta "
+        "pierden las dos juntas."
+    )
+    same = correlated_exposure("ETH", "long", [Pos("ETH", "long", 20.0)], MATRIX, 0.8)
+    assert same.explanation.startswith(
+        "Ya tenés una posición en long (compra) en ETH, la misma moneda: ETH (20 USD)."
+    )
 
 
 def test_exposure_threshold_is_inclusive():
@@ -642,7 +712,7 @@ def test_exposure_mixed_portfolio_to_dict():
         ("NEW", REASON_UNKNOWN_CORRELATION),
     ]
     assert [(e.symbol, e.reason) for e in exp.skipped] == [
-        ("SOL", REASON_HEDGE),
+        ("SOL", REASON_OPPOSITE_SIDE),
         ("XRP", REASON_LOW_CORRELATION),
     ]
     assert exp.existing_risk_usd == 85.0

@@ -5,8 +5,8 @@ operaciones. Cada método abre y cierra su propia sesión (una transacción por
 llamada), así que se puede usar desde varios hilos.
 
 Qué devuelve: dataclasses inmutables (``StoredTrade``, ``StoredPosition``,
-``StoredWalletEvent``, ``StoredVolatilityEvent``, ``StoredAnalysis``), nunca
-los objetos de SQLModel. Se
+``StoredWalletEvent``, ``StoredVolatilityEvent``, ``StoredSafetyLock``,
+``StoredAnalysis``), nunca los objetos de SQLModel. Se
 pueden usar después de cerrada la sesión, no consultan la base de nuevo y
 modificarlas no cambia nada guardado. Cada una tiene ``to_dict()`` listo para
 JSON (fechas en ISO 8601 con ``+00:00``, sin NaN ni infinitos).
@@ -25,8 +25,17 @@ Fechas:
 
 Validaciones (``ValueError`` con el motivo en castellano): dirección distinta
 de ``"long"``/``"short"``, moneda que no es alfanumérica, cierre antes de la
-apertura, riesgo <= 0, precios <= 0, montos <= 0 en depósitos y retiros,
-saldo negativo, números no finitos, análisis inexistente o de otra moneda.
+apertura, riesgo negativo (0 vale: es el stop movido a la entrada), precios
+<= 0, montos <= 0 en depósitos y retiros, saldo negativo, números no finitos,
+textos obligatorios vacíos, análisis inexistente o de otra moneda.
+
+Posiciones abiertas: ``update_position`` cambia el riesgo (por ejemplo, al
+mover el stop: 0 = stop en la entrada), el precio de entrada o la nota.
+
+Bloqueos totales (``add_safety_lock`` / ``list_safety_locks``, esquema 3):
+cada vez que la capa de seguridad escribe el archivo LOCKED lo anota acá, con
+los números del disparo. Con eso, si el usuario borra el LOCKED, la caída del
+mes se vuelve a medir desde el saldo de ese momento.
 
 Eventos de alta volatilidad (``add_volatility_event``): nota obligatoria y hora
 de fin posterior a ahora y al inicio (el inicio por defecto es ahora y puede
@@ -64,6 +73,7 @@ from app.storage.models import (
     HighVolatilityEvent,
     ManualTrade,
     OpenPosition,
+    SafetyLock,
     WalletEvent,
     utc_now,
 )
@@ -81,6 +91,12 @@ MAX_EVENT_NOTE_LENGTH = 300
 
 #: Largo máximo del símbolo de una moneda (``1000PEPE`` tiene 8).
 MAX_SYMBOL_LENGTH = 20
+
+#: Largo máximo del código del freno de un bloqueo total.
+MAX_TRIGGER_CODE_LENGTH = 40
+
+#: Largo máximo de una ruta guardada (informe del incidente, archivo LOCKED).
+MAX_PATH_LENGTH = 4096
 
 SIDES: tuple[str, ...] = ("long", "short")
 WALLET_EVENT_KINDS: tuple[str, ...] = ("deposit", "withdrawal", "balance")
@@ -286,6 +302,58 @@ class StoredVolatilityEvent:
 
 
 @dataclass(frozen=True)
+class StoredSafetyLock:
+    """Bloqueo total anotado en la base (ver ``models.SafetyLock``).
+
+    ``triggered_at``: cuándo la app escribió el LOCKED; ``trigger_code``: qué
+    freno lo pidió (``"monthly_drawdown_lock"``); ``drawdown_pct``,
+    ``peak_usd`` y ``balance_usd``: la caída, el máximo y el saldo del
+    disparo; ``report_path`` / ``lock_path``: dónde quedaron el informe y el
+    LOCKED (``None`` si no se sabe).
+    """
+
+    id: int
+    triggered_at: datetime
+    trigger_code: str
+    drawdown_pct: float | None
+    peak_usd: float | None
+    balance_usd: float | None
+    report_path: str | None
+    lock_path: str | None
+    created_at: datetime
+
+    def to_dict(self) -> dict[str, Any]:
+        return json_safe(
+            {
+                "id": self.id,
+                "triggered_at": _iso(self.triggered_at),
+                "trigger_code": self.trigger_code,
+                "drawdown_pct": self.drawdown_pct,
+                "peak_usd": self.peak_usd,
+                "balance_usd": self.balance_usd,
+                "report_path": self.report_path,
+                "lock_path": self.lock_path,
+                "created_at": _iso(self.created_at),
+            }
+        )
+
+    @classmethod
+    def _from_row(cls, row: SafetyLock) -> StoredSafetyLock:
+        assert row.id is not None
+        return cls(
+            id=row.id,
+            triggered_at=row.triggered_at,
+            trigger_code=row.trigger_code,
+            drawdown_pct=row.drawdown_pct,
+            peak_usd=row.peak_usd,
+            balance_usd=row.balance_usd,
+            report_path=row.report_path,
+            lock_path=row.lock_path,
+            created_at=row.created_at,
+        )
+
+
+@dataclass(frozen=True)
 class StoredAnalysis:
     """Análisis guardado (ver ``models.AnalysisRecord``).
 
@@ -415,6 +483,18 @@ def _opt_positive(value: Any, label: str) -> float | None:
     return None if value is None else _positive(value, label)
 
 
+def _non_negative(value: Any, label: str) -> float:
+    """Número finito >= 0 (el riesgo puede ser 0: stop movido a la entrada)."""
+    v = _number(value, label)
+    if v < 0:
+        raise ValueError(f"{label} no puede ser negativo, llegó {v:g}.")
+    return v
+
+
+def _opt_non_negative(value: Any, label: str) -> float | None:
+    return None if value is None else _non_negative(value, label)
+
+
 def _opt_bool(value: Any, label: str) -> bool | None:
     if value is None:
         return None
@@ -426,12 +506,21 @@ def _opt_bool(value: Any, label: str) -> bool | None:
     return value
 
 
+def _lower_first(text: str) -> str:
+    return text[:1].lower() + text[1:]
+
+
 def _text(value: Any, label: str, max_length: int) -> str:
+    """Texto obligatorio, sin espacios en los bordes.
+
+    Los mensajes no dependen del género de ``label`` ("La nota del evento",
+    "El perfil"): ``"Falta la nota del evento."``.
+    """
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{label} no puede estar vacío.")
+        raise ValueError(f"Falta {_lower_first(label)}.")
     s = value.strip()
     if len(s) > max_length:
-        raise ValueError(f"{label} es demasiado largo (máximo {max_length} caracteres).")
+        raise ValueError(f"{label} tiene {len(s)} caracteres y el máximo es {max_length}.")
     return s
 
 
@@ -702,7 +791,7 @@ class Repository:
             opened_at=opened_at,
             closed_at=closed_at,
             pnl_usd=pnl,
-            risk_usd=_opt_positive(kw["risk_usd"], "El riesgo"),
+            risk_usd=_opt_non_negative(kw["risk_usd"], "El riesgo"),
             entry_price=_opt_positive(kw["entry_price"], "El precio de entrada"),
             exit_price=_opt_positive(kw["exit_price"], "El precio de salida"),
             notes=_notes(kw["notes"]),
@@ -775,8 +864,10 @@ class Repository:
     ) -> StoredPosition:
         """Guarda una posición abierta. ``risk_usd``: USD que se pierden si toca el stop.
 
-        ``opened_at`` por defecto es ahora. Se permiten varias posiciones en la
-        misma moneda (la correlación suma sus riesgos).
+        ``risk_usd`` puede ser 0 (stop en la entrada: si salta, no se pierde
+        nada); negativo se rechaza. ``opened_at`` por defecto es ahora. Se
+        permiten varias posiciones en la misma moneda (la correlación suma sus
+        riesgos).
         """
         sym = _symbol(symbol)
         row = OpenPosition(
@@ -784,7 +875,7 @@ class Repository:
             side=_side(side),
             opened_at=self._user_date(opened_at, "La fecha de apertura", default_now=True),
             entry_price=_opt_positive(entry_price, "El precio de entrada"),
-            risk_usd=_positive(risk_usd, "El riesgo"),
+            risk_usd=_non_negative(risk_usd, "El riesgo"),
             notes=_notes(notes),
             analysis_id=_opt_record_id(analysis_id, "El número de análisis"),
             created_at=self._now(),
@@ -810,6 +901,47 @@ class Repository:
         stmt = stmt.order_by(col(OpenPosition.opened_at), col(OpenPosition.id))
         with session_scope(self._engine) as session:
             return [StoredPosition._from_row(r) for r in session.exec(stmt).all()]
+
+    def update_position(
+        self,
+        position_id: int,
+        *,
+        risk_usd: float | None = None,
+        entry_price: float | None = None,
+        note: str | None = None,
+    ) -> StoredPosition:
+        """Cambia el riesgo, el precio de entrada o la nota de una posición abierta.
+
+        - ``risk_usd``: lo nuevo que se pierde si toca el stop (por ejemplo,
+          después de mover el stop). 0 vale (stop en la entrada); negativo no.
+        - ``entry_price``: mayor a 0.
+        - ``note``: reemplaza la nota; ``""`` (o solo espacios) la borra.
+
+        Lo que queda en ``None`` no se toca. ``ValueError`` si la posición no
+        existe o si no se pasó nada para cambiar. Devuelve la posición como
+        quedó.
+        """
+        pid = _record_id(position_id, "El número de posición")
+        if risk_usd is None and entry_price is None and note is None:
+            raise ValueError(
+                "No hay nada para cambiar: indicá el riesgo, el precio de entrada o la nota."
+            )
+        new_risk = _opt_non_negative(risk_usd, "El riesgo")
+        new_entry = _opt_positive(entry_price, "El precio de entrada")
+        new_note = None if note is None else _notes(note)
+        with session_scope(self._engine) as session:
+            row = session.get(OpenPosition, pid)
+            if row is None:
+                raise ValueError(f"No existe la posición abierta {pid}.")
+            if new_risk is not None:
+                row.risk_usd = new_risk
+            if new_entry is not None:
+                row.entry_price = new_entry
+            if note is not None:
+                row.notes = new_note
+            session.add(row)
+            session.flush()
+            return StoredPosition._from_row(row)
 
     def close_open_position(self, position_id: int) -> StoredPosition | None:
         """Saca la posición de la lista (sin registrar resultado). Devuelve lo que borró.
@@ -1018,6 +1150,63 @@ class Repository:
             session.delete(row)
             return True
 
+    # --- bloqueos totales ---------------------------------------------------------
+
+    def add_safety_lock(
+        self,
+        *,
+        triggered_at: datetime,
+        trigger_code: str = "monthly_drawdown_lock",
+        drawdown_pct: float | None = None,
+        peak_usd: float | None = None,
+        balance_usd: float | None = None,
+        report_path: Path | str | None = None,
+        lock_path: Path | str | None = None,
+    ) -> StoredSafetyLock:
+        """Anota que la app escribió el archivo LOCKED (lo llama la capa de seguridad).
+
+        ``triggered_at`` tiene que tener zona horaria (es la hora del disparo
+        que puso la app, no la tipea el usuario: no se controla que no esté en
+        el futuro). Los números son opcionales pero, si vienen, tienen que ser
+        finitos. Las rutas se guardan como texto.
+        """
+        row = SafetyLock(
+            triggered_at=_aware(triggered_at, "La hora del bloqueo"),
+            trigger_code=_text(trigger_code, "El código del freno", MAX_TRIGGER_CODE_LENGTH),
+            drawdown_pct=_opt_number(drawdown_pct, "La caída del bloqueo"),
+            peak_usd=_opt_number(peak_usd, "El máximo del bloqueo"),
+            balance_usd=_opt_number(balance_usd, "El saldo del bloqueo"),
+            report_path=_opt_text(
+                None if report_path is None else str(report_path),
+                "La ruta del informe",
+                MAX_PATH_LENGTH,
+            ),
+            lock_path=_opt_text(
+                None if lock_path is None else str(lock_path),
+                "La ruta del archivo LOCKED",
+                MAX_PATH_LENGTH,
+            ),
+            created_at=self._now(),
+        )
+        with session_scope(self._engine) as session:
+            session.add(row)
+            session.flush()
+            return StoredSafetyLock._from_row(row)
+
+    def list_safety_locks(
+        self, *, since: datetime | None = None, until: datetime | None = None
+    ) -> list[StoredSafetyLock]:
+        """Bloqueos con ``since <= triggered_at < until``, del más viejo al más nuevo."""
+        start, end = self._range(since, until)
+        stmt = select(SafetyLock)
+        if start is not None:
+            stmt = stmt.where(col(SafetyLock.triggered_at) >= start)
+        if end is not None:
+            stmt = stmt.where(col(SafetyLock.triggered_at) < end)
+        stmt = stmt.order_by(col(SafetyLock.triggered_at), col(SafetyLock.id))
+        with session_scope(self._engine) as session:
+            return [StoredSafetyLock._from_row(r) for r in session.exec(stmt).all()]
+
     # --- análisis -----------------------------------------------------------------
 
     def save_analysis(
@@ -1143,7 +1332,9 @@ __all__ = [
     "MAX_CLOCK_SKEW",
     "MAX_EVENT_NOTE_LENGTH",
     "MAX_NOTES_LENGTH",
+    "MAX_PATH_LENGTH",
     "MAX_SYMBOL_LENGTH",
+    "MAX_TRIGGER_CODE_LENGTH",
     "PLAN_STATUSES",
     "REGIME_CATEGORIES",
     "SIDES",
@@ -1152,6 +1343,7 @@ __all__ = [
     "Repository",
     "StoredAnalysis",
     "StoredPosition",
+    "StoredSafetyLock",
     "StoredTrade",
     "StoredVolatilityEvent",
     "StoredWalletEvent",

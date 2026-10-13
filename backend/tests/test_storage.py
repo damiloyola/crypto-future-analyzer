@@ -22,6 +22,7 @@ from app.storage import (
     Repository,
     StoredAnalysis,
     StoredPosition,
+    StoredSafetyLock,
     StoredTrade,
     StoredVolatilityEvent,
     StoredWalletEvent,
@@ -153,49 +154,138 @@ def test_init_db_refuses_a_database_from_another_schema_version(tmp_path: Path):
         open_db(db_file)
 
 
-def test_schema_version_2_and_every_old_version_has_a_migration():
-    assert SCHEMA_VERSION == 2
+def test_schema_version_3_and_every_old_version_has_a_migration():
+    assert SCHEMA_VERSION == 3
     assert sorted(MIGRATIONS) == list(range(1, SCHEMA_VERSION))
 
 
-def _make_v1_database(db_file: Path) -> None:
-    """Base como la dejaba la tanda 1 del Hito 5: 4 tablas y ``user_version = 1``."""
-    open_db(db_file).dispose()
+# Esquemas viejos tal como los creaba la app (copiados de ``sqlite_master``):
+# así las migraciones se prueban contra archivos reales de esas versiones y no
+# contra el esquema actual con tablas borradas.
+_V1_DDL = (
+    "CREATE TABLE manual_trades (id INTEGER NOT NULL, symbol VARCHAR(20) NOT NULL, "
+    "side VARCHAR(5) NOT NULL, opened_at DATETIME NOT NULL, closed_at DATETIME NOT NULL, "
+    "pnl_usd FLOAT NOT NULL, risk_usd FLOAT, entry_price FLOAT, exit_price FLOAT, notes TEXT, "
+    "analysis_id INTEGER, regime_category VARCHAR(20), regime_name VARCHAR(60), "
+    "regime_confidence FLOAT, score_total FLOAT, plan_status VARCHAR(20), "
+    "profile_name VARCHAR(60), created_at DATETIME NOT NULL, PRIMARY KEY (id))",
+    "CREATE INDEX ix_manual_trades_analysis_id ON manual_trades (analysis_id)",
+    "CREATE INDEX ix_manual_trades_closed_at ON manual_trades (closed_at)",
+    "CREATE INDEX ix_manual_trades_symbol ON manual_trades (symbol)",
+    "CREATE TABLE open_positions (id INTEGER NOT NULL, symbol VARCHAR(20) NOT NULL, "
+    "side VARCHAR(5) NOT NULL, opened_at DATETIME NOT NULL, entry_price FLOAT, "
+    "risk_usd FLOAT NOT NULL, notes TEXT, analysis_id INTEGER, created_at DATETIME NOT NULL, "
+    "PRIMARY KEY (id))",
+    "CREATE INDEX ix_open_positions_analysis_id ON open_positions (analysis_id)",
+    "CREATE INDEX ix_open_positions_symbol ON open_positions (symbol)",
+    "CREATE TABLE wallet_events (id INTEGER NOT NULL, ts DATETIME NOT NULL, "
+    "kind VARCHAR(12) NOT NULL, amount_usd FLOAT NOT NULL, notes TEXT, PRIMARY KEY (id))",
+    "CREATE INDEX ix_wallet_events_ts ON wallet_events (ts)",
+    "CREATE TABLE analyses (id INTEGER NOT NULL, created_at DATETIME NOT NULL, "
+    "symbol VARCHAR(20) NOT NULL, profile_name VARCHAR(60) NOT NULL, price FLOAT NOT NULL, "
+    "price_source VARCHAR(40) NOT NULL, regime_category VARCHAR(20), regime_name VARCHAR(60), "
+    "regime_confidence FLOAT, regime_unstable BOOLEAN, score_total FLOAT, "
+    "plan_status VARCHAR(20) NOT NULL, plan_json TEXT, score_json TEXT, safety_json TEXT, "
+    "llm_json TEXT, inputs_json TEXT, PRIMARY KEY (id))",
+    "CREATE INDEX ix_analyses_created_at ON analyses (created_at)",
+    "CREATE INDEX ix_analyses_symbol_created_at ON analyses (symbol, created_at)",
+)
+_V2_EXTRA_DDL = (
+    "CREATE TABLE high_volatility_events (id INTEGER NOT NULL, created_at DATETIME NOT NULL, "
+    "starts_at DATETIME NOT NULL, until DATETIME NOT NULL, note TEXT NOT NULL, "
+    "PRIMARY KEY (id))",
+    "CREATE INDEX ix_high_volatility_events_starts_at ON high_volatility_events (starts_at)",
+    "CREATE INDEX ix_high_volatility_events_until ON high_volatility_events (until)",
+)
+
+
+def _make_old_database(db_file: Path, version: int) -> None:
+    """Base de la versión ``version`` (1 o 2) con una operación, una posición y un saldo."""
+    ddl = _V1_DDL if version == 1 else _V1_DDL + _V2_EXTRA_DDL
     with sqlite3.connect(db_file) as conn:
-        conn.execute("DROP TABLE high_volatility_events")
-        conn.execute("PRAGMA user_version = 1")
+        for statement in ddl:
+            conn.execute(statement)
         conn.execute(
             "INSERT INTO manual_trades (symbol, side, opened_at, closed_at, pnl_usd, created_at) "
             "VALUES ('BTC', 'long', '2026-10-13 10:00:00', '2026-10-13 11:00:00', -12.5, "
             "'2026-10-13 11:00:00')"
         )
+        conn.execute(
+            "INSERT INTO open_positions (symbol, side, opened_at, risk_usd, created_at) "
+            "VALUES ('ETH', 'short', '2026-10-13 12:00:00', 30.0, '2026-10-13 12:00:00')"
+        )
+        conn.execute(
+            "INSERT INTO wallet_events (ts, kind, amount_usd) "
+            "VALUES ('2026-10-01 12:00:00', 'balance', 300.0)"
+        )
+        if version == 2:
+            conn.execute(
+                "INSERT INTO high_volatility_events (created_at, starts_at, until, note) "
+                "VALUES ('2026-10-13 14:00:00', '2026-10-13 14:00:00', '2026-10-13 16:00:00', "
+                "'Fed')"
+            )
+        conn.execute(f"PRAGMA user_version = {version}")
+
+
+def _tables(db_file: Path) -> set[str]:
+    return {r[0] for r in raw_rows(db_file, "SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def _check_old_data_survived(repo: Repository) -> None:
+    (trade,) = repo.list_trades()
+    assert (trade.symbol, trade.pnl_usd) == ("BTC", -12.5)
+    assert trade.closed_at == datetime(2026, 10, 13, 11, 0, tzinfo=UTC)
+    (pos,) = repo.list_open_positions()
+    assert (pos.symbol, pos.side, pos.risk_usd) == ("ETH", "short", 30.0)
+    (bal,) = repo.list_wallet_events()
+    assert (bal.kind, bal.amount_usd) == ("balance", 300.0)
 
 
 def test_a_v1_database_is_migrated_without_losing_data(tmp_path: Path, clock: FakeClock):
     db_file = tmp_path / "v1.db"
-    _make_v1_database(db_file)
-    tables = {r[0] for r in raw_rows(db_file, "SELECT name FROM sqlite_master WHERE type='table'")}
-    assert "high_volatility_events" not in tables
+    _make_old_database(db_file, 1)
+    assert {"high_volatility_events", "safety_locks"}.isdisjoint(_tables(db_file))
 
-    repo = Repository.open(db_file, clock=clock)
-    assert raw_rows(db_file, "PRAGMA user_version") == [(2,)]
-    (trade,) = repo.list_trades()
-    assert (trade.symbol, trade.pnl_usd) == ("BTC", -12.5)
-    assert trade.closed_at == datetime(2026, 10, 13, 11, 0, tzinfo=UTC)
+    repo = Repository.open(db_file, clock=clock)  # 1 → 2 → 3
+    assert raw_rows(db_file, "PRAGMA user_version") == [(3,)]
+    assert {"high_volatility_events", "safety_locks"} <= _tables(db_file)
+    _check_old_data_survived(repo)
     event = repo.add_volatility_event("CPI", until=NOW + timedelta(hours=1))
     assert repo.active_volatility_events() == [event]
+    lock = repo.add_safety_lock(triggered_at=NOW, drawdown_pct=72.0)
     # Abrirla de nuevo no vuelve a migrar ni toca nada.
     again = Repository.open(db_file, clock=clock)
-    assert len(again.list_trades()) == 1
+    _check_old_data_survived(again)
     assert again.list_volatility_events() == [event]
+    assert again.list_safety_locks() == [lock]
 
 
-def test_a_v1_database_that_already_has_the_new_table_is_migrated(tmp_path: Path):
-    """Migración idempotente: si la tabla ya existe (corte a mitad), no falla."""
-    db_file = tmp_path / "v1b.db"
+def test_a_v2_database_is_migrated_without_losing_data(tmp_path: Path, clock: FakeClock):
+    db_file = tmp_path / "v2.db"
+    _make_old_database(db_file, 2)
+    assert "safety_locks" not in _tables(db_file)
+
+    repo = Repository.open(db_file, clock=clock)
+    assert raw_rows(db_file, "PRAGMA user_version") == [(3,)]
+    assert "safety_locks" in _tables(db_file)
+    indexes = {r[0] for r in raw_rows(db_file, "SELECT name FROM sqlite_master WHERE type='index'")}
+    assert "ix_safety_locks_triggered_at" in indexes
+    _check_old_data_survived(repo)
+    (event,) = repo.list_volatility_events()
+    assert event.note == "Fed"
+    assert event.until == datetime(2026, 10, 13, 16, 0, tzinfo=UTC)
+    assert repo.list_safety_locks() == []
+    lock = repo.add_safety_lock(triggered_at=NOW)
+    assert Repository.open(db_file, clock=clock).list_safety_locks() == [lock]
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_an_old_database_that_already_has_the_new_tables_is_migrated(tmp_path: Path, version):
+    """Migración idempotente: si las tablas ya existen (corte a mitad), no falla."""
+    db_file = tmp_path / f"v{version}b.db"
     open_db(db_file).dispose()
     with sqlite3.connect(db_file) as conn:
-        conn.execute("PRAGMA user_version = 1")
+        conn.execute(f"PRAGMA user_version = {version}")
     open_db(db_file).dispose()
     assert raw_rows(db_file, "PRAGMA user_version") == [(SCHEMA_VERSION,)]
 
@@ -451,15 +541,18 @@ def test_list_trades_newest_first_with_limit(repo: Repository):
         ({"symbol": "X" * 21}, "Moneda inválida"),
         ({"symbol": 123}, "La moneda tiene que ser un texto"),
         ({"opened_at": ago(minutes=10), "closed_at": ago(minutes=20)}, "antes de abrir"),
-        ({"risk_usd": 0}, "El riesgo tiene que ser mayor a 0"),
-        ({"risk_usd": -5}, "El riesgo tiene que ser mayor a 0"),
+        ({"risk_usd": -5}, "El riesgo no puede ser negativo"),
+        ({"risk_usd": -0.01}, "El riesgo no puede ser negativo"),
         ({"pnl_usd": float("nan")}, "número finito"),
         ({"pnl_usd": float("inf")}, "número finito"),
         ({"pnl_usd": True}, "tiene que ser un número"),
         ({"pnl_usd": "-10"}, "tiene que ser un número"),
         ({"entry_price": 0}, "El precio de entrada"),
         ({"exit_price": -1}, "El precio de salida"),
-        ({"notes": "x" * (MAX_NOTES_LENGTH + 1)}, "demasiado largo"),
+        (
+            {"notes": "x" * (MAX_NOTES_LENGTH + 1)},
+            f"La nota tiene {MAX_NOTES_LENGTH + 1} caracteres y el máximo es {MAX_NOTES_LENGTH}",
+        ),
         ({"regime_confidence": 1.5}, "va de 0 a 1"),
         ({"score_total": 150}, "va de -100 a \\+100"),
         ({"plan_status": "COMPRAR"}, "Estado del plan desconocido"),
@@ -473,6 +566,11 @@ def test_trade_validation_errors(repo: Repository, overrides, message):
     with pytest.raises(ValueError, match=message):
         add_trade(repo, **overrides)
     assert repo.list_trades() == []
+
+
+def test_trade_with_zero_risk_is_allowed(repo: Repository):
+    """Riesgo 0 = el stop estaba en la entrada (no se arriesgaba nada)."""
+    assert add_trade(repo, risk_usd=0).risk_usd == 0.0
 
 
 def test_closing_exactly_at_the_opening_is_allowed(repo: Repository):
@@ -534,8 +632,8 @@ def test_open_position_defaults_and_listing(repo: Repository):
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"risk_usd": 0}, "El riesgo tiene que ser mayor a 0"),
-        ({"risk_usd": -10}, "El riesgo tiene que ser mayor a 0"),
+        ({"risk_usd": -10}, "El riesgo no puede ser negativo"),
+        ({"risk_usd": float("nan")}, "número finito"),
         ({"risk_usd": None}, "tiene que ser un número"),
         ({"side": "sell"}, "Dirección desconocida"),
         ({"symbol": "BTC USDT"}, "Moneda inválida"),
@@ -548,6 +646,62 @@ def test_open_position_validation_errors(repo: Repository, kwargs, message):
     with pytest.raises(ValueError, match=message):
         repo.add_open_position(**data)
     assert repo.list_open_positions() == []
+
+
+def test_open_position_with_zero_risk_and_closing_it(repo: Repository):
+    """Stop en la entrada: riesgo 0. Se puede abrir y cerrar con resultado."""
+    pos = repo.add_open_position(symbol="BTC", side="long", risk_usd=0)
+    assert pos.risk_usd == 0.0
+    trade = repo.close_position_with_result(pos.id, pnl_usd=0.0)
+    assert trade.risk_usd == 0.0
+    assert repo.list_open_positions() == []
+
+
+def test_update_position_changes_risk_entry_and_note(repo: Repository):
+    pos = repo.add_open_position(
+        symbol="ETH",
+        side="short",
+        risk_usd=40.0,
+        entry_price=2400.0,
+        notes="Entrada",
+        opened_at=ago(hours=1),
+    )
+    moved = repo.update_position(pos.id, risk_usd=0)
+    assert isinstance(moved, StoredPosition)
+    assert moved.risk_usd == 0.0  # stop movido a la entrada
+    assert (moved.entry_price, moved.notes, moved.opened_at) == (2400.0, "Entrada", pos.opened_at)
+    assert repo.get_open_position(pos.id) == moved
+
+    both = repo.update_position(pos.id, risk_usd=12.5, entry_price=2410.5, note="  Promedié  ")
+    assert (both.risk_usd, both.entry_price, both.notes) == (12.5, 2410.5, "Promedié")
+    cleared = repo.update_position(pos.id, note="   ")
+    assert cleared.notes is None and cleared.risk_usd == 12.5
+    assert (cleared.symbol, cleared.side, cleared.created_at) == ("ETH", "short", pos.created_at)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"risk_usd": -1}, "El riesgo no puede ser negativo"),
+        ({"risk_usd": float("inf")}, "número finito"),
+        ({"risk_usd": "10"}, "tiene que ser un número"),
+        ({"entry_price": 0}, "El precio de entrada tiene que ser mayor a 0"),
+        ({"note": "x" * (MAX_NOTES_LENGTH + 1)}, "el máximo es"),
+        ({}, "No hay nada para cambiar"),
+    ],
+)
+def test_update_position_validation_errors(repo: Repository, kwargs, message):
+    pos = repo.add_open_position(symbol="BTC", side="long", risk_usd=50.0)
+    with pytest.raises(ValueError, match=message):
+        repo.update_position(pos.id, **kwargs)
+    assert repo.get_open_position(pos.id) == pos  # no cambió nada
+
+
+def test_update_position_of_a_missing_position(repo: Repository):
+    with pytest.raises(ValueError, match="No existe la posición abierta 99"):
+        repo.update_position(99, risk_usd=10)
+    with pytest.raises(ValueError, match="entero positivo"):
+        repo.update_position(0, risk_usd=10)
 
 
 def test_close_open_position_removes_it(repo: Repository):
@@ -710,12 +864,13 @@ def test_volatility_event_can_start_in_the_past(repo: Repository):
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"note": "", "until": NOW + timedelta(hours=1)}, "La nota del evento no puede estar"),
-        ({"note": "   ", "until": NOW + timedelta(hours=1)}, "La nota del evento no puede estar"),
-        ({"note": None, "until": NOW + timedelta(hours=1)}, "La nota del evento no puede estar"),
+        ({"note": "", "until": NOW + timedelta(hours=1)}, "^Falta la nota del evento\\.$"),
+        ({"note": "   ", "until": NOW + timedelta(hours=1)}, "^Falta la nota del evento\\.$"),
+        ({"note": None, "until": NOW + timedelta(hours=1)}, "^Falta la nota del evento\\.$"),
         (
             {"note": "x" * (MAX_EVENT_NOTE_LENGTH + 1), "until": NOW + timedelta(hours=1)},
-            "demasiado largo",
+            f"La nota del evento tiene {MAX_EVENT_NOTE_LENGTH + 1} caracteres y el máximo es "
+            f"{MAX_EVENT_NOTE_LENGTH}",
         ),
         ({"note": "CPI", "until": NOW}, "ya pasó"),
         ({"note": "CPI", "until": ago(minutes=1)}, "ya pasó"),
@@ -781,6 +936,62 @@ def test_delete_volatility_event(repo: Repository):
     assert repo.active_volatility_events() == []
     with pytest.raises(ValueError, match="número entero positivo"):
         repo.delete_volatility_event(0)
+
+
+# --- bloqueos totales (esquema 3) -----------------------------------------------------
+
+
+def test_safety_lock_round_trip(repo: Repository, tmp_path: Path):
+    lock = repo.add_safety_lock(
+        triggered_at=datetime(2026, 10, 13, 12, 0, tzinfo=BUENOS_AIRES),
+        trigger_code="monthly_drawdown_lock",
+        drawdown_pct=np.float64(73.33),
+        peak_usd=300.0,
+        balance_usd=80,
+        report_path=tmp_path / "incidente.md",
+        lock_path=str(tmp_path / "LOCKED"),
+    )
+    assert isinstance(lock, StoredSafetyLock)
+    assert lock.triggered_at == datetime(2026, 10, 13, 15, 0, tzinfo=UTC)  # en UTC
+    assert (lock.drawdown_pct, lock.peak_usd, lock.balance_usd) == (73.33, 300.0, 80.0)
+    assert lock.report_path == str(tmp_path / "incidente.md")
+    assert lock.lock_path == str(tmp_path / "LOCKED")
+    assert lock.created_at == NOW
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        lock.peak_usd = 1.0  # type: ignore[misc]
+    d = lock.to_dict()
+    assert json.loads(json.dumps(d, allow_nan=False)) == d
+    assert d["triggered_at"] == "2026-10-13T15:00:00+00:00"
+    assert repo.list_safety_locks() == [lock]
+
+
+def test_safety_lock_minimal_fields_and_listing(repo: Repository):
+    late = repo.add_safety_lock(triggered_at=NOW)
+    early = repo.add_safety_lock(triggered_at=ago(days=20), trigger_code="otro")
+    assert late.trigger_code == "monthly_drawdown_lock"
+    assert late.drawdown_pct is None and late.report_path is None and late.lock_path is None
+    assert repo.list_safety_locks() == [early, late]  # por hora del bloqueo
+    assert repo.list_safety_locks(since=ago(days=1)) == [late]
+    assert repo.list_safety_locks(until=ago(days=1)) == [early]
+    # La hora la pone la app: no se controla que no esté en el futuro.
+    future = repo.add_safety_lock(triggered_at=NOW + timedelta(days=1))
+    assert repo.list_safety_locks()[-1] == future
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"triggered_at": datetime(2026, 10, 13, 15, 0)}, "no tiene zona horaria"),
+        ({"triggered_at": "2026-10-13"}, "tiene que ser una fecha"),
+        ({"triggered_at": NOW, "trigger_code": "  "}, "^Falta el código del freno\\.$"),
+        ({"triggered_at": NOW, "drawdown_pct": float("nan")}, "número finito"),
+        ({"triggered_at": NOW, "peak_usd": "300"}, "tiene que ser un número"),
+    ],
+)
+def test_safety_lock_validation_errors(repo: Repository, kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        repo.add_safety_lock(**kwargs)
+    assert repo.list_safety_locks() == []
 
 
 # --- análisis -------------------------------------------------------------------------
@@ -893,8 +1104,9 @@ def test_analysis_minimal_fields_and_numpy_values(repo: Repository):
     [
         ({"price": 0}, "El precio tiene que ser mayor a 0"),
         ({"price": float("inf")}, "número finito"),
-        ({"profile_name": "  "}, "El perfil no puede estar vacío"),
-        ({"price_source": ""}, "La fuente del precio no puede estar vacío"),
+        ({"profile_name": "  "}, "^Falta el perfil\\.$"),
+        ({"price_source": ""}, "^Falta la fuente del precio\\.$"),
+        ({"profile_name": "x" * 61}, "El perfil tiene 61 caracteres y el máximo es 60"),
         ({"plan_status": None}, "Estado del plan desconocido"),
         ({"plan_status": "WAIT"}, "Estado del plan desconocido"),
         ({"regime_category": "lateral"}, "Tipo de régimen desconocido"),

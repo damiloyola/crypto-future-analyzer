@@ -9,16 +9,18 @@ de la cuenta con la misma interfaz.
 Módulos (cada uno puro salvo las funciones de I/O que se nombran):
 
 - ``state``: ``TradingState``, los números del estado de trading en la zona
-  del usuario (pérdida neta del día y de la semana, operaciones de hoy, racha
-  de pérdidas con su pausa, saldo de la billetera, su máximo del mes y la
-  caída). I/O: ``load_trading_state(repo, settings, profile, now)``.
+  del usuario (pérdida neta del día y de la semana, la actual y la más grande
+  a la que se llegó; operaciones de hoy, racha de pérdidas con su pausa, saldo
+  de la billetera, su máximo del mes, la caída y la caída medida desde el
+  último bloqueo total). I/O: ``load_trading_state(repo, settings, profile,
+  now)``.
 - ``breakers``: un ``BreakerStatus`` por freno (pérdida del día, pausa por
   pérdidas seguidas, pérdida de la semana, caída del mes, evento de alta
   volatilidad y archivo LOCKED) y ``evaluate_breakers(...) -> SafetyVerdict``
   (verde / ámbar / rojo, multiplicador de riesgo y motivos de bloqueo). I/O:
   la lectura del LOCKED dentro de ``evaluate_breakers`` (salvo que se pase
   ``lock``) y ``trigger_lock_if_needed``, que escribe el informe del incidente
-  y el LOCKED una sola vez.
+  y el LOCKED una sola vez y anota el bloqueo en la base.
 - ``correlation``: matriz de correlación de retornos de 1h y riesgo combinado
   de posiciones correlacionadas (``combined_risk_limit``). I/O:
   ``fetch_correlation_matrix``.

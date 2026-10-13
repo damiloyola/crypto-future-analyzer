@@ -6,6 +6,15 @@
 # Datos locales (base SQLite, modelos HMM, lock, informes)
 data/*
 !data/.gitkeep
+# Bases SQLite, archivo LOCKED e informes de incidentes en cualquier carpeta
+# (por ejemplo, una --db de prueba en backend/ o en la raíz): son datos
+# personales y nunca se suben.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+LOCKED
+incidents/
 
 # Python
 __pycache__/

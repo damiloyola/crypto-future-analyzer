@@ -50,9 +50,12 @@ Decisiones
       que sale como 0,7999999999 por cuentas en punto flotante también cuente.
     - **La misma moneda** tiene correlación 1, siempre (aunque no esté en la
       matriz).
-    - **Dirección contraria = cobertura**: no suma riesgo, aunque sea la misma
-      moneda. Solo se miran correlaciones positivas (en cripto las correlaciones
-      muy negativas entre monedas prácticamente no existen).
+    - **Dirección contraria no suma riesgo**. Solo la **misma moneda** en
+      dirección contraria se llama cobertura (``REASON_HEDGE``); otra moneda al
+      revés del plan (``REASON_OPPOSITE_SIDE``) se explica según su correlación
+      ("se mueve parecido", "no se mueve junto" o "no hay datos"), sin decir que
+      cubre nada. Solo se miran correlaciones positivas (en cripto las
+      correlaciones muy negativas entre monedas prácticamente no existen).
     - **Sin look-ahead**: solo velas cerradas a la hora ``now``.
 """
 
@@ -100,7 +103,8 @@ THRESHOLD_TOLERANCE = 1e-9
 REASON_SAME_SYMBOL = "same_symbol"  # misma moneda, misma dirección: suma
 REASON_HIGH_CORRELATION = "high_correlation"  # correlación >= umbral: suma
 REASON_UNKNOWN_CORRELATION = "unknown_correlation"  # sin dato: suma por las dudas
-REASON_HEDGE = "hedge"  # dirección contraria (cobertura): no suma
+REASON_HEDGE = "hedge"  # misma moneda en dirección contraria (cobertura): no suma
+REASON_OPPOSITE_SIDE = "opposite_side"  # otra moneda en dirección contraria: no suma
 REASON_LOW_CORRELATION = "low_correlation"  # correlación < umbral: no suma
 
 _SIDE_WORD = {"long": "long (compra)", "short": "short (venta)"}
@@ -672,7 +676,8 @@ class Exposure:
 
     ``counted``: misma dirección y moneda muy correlacionada (o la misma, o
     sin dato de correlación). ``skipped``: las demás, con el motivo
-    (cobertura o correlación baja). ``existing_risk_usd`` es la suma del riesgo
+    (cobertura en la misma moneda, otra moneda en dirección contraria o
+    correlación baja). ``existing_risk_usd`` es la suma del riesgo
     de ``counted``: lo que hay que sumarle al riesgo del plan nuevo antes de
     compararlo con ``combined_risk_limit``.
     """
@@ -709,24 +714,70 @@ class Exposure:
 
     @property
     def explanation(self) -> str:
+        """Las posiciones que suman, en palabras simples.
+
+        Las que se cuentan sin saber su correlación se nombran aparte: de esas
+        no se dice que "se mueven junto" con la moneda del plan (no hay datos),
+        solo que se cuentan por las dudas.
+        """
         side = _SIDE_WORD[self.new_side]
+        new = self.new_symbol
         if not self.counted:
             return (
                 f"No hay posiciones abiertas en {side} que se muevan junto con "
-                f"{self.new_symbol}: el plan no suma riesgo con otras posiciones."
+                f"{new}: el plan no suma riesgo con otras posiciones."
             )
+        known = [e for e in self.counted if e.reason != REASON_UNKNOWN_CORRELATION]
+        unknown = [e for e in self.counted if e.reason == REASON_UNKNOWN_CORRELATION]
+        n = len(self.counted)
+        total = fmt_usd(self.existing_risk_usd)
+        lose = "pueden perder" if unknown else "pierden"
         names = ", ".join(f"{e.symbol} ({fmt_usd(e.risk_usd)})" for e in self.counted)
-        text = (
-            f"Ya tenés posiciones en {side} que se mueven junto con {self.new_symbol}: "
-            f"{names}. Suman {fmt_usd(self.existing_risk_usd)} de riesgo, que cuenta junto "
-            "con el del plan nuevo porque si el mercado se da vuelta pierden todas juntas."
-        )
-        if self.unknown_symbols:
-            text += (
-                f" De {', '.join(self.unknown_symbols)} no hay datos para saber si se mueve "
-                f"junto con {self.new_symbol}; por las dudas se cuenta."
+        if n == 1:
+            head = f"Ya tenés una posición en {side}"
+            why = (
+                f"Su riesgo ({total}) cuenta junto con el del plan nuevo porque si el mercado se "
+                f"da vuelta {lose} las dos juntas."
             )
-        return text
+        else:
+            head = f"Ya tenés {n} posiciones en {side}"
+            why = (
+                f"Suman {total} de riesgo, que cuenta junto con el del plan nuevo porque si el "
+                f"mercado se da vuelta {lose} todas juntas."
+            )
+        same = _unique_coins(e for e in known if e.symbol == new)
+        related = _unique_coins(e for e in known if e.symbol != new)
+        if not unknown:
+            if not related:
+                relation = f"en {new}, la misma moneda"
+            elif not same:
+                relation = f"que {'se mueven' if n > 1 else 'se mueve'} junto con {new}"
+            else:
+                relation = f"en {new} o que se mueven junto con {new}"
+            return f"{head} {relation}: {names}. {why}"
+        # Con monedas sin dato de correlación no se afirma que "se mueven junto":
+        # se dice cuáles sí (si hay) y que las otras se cuentan por las dudas.
+        details: list[str] = []
+        if same:
+            details.append(f"{new} es la misma moneda")
+        if related:
+            moves = "se mueven" if len(related) > 1 else "se mueve"
+            details.append(f"{_join_es(related)} {moves} junto con {new}")
+        doubt_coins = _unique_coins(unknown)
+        moves = "se mueven" if len(doubt_coins) > 1 else "se mueve"
+        counts = "se cuentan" if len(unknown) > 1 else "se cuenta"
+        if details:
+            doubt = (
+                f"De {_join_es(doubt_coins)} no hay datos para saber si {moves} junto con {new}; "
+                f"por las dudas {counts}."
+            )
+            known_text = " y ".join(details)
+            return f"{head}: {names}. {known_text[:1].upper()}{known_text[1:]}. {doubt} {why}"
+        doubt = (
+            f"No hay datos para saber si {_join_es(doubt_coins)} {moves} junto con {new}; por "
+            f"las dudas {counts}."
+        )
+        return f"{head}: {names}. {doubt} {why}"
 
     def to_dict(self) -> dict[str, Any]:
         return json_safe(
@@ -743,6 +794,18 @@ class Exposure:
                 "explanation": self.explanation,
             }
         )
+
+
+def _unique_coins(entries: Iterable[ExposureEntry]) -> list[str]:
+    """Las monedas de ``entries``, sin repetir y en orden."""
+    return list(dict.fromkeys(e.symbol for e in entries))
+
+
+def _join_es(items: Sequence[str]) -> str:
+    """``["ETH", "SOL", "AVAX"]`` → ``"ETH, SOL y AVAX"``."""
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " y " + items[-1]
 
 
 def _entry(
@@ -770,11 +833,26 @@ def _entry(
         return ExposureEntry(symbol, side, risk, corr, counted, reason, explanation)
 
     if side != new_side:
+        # Cobertura es solo la misma moneda al revés (decisión del usuario). Otra
+        # moneda al revés no suma riesgo, pero tampoco "cubre" nada: se dice cómo
+        # se mueve respecto de la del plan.
+        if symbol == new_symbol:
+            return make(
+                False,
+                REASON_HEDGE,
+                f"{symbol} está en {_SIDE_WORD[side]}, al revés del plan en la misma moneda: "
+                "funciona como cobertura y no suma riesgo.",
+            )
+        if corr is None:
+            relation = f" (no hay datos para saber si se mueve junto con {new_symbol})"
+        elif corr >= threshold - THRESHOLD_TOLERANCE:
+            relation = f" y se mueve parecido a {new_symbol} (correlación {corr_text})"
+        else:
+            relation = f" y no se mueve junto con {new_symbol} (correlación {corr_text})"
         return make(
             False,
-            REASON_HEDGE,
-            f"{symbol} está en {_SIDE_WORD[side]}, al revés del plan: funciona como "
-            "cobertura y no suma riesgo.",
+            REASON_OPPOSITE_SIDE,
+            f"{symbol} está en {_SIDE_WORD[side]}: va al revés del plan{relation}: no suma riesgo.",
         )
     if symbol == new_symbol:
         return make(
@@ -821,8 +899,10 @@ def correlated_exposure(
     correlación no se conoce (la moneda no está en la matriz, el par quedó sin
     dato o ``matrix`` es ``None``), **se cuenta igual**, por las dudas, con
     ``reason = REASON_UNKNOWN_CORRELATION``. Las de dirección contraria se
-    saltean como cobertura (aunque sea la misma moneda) y las de correlación
-    baja también, con su motivo.
+    saltean: la misma moneda como cobertura (``REASON_HEDGE``) y otra moneda
+    con ``REASON_OPPOSITE_SIDE`` (su explicación dice si se mueve parecido, si
+    no o si no hay datos, sin llamarla cobertura). Las de correlación baja
+    también se saltean, con su motivo.
 
     ``threshold`` va de 0 (excluido) a 1, como ``correlation.high_threshold``.
     ``ValueError`` si un lado no es long/short, un símbolo está vacío o un

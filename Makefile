@@ -5,6 +5,14 @@ FRONTEND := frontend
 VENV := $(BACKEND)/.venv
 PY := $(VENV)/bin/python
 SYMBOL ?= BTC
+# Carpeta desde donde corriste make (los Makefiles de backend/ y frontend/ la
+# pasan al reenviar). Los comandos corren adentro de backend/, pero una ruta
+# relativa en ARGS (--db, --config) es relativa a esta carpeta: cli, trade,
+# trades y safety se la pasan a los scripts en la variable de entorno
+# ANALYZER_INVOCATION_DIR (solo a esos: los tests no la ven).
+ANALYZER_INVOCATION_DIR ?= $(CURDIR)
+unexport ANALYZER_INVOCATION_DIR
+FROM_DIR := ANALYZER_INVOCATION_DIR="$(ANALYZER_INVOCATION_DIR)"
 
 .PHONY: help setup setup-backend setup-frontend dev backend frontend test test-backend test-frontend lint format cli trade trades safety train-regime walk-forward clean
 
@@ -49,16 +57,16 @@ format: ## Formatea el backend
 	cd $(BACKEND) && .venv/bin/ruff format . && .venv/bin/ruff check --fix .
 
 cli: ## Datos, régimen, score y plan de una moneda. Ej: make cli SYMBOL=ETH ARGS="--offline"
-	cd $(BACKEND) && .venv/bin/python -m scripts.analyze_cli $(SYMBOL) $(ARGS)
+	cd $(BACKEND) && $(FROM_DIR) .venv/bin/python -m scripts.analyze_cli $(SYMBOL) $(ARGS)
 
 trade: ## Carga tu estado a mano. Ej: make trade ARGS="add --symbol BTC --side long --pnl -32,5"
-	cd $(BACKEND) && .venv/bin/python -m scripts.trades $(ARGS)
+	cd $(BACKEND) && $(FROM_DIR) .venv/bin/python -m scripts.trades $(ARGS)
 
 trades: ## Lista lo cargado: operaciones, posiciones, billetera y eventos
-	cd $(BACKEND) && .venv/bin/python -m scripts.trades list $(ARGS)
+	cd $(BACKEND) && $(FROM_DIR) .venv/bin/python -m scripts.trades list $(ARGS)
 
 safety: ## Estado de los frenos de seguridad (si la caída del mes llegó al tope, bloquea la app)
-	cd $(BACKEND) && .venv/bin/python -m scripts.trades status $(ARGS)
+	cd $(BACKEND) && $(FROM_DIR) .venv/bin/python -m scripts.trades status $(ARGS)
 
 # Sin SYMBOL (ni en la línea de comandos ni en el entorno) entrena todas las
 # favoritas: el BTC por omisión de arriba no cuenta (origin "file").

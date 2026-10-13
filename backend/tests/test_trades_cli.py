@@ -15,7 +15,8 @@ from zoneinfo import ZoneInfo
 import pytest
 import yaml
 
-from app.config import DEFAULT_CONFIG_PATH
+from app.config import DEFAULT_CONFIG_PATH, load_settings
+from app.risk.profiles import get_profile
 from app.storage import Repository
 from scripts import trades
 from scripts.trades import main, parse_user_datetime
@@ -49,6 +50,12 @@ def run(db: Path, *argv: str, answer: str | None = None, now: datetime = NOW):
 
 def repo(db: Path, now: datetime = NOW) -> Repository:
     return Repository.open(db, clock=lambda: now)
+
+
+def create(db: Path) -> Path:
+    """Crea la base vacía (``list``, ``status``, ``close`` y ``delete`` no la crean)."""
+    repo(db).engine.dispose()
+    return db
 
 
 # --- fechas y horas ----------------------------------------------------------------------
@@ -162,8 +169,9 @@ def test_add_in_the_future_exits_2_with_local_times(db):
     )
     assert code == 2 and repo(db).list_trades() == []
     assert (
-        "Dato inválido: La hora de cierre (14/10 16:00) está en el futuro: ahora son las 14/10 "
-        "15:00 (hora de Buenos Aires)."
+        "Dato inválido: La hora de cierre (14/10/2026 16:00) está en el futuro: ahora son las "
+        "14/10/2026 15:00 (hora de Buenos Aires). Revisá la fecha y la hora. Si fue ayer, escribí "
+        '"ayer 16:00".'
     ) in err
 
 
@@ -339,6 +347,7 @@ def test_close_needs_a_number_with_several_positions(db):
 
 
 def test_close_errors(db):
+    create(db)
     code, _, err = run(db, "close", "--pnl", "5")
     assert code == 1 and "No tenés posiciones abiertas cargadas." in err
     run(db, "open", "--symbol", "BTC", "--side", "long", "--risk", "30", "--opened", "14:00")
@@ -421,7 +430,7 @@ def test_list_shows_everything(db):
 
 
 def test_list_when_empty(db):
-    code, out, _ = run(db, "list")
+    code, out, _ = run(create(db), "list")
     assert code == 0
     assert "Todavía no cargaste operaciones." in out and "No hay posiciones abiertas." in out
 
@@ -451,7 +460,7 @@ def test_delete_each_kind_with_yes(db):
 
 
 def test_delete_errors(db):
-    code, _, err = run(db, "delete", "trade", "4", "--yes")
+    code, _, err = run(create(db), "delete", "trade", "4", "--yes")
     assert code == 1 and "No existe la operación #4." in err
     code, _, err = run(db, "delete", "cosa", "1", "--yes")
     assert code == 2 and "No sé borrar 'cosa'" in err
@@ -461,7 +470,7 @@ def test_delete_errors(db):
 
 
 def test_status_green(db):
-    code, out, _ = run(db, "status")
+    code, out, _ = run(create(db), "status")
     assert code == 0
     assert "Frenos de seguridad" in out and "Estado: VERDE" in out
     for label in ("Pérdida del día: bajar el riesgo", "Pérdidas seguidas: pausa", "Caída del mes"):
@@ -513,7 +522,14 @@ def test_drawdown_lock_is_written_by_status_once(db):
     )
     assert code == 0
     lock = db.parent / "LOCKED"
-    assert "la próxima vez que analices o mires los frenos (make safety) la app se bloquea" in out
+    # Hallazgo 13: el bloqueo está pendiente; no manda a borrar un LOCKED que no existe.
+    assert (
+        "Frenos de seguridad: ROJO · No se generan planes: la billetera del mes cayó 73,33 % desde "
+        "su máximo (tope 70 %); al analizar o con make safety la app se va a bloquear y va a "
+        "escribir el informe del incidente."
+    ) in out
+    assert "Si falta cargar un depósito o el saldo real de la billetera, cargalo antes" in out
+    assert "LOCKED" not in out
     assert not lock.exists()  # cargar no escribe el LOCKED
     code, out, _ = run(db, "status")
     assert code == 0 and lock.exists()
@@ -576,5 +592,493 @@ def test_module_documents_every_command():
         "event",
         "delete",
         "status",
+        "update",
     ):
         assert f"``{name}" in trades.__doc__
+
+
+# --- revisión del Hito 5: fechas -------------------------------------------------------------
+
+
+def test_a_time_a_few_minutes_ahead_is_saved_as_now_and_counts_today(db):
+    """Hallazgo 11: "15:03" con el reloj en 15:00 se guarda como 15:00 y los frenos la cuentan."""
+    code, out, err = run(
+        db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-60", "--closed", "15:03"
+    )
+    assert code == 0, err
+    [t] = repo(db).list_trades()
+    assert t.closed_at == NOW.astimezone(UTC) and t.opened_at == t.closed_at
+    assert (
+        "La hora de cierre que pusiste (14/10 15:03) está unos minutos adelante del reloj de la "
+        "computadora: la guardé como ahora (14/10 15:00), así los frenos ya la cuentan."
+    ) in out
+    # -60 USD pasa la mitad del límite del día del perfil agresivo (50 de 100 USD).
+    assert "Frenos de seguridad: ÁMBAR" in out
+    code, out, _ = run(db, "status")
+    assert "Hoy                  -60,00 USD neto" in out
+
+
+def test_wallet_and_open_inside_the_clock_window_are_saved_as_now(db):
+    assert run(db, "balance", "--amount", "300", "--date", "15:04")[0] == 0
+    assert (
+        run(db, "open", "--symbol", "BTC", "--side", "long", "--risk", "30", "--opened", "15:02")[0]
+        == 0
+    )
+    r = repo(db)
+    assert r.list_wallet_events()[0].ts == NOW.astimezone(UTC)
+    assert r.list_open_positions()[0].opened_at == NOW.astimezone(UTC)
+
+
+def test_a_time_beyond_the_clock_window_is_still_rejected(db):
+    code, _, err = run(
+        db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-5", "--closed", "15:06"
+    )
+    assert code == 2 and "está en el futuro" in err
+
+
+NEW_YEAR = datetime(2027, 1, 1, 1, 0, tzinfo=BA)  # 01/01/2027 01:00 de Buenos Aires
+
+
+def test_a_date_without_year_is_the_most_recent_past_one():
+    """Hallazgo 16: el 1/1 a la 01:00, "31/12 23:00" es de hace dos horas (del año anterior)."""
+    assert parse_user_datetime("31/12 23:00", BA, NEW_YEAR, year="past") == datetime(
+        2026, 12, 31, 23, 0, tzinfo=BA
+    )
+    # Este año, si ya pasó.
+    assert parse_user_datetime("13/10 14:30", BA, NOW, year="past") == local(13, 14, 30)
+    # Para eventos, la más cercana: el 28/12, "05/01 10:00" es del año que viene.
+    dec28 = datetime(2026, 12, 28, 12, 0, tzinfo=BA)
+    assert parse_user_datetime("05/01 10:00", BA, dec28) == datetime(2027, 1, 5, 10, 0, tzinfo=BA)
+    with pytest.raises(ValueError, match="no existe"):
+        parse_user_datetime("30/02 10:00", BA, NOW, year="past")
+
+
+def test_add_with_last_years_date_in_january(db):
+    code, out, err = run(
+        db,
+        "add",
+        "--symbol",
+        "BTC",
+        "--side",
+        "long",
+        "--pnl",
+        "-5",
+        "--closed",
+        "31/12 23:00",
+        now=NEW_YEAR,
+    )
+    assert code == 0, err
+    assert repo(db, NEW_YEAR).list_trades()[0].closed_at == datetime(
+        2026, 12, 31, 23, 0, tzinfo=BA
+    ).astimezone(UTC)
+    assert "Cerrada 31/12/2026 23:00" in out
+
+
+def test_a_bare_time_in_the_future_suggests_yesterday(db):
+    code, _, err = run(
+        db,
+        "add",
+        "--symbol",
+        "BTC",
+        "--side",
+        "long",
+        "--pnl",
+        "-5",
+        "--closed",
+        "22:00",
+        now=NEW_YEAR,
+    )
+    assert code == 2
+    assert (
+        "La hora de cierre (01/01/2027 22:00) está en el futuro: ahora son las 01/01/2027 01:00 "
+        '(hora de Buenos Aires). Revisá la fecha y la hora. Si fue ayer, escribí "ayer 22:00".'
+    ) in err
+    code, _, err = run(
+        db,
+        "add",
+        "--symbol",
+        "BTC",
+        "--side",
+        "long",
+        "--pnl",
+        "-5",
+        "--closed",
+        "hoy 9:30",
+        now=NEW_YEAR,
+    )
+    assert code == 2 and 'Si fue ayer, escribí "ayer 09:30".' in err
+
+
+# --- revisión del Hito 5: evento, análisis ligado y base -----------------------------------
+
+
+def test_event_without_from_is_active_right_away_with_a_moving_clock(db):
+    """Hallazgo 12: con un reloj que avanza, el evento recién cargado ya bloquea."""
+    ticks = iter(NOW + timedelta(milliseconds=i) for i in range(1000))
+    out, err = io.StringIO(), io.StringIO()
+    code = main(
+        ["event", "--note", "CPI", "--until", "mañana 11:00", "--db", str(db)],
+        out=out,
+        err=err,
+        clock=lambda: next(ticks),
+    )
+    assert code == 0, err.getvalue()
+    assert "Frenos de seguridad: ROJO · No se generan planes: hay un evento" in out.getvalue()
+    [e] = repo(db).list_volatility_events()
+    assert e.starts_at == NOW.astimezone(UTC)  # la hora del comando, no la de la base
+
+
+def test_explicit_analysis_made_after_opening_is_rejected(db):
+    """Hallazgo 17: un análisis posterior a la apertura no puede ser el que seguiste."""
+    later = _analysis(db, "BTC", local(14, 14, 0))
+    code, out, err = run(
+        db,
+        "add",
+        "--symbol",
+        "BTC",
+        "--side",
+        "long",
+        "--pnl",
+        "5",
+        "--opened",
+        "13:00",
+        "--closed",
+        "13:30",
+        "--analysis",
+        str(later.id),
+    )
+    assert code == 2 and repo(db).list_trades() == []
+    assert (
+        f"El análisis #{later.id} es del 14/10 14:00, después de que abriste (14/10 13:00): no "
+        "puede ser el que seguiste para entrar."
+    ) in err
+    code, _, err = run(
+        db,
+        "open",
+        "--symbol",
+        "BTC",
+        "--side",
+        "long",
+        "--risk",
+        "30",
+        "--opened",
+        "13:00",
+        "--analysis",
+        str(later.id),
+    )
+    assert code == 2 and repo(db).list_open_positions() == []
+    # En el mismo minuto de la apertura sí (la hora escrita no tiene segundos).
+    same_minute = _analysis(db, "BTC", local(14, 13, 0) + timedelta(seconds=40))
+    code, _, err = run(
+        db,
+        "add",
+        "--symbol",
+        "BTC",
+        "--side",
+        "long",
+        "--pnl",
+        "5",
+        "--opened",
+        "13:00",
+        "--analysis",
+        str(same_minute.id),
+    )
+    assert code == 0, err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("status",),
+        ("list",),
+        ("close", "--pnl", "5"),
+        ("update", "1", "--risk", "0"),
+        ("delete", "trade", "1", "--yes"),
+    ],
+)
+def test_reading_a_missing_db_fails_without_creating_it(tmp_path, argv):
+    """Hallazgo 19: una --db mal escrita no crea una base vacía que muestre todo en VERDE."""
+    missing = tmp_path / "no-existe" / "x.db"
+    code, out, err = run(missing, *argv)
+    assert code == 1 and out == ""
+    assert f"No existe la base {missing}: ¿está bien escrita la ruta de --db?" in err
+    assert not missing.exists() and not missing.parent.exists()
+
+
+def test_writing_commands_create_the_db_and_say_so_once(tmp_path):
+    db = tmp_path / "nueva" / "estado.db"
+    code, out, _ = run(db, "deposit", "--amount", "10")
+    assert code == 0 and db.exists()
+    assert f"Base nueva: se creó {db}." in out
+    code, out, _ = run(db, "deposit", "--amount", "10")
+    assert code == 0 and "Base nueva" not in out
+
+
+def test_relative_db_is_relative_to_where_make_was_run(tmp_path, monkeypatch):
+    """Hallazgo 20: el Makefile pasa la carpeta del usuario en ANALYZER_INVOCATION_DIR."""
+    user_dir, backend_dir = tmp_path / "usuario", tmp_path / "backend"
+    user_dir.mkdir()
+    backend_dir.mkdir()
+    monkeypatch.chdir(backend_dir)  # el Makefile corre el script adentro de backend/
+    monkeypatch.setenv(trades.INVOCATION_DIR_ENV, str(user_dir))
+    out, err = io.StringIO(), io.StringIO()
+    code = main(
+        ["balance", "--amount", "100", "--db", "prueba.db"], out=out, err=err, clock=lambda: NOW
+    )
+    assert code == 0, err.getvalue()
+    assert (user_dir / "prueba.db").exists() and not (backend_dir / "prueba.db").exists()
+    # Sin la variable (el script corrido a mano), relativa a la carpeta actual.
+    monkeypatch.delenv(trades.INVOCATION_DIR_ENV)
+    assert trades.resolve_user_path(Path("otra.db")) == backend_dir.resolve() / "otra.db"
+    assert trades.resolve_user_path(Path("/abs/x.db"), {"ANALYZER_INVOCATION_DIR": "/u"}) == Path(
+        "/abs/x.db"
+    )
+    assert trades.resolve_user_path(Path("x.db"), {"ANALYZER_INVOCATION_DIR": "/u"}) == Path(
+        "/u/x.db"
+    )
+
+
+def test_makefiles_pass_the_invocation_dir_and_personal_files_are_ignored():
+    root = Path(__file__).resolve().parents[2]
+    for makefile in ("backend/Makefile", "frontend/Makefile"):  # reenvían su carpeta
+        text = (root / makefile).read_text(encoding="utf-8")
+        assert "ANALYZER_INVOCATION_DIR ?= $(CURDIR)" in text, makefile
+        assert "export ANALYZER_INVOCATION_DIR" in text, makefile
+    text = (root / "Makefile").read_text(encoding="utf-8")
+    assert "ANALYZER_INVOCATION_DIR ?= $(CURDIR)" in text
+    assert "unexport ANALYZER_INVOCATION_DIR" in text  # los tests no la ven
+    for script in ("analyze_cli $(SYMBOL)", "trades $(ARGS)", "trades list", "trades status"):
+        assert f"$(FROM_DIR) .venv/bin/python -m scripts.{script}" in text, script
+    ignored = (root / ".gitignore").read_text(encoding="utf-8").splitlines()
+    for pattern in ("*.db", "LOCKED", "incidents/"):
+        assert pattern in ignored
+
+
+# --- revisión del Hito 5: resumen de los frenos ---------------------------------------------
+
+
+def test_reaching_the_trades_of_the_day_is_warned(db):
+    """Hallazgo 21: con 3 de 3 operaciones hoy, avisa que no va a haber planes hasta mañana."""
+    for hour in ("10:00", "11:00"):
+        run(db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "5", "--closed", hour)
+    _, out, _ = run(
+        db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "5", "--closed", "12:00"
+    )
+    assert (
+        "Frenos de seguridad: VERDE · Ningún freno activo, pero ojo: ya hiciste 3 de 3 "
+        "operaciones permitidas hoy: no va a haber planes hasta mañana."
+    ) in out
+    _, out, _ = run(db, "status")
+    assert (
+        "Estado: VERDE · Ningún freno activo, pero ojo: ya hiciste 3 de 3 operaciones permitidas "
+        "hoy: no va a haber planes hasta mañana."
+    ) in out
+
+
+def test_trades_warning_is_added_to_other_headlines(db):
+    run(db, "event", "--note", "Fed", "--until", "17:00")
+    for hour in ("10:00", "11:00"):
+        run(db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "5", "--closed", hour)
+    _, out, _ = run(
+        db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "5", "--closed", "12:00"
+    )
+    assert "Frenos de seguridad: ROJO · No se generan planes: hay un evento" in out
+    assert "Ojo: ya hiciste 3 de 3 operaciones permitidas hoy" in out
+
+
+def test_trades_limit_text():
+    assert trades._trades_limit_text(2, 3) is None
+    assert trades._trades_limit_text(5, None) is None
+    assert "ya hiciste 4 de 3 operaciones permitidas hoy" in trades._trades_limit_text(4, 3)
+    assert "tu perfil no permite operaciones" in trades._trades_limit_text(0, 0)
+
+
+# --- revisión del Hito 5: confirmación con --yes (D7) y caída recortada ---------------------
+
+
+def _limits():
+    settings = load_settings(DEFAULT_CONFIG_PATH)
+    profile = get_profile(None, settings)
+    manual = settings.app.manual_input
+    return manual.confirm_pnl_over_risk_multiple * profile.risk_per_trade_usd, manual
+
+
+def test_a_huge_result_needs_yes(db):
+    """Hallazgo 24 / D7: más que N × el riesgo por operación pide --yes y no guarda nada."""
+    cap, _ = _limits()
+    run(db, "balance", "--amount", "10000", "--date", "2026-10-01 09:00")
+    big = f"-{fmt_amount(cap + 1)}"
+    code, out, err = run(db, "add", "--symbol", "BTC", "--side", "long", "--pnl", big)
+    assert code == 1 and repo(db).list_trades() == []
+    assert "es más grande que" in err and "veces tu riesgo por operación" in err
+    assert "Si está bien, cargalo de nuevo agregando --yes. No se guardó nada." in err
+    assert "saldo" not in err  # el saldo (10.000 USD) alcanza
+    code, _, err = run(db, "add", "--symbol", "BTC", "--side", "long", "--pnl", big, "--yes")
+    assert code == 0, err
+    assert len(repo(db).list_trades()) == 1
+    # Justo en el tope no pregunta.
+    code, _, err = run(db, "add", "--symbol", "BTC", "--side", "long", "--pnl", fmt_amount(cap))
+    assert code == 0, err
+
+
+def test_a_result_bigger_than_the_balance_needs_yes(db):
+    cap, _ = _limits()
+    run(db, "balance", "--amount", "40", "--date", "2026-10-01 09:00")
+    pnl = min(45.0, cap)  # más que el saldo (40) pero no que N × el riesgo
+    code, _, err = run(db, "add", "--symbol", "ETH", "--side", "short", "--pnl", f"+{pnl:g}")
+    assert code == 1 and repo(db).list_trades() == []
+    assert "que el saldo de tu billetera (40,00 USD)" in err
+
+
+def test_closing_with_a_huge_result_needs_yes(db):
+    cap, _ = _limits()
+    run(db, "balance", "--amount", "10000", "--date", "2026-10-01 09:00")
+    run(db, "open", "--symbol", "SOL", "--side", "long", "--risk", "40")
+    big = f"-{fmt_amount(cap * 2)}"
+    code, _, err = run(db, "close", "--pnl", big)
+    assert code == 1 and "--yes" in err
+    assert len(repo(db).list_open_positions()) == 1 and repo(db).list_trades() == []
+    code, _, err = run(db, "close", "--pnl", big, "--yes")
+    assert code == 0, err
+    assert repo(db).list_open_positions() == [] and len(repo(db).list_trades()) == 1
+
+
+def test_a_long_event_needs_yes(db):
+    _, manual = _limits()
+    days = manual.confirm_event_longer_than_days
+    until = (NOW + timedelta(days=days, hours=1)).strftime("%Y-%m-%d %H:%M")
+    code, _, err = run(db, "event", "--note", "Fed", "--until", until)
+    assert code == 1 and repo(db).list_volatility_events() == []
+    assert "Ojo: el evento duraría" in err and "¿Está bien la fecha" in err and "--yes" in err
+    code, _, err = run(db, "event", "--note", "Fed", "--until", until, "--yes")
+    assert code == 0, err
+    shorter = (NOW + timedelta(days=days) - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+    code, _, err = run(db, "event", "--note", "BCE", "--until", shorter)
+    assert code == 0, err
+
+
+def test_drawdown_shown_is_clamped_at_100_percent(db):
+    run(db, "balance", "--amount", "300", "--date", "2026-10-01 09:00")
+    code, out, _ = run(
+        db,
+        "add",
+        "--symbol",
+        "BTC",
+        "--side",
+        "long",
+        "--pnl",
+        "-400",
+        "--closed",
+        "2026-10-05 12:00",
+        "--yes",
+    )
+    assert code == 0
+    assert "la billetera del mes cayó 100 % desde su máximo" in out and "133" not in out
+    code, out, _ = run(db, "status")
+    assert "caída 100,0 %" in out and "100 % de 70 %" in out
+    assert "Tu billetera cayó 100 % desde su máximo del mes (300 USD → -100 USD)" in out
+    assert "133" not in out
+
+
+def fmt_amount(value: float) -> str:
+    """``150.0`` → ``"150"``; ``150.5`` → ``"150,5"`` (como lo escribiría el usuario)."""
+    return f"{value:g}".replace(".", ",")
+
+
+# --- integración del Hito 5: stop movido (hallazgo 23) y análisis de prueba (hallazgo 18) ----
+
+
+def load_state(db: Path):
+    from app.safety.state import load_trading_state
+
+    settings = load_settings(DEFAULT_CONFIG_PATH)
+    return load_trading_state(repo(db), settings, get_profile(None, settings), NOW)
+
+
+def test_open_accepts_zero_risk_and_explains_it(db):
+    code, out, err = run(db, "open", "--symbol", "ETH", "--side", "long", "--risk", "0")
+    assert code == 0, err
+    [p] = repo(db).list_open_positions()
+    assert p.risk_usd == 0.0
+    assert "Riesgo 0: el stop está en la entrada o en ganancia (si salta, no perdés)." in out
+    assert 'make trade ARGS="update 1 --risk <lo que perdés ahora>"' in out
+
+
+def test_open_rejects_a_negative_risk(db, capsys):
+    with pytest.raises(SystemExit) as info:
+        main(
+            ["open", "--symbol", "ETH", "--side", "long", "--risk", "-5", "--db", str(db)],
+            clock=lambda: NOW,
+        )
+    assert info.value.code == 2
+    assert "tiene que ser un monto positivo" in capsys.readouterr().err
+
+
+def test_update_moves_the_stop_without_closing_the_position(db):
+    run(db, "open", "--symbol", "BTC", "--side", "long", "--risk", "40", "--opened", "10:00")
+    run(db, "open", "--symbol", "ETH", "--side", "long", "--risk", "40", "--opened", "10:05")
+    before = repo(db).get_open_position(1)
+    code, out, err = run(db, "update", "1", "--risk", "0", "--entry", "61000,5", "--note", "BE")
+    assert code == 0, err
+    after = repo(db).get_open_position(1)
+    assert (after.risk_usd, after.entry_price, after.notes) == (0.0, 61000.5, "BE")
+    assert after.opened_at == before.opened_at  # la apertura y las operaciones del día no cambian
+    assert (
+        "Posición #1 (BTC long) actualizada: riesgo 40,00 USD → 0,00 USD; entrada — → "
+        "61.000,5; nota cambiada." in out
+    )
+    assert "Ya no cuenta para el límite de pérdida del día" in out
+    assert "Frenos de seguridad:" in out
+    state = load_state(db)
+    assert state.open_risk_usd == 40.0 and state.trades_today == 2
+    code, out, _ = run(db, "update", "1", "--note", "")
+    assert code == 0 and "nota borrada" in out and repo(db).get_open_position(1).notes is None
+
+
+def test_update_errors(db):
+    run(db, "open", "--symbol", "BTC", "--side", "long", "--risk", "40")
+    code, _, err = run(db, "update", "7", "--risk", "10")
+    assert code == 1 and "No existe la posición abierta #7." in err
+    code, _, err = run(db, "update", "1")
+    assert code == 2 and "No hay nada para cambiar: poné --risk" in err
+
+
+def test_auto_link_skips_test_analyses(db):
+    real = _analysis(db, "BTC", local(14, 10))
+    synthetic = _analysis(db, "BTC", local(14, 11), inputs={"offline": True})
+    _analysis(db, "BTC", local(14, 12), inputs={"offline": False, "day_overrides": [{"x": 1}]})
+    code, out, err = run(
+        db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-5", "--opened", "13:00"
+    )
+    assert code == 0, err
+    assert repo(db).list_trades()[0].analysis_id == real.id
+    assert f"Ligada al análisis #{real.id} del 14/10 10:00 (régimen Alcista" in out
+    code, out, err = run(
+        db,
+        "add",
+        "--symbol",
+        "BTC",
+        "--side",
+        "long",
+        "--pnl",
+        "-5",
+        "--opened",
+        "13:00",
+        "--analysis",
+        str(synthetic.id),
+    )
+    assert code == 0, err
+    assert repo(db).list_trades()[1].analysis_id == synthetic.id
+    assert f"Ligada al análisis #{synthetic.id} del 14/10 11:00 (datos sintéticos) (régimen" in out
+    assert "Ojo: ese análisis es de prueba (datos sintéticos)" in out
+
+
+def test_auto_link_with_only_test_analyses_links_nothing(db):
+    test = _analysis(db, "BTC", local(14, 11), inputs={"offline": True, "day_overrides": [1]})
+    code, out, err = run(db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-5")
+    assert code == 0, err
+    assert repo(db).list_trades()[0].analysis_id is None
+    assert (
+        f"No había un análisis real de BTC en las 24 h antes de abrir: el #{test.id} es de prueba "
+        "(datos sintéticos y números de prueba) y no se liga solo" in out
+    )

@@ -25,6 +25,7 @@ from app.risk.plan import (
     CORRELATION_CAP,
     CORRELATION_RULE,
     DAILY_LOSS_CAP,
+    DAILY_REMAINING_RULE,
     OVERRIDE_PNL_TODAY,
     OVERRIDE_TRADES_TODAY,
     SAFETY_RULE,
@@ -537,3 +538,411 @@ def test_day_overrides_are_used_and_warned(settings, profile):
         {"field": "trades_today", "value": 3, "loaded": 1},
         {"field": "pnl_today_usd", "value": -30.5, "loaded": -10.0},
     ]
+
+
+# --- riesgo de las posiciones abiertas en el límite del día (decisión D6) -----------------
+#
+# Revisión del Hito 5 (hallazgo 7): "lo que queda del límite del día" también descuenta lo
+# que se pierde si saltan los stops de todas las posiciones abiertas
+# (trade_plan.daily_cap_includes_open_risk), así el día nunca pasa su límite.
+
+
+def without_open_risk_in_day(settings):
+    tp = settings.trade_plan.model_copy(update={"daily_cap_includes_open_risk": False})
+    return settings.model_copy(update={"trade_plan": tp})
+
+
+def test_open_risk_below_the_minimum_means_no_trade_naming_both_parts(settings, profile):
+    # Perdiste 40 y tenés 50 en juego en un SOL short (dirección contraria: la correlación
+    # no lo cuenta). Quedan 10 del día < 15: "No operar". Antes daba LONG con 50 de riesgo
+    # (40 + 50 + 50 = 140 si saltaban todos los stops, contra un límite de 100).
+    state, verdict = state_and_verdict(settings, profile, trades=[trade(local(14, 10), -40.0)])
+    sol = CorrelatedPosition("SOL", "short", 50.0, None, "opposite_side")
+    plan = plan_with(
+        settings,
+        profile,
+        state=state,
+        verdict=verdict,
+        open_risk_usd=50.0,
+        correlation={
+            "long": CorrelationExposure("long"),
+            "short": CorrelationExposure("short", (sol,)),
+        },
+    )
+    assert plan.status == STATUS_NO_TRADE and plan.is_reference
+    assert failing(plan) == [MIN_OPERABLE_RISK]
+    rule = plan.blocking_rules[0]
+    assert rule.message == (
+        "No operar: hoy ya perdiste 40 USD y tenés 50 USD en juego en posiciones abiertas (lo "
+        "que perdés si saltan sus stops): de tu límite de 100 USD del día quedan 10 USD, menos "
+        "que el mínimo operable de 15 USD."
+    )
+    assert rule.suggestion == (
+        "Esperá a mañana, o a que alguna posición abierta se cierre sin pérdida o tenga el stop "
+        "en ganancia (ahí deja de contar)."
+    )
+    assert plan.headline.startswith("No operar: hoy ya perdiste 40 USD y tenés 50 USD en juego")
+    daily = next(a for a in plan.adjustments if a.code == DAILY_LOSS_CAP)
+    assert daily.message == (
+        "Riesgo bajado de 50 a 10 USD: hoy ya perdiste 40 USD y tenés 50 USD en juego en "
+        "posiciones abiertas (lo que perdés si saltan sus stops): quedan 10 USD de tu límite de "
+        "100 USD del día. Así, aunque salten todos los stops, no pasás el límite."
+    )
+    # El JSON trae el riesgo abierto usado.
+    d = plan.to_dict()
+    assert d["risk"]["open_risk_usd"] == 50.0 and d["risk"]["daily_open_risk_usd"] == 50.0
+    assert d["risk"]["daily_remaining_usd"] == pytest.approx(10.0)
+    assert d["day_state"]["open_risk_usd"] == 50.0
+    assert d["day_state"]["daily_open_risk_usd"] == 50.0
+    assert d["day_state"]["daily_cap_includes_open_risk"] is True
+    assert d["day_state"]["daily_remaining_usd"] == pytest.approx(10.0)
+
+
+def test_open_risk_caps_the_plan_so_the_day_never_passes_its_limit(settings, profile):
+    state, verdict = state_and_verdict(settings, profile, trades=[trade(local(14, 10), -30.0)])
+    plan = plan_with(settings, profile, state=state, verdict=verdict, open_risk_usd=40.0)
+    assert plan.status == STATUS_LONG
+    assert plan.adjusted_risk_usd == pytest.approx(30.0) and plan.risk_capped_by_day
+    assert plan.position.risk_usd <= 30.0 + 1e-9
+    # Si saltan todos los stops: 30 cerrados + 40 abiertos + el plan nuevo <= 100.
+    assert 30.0 + 40.0 + plan.position.risk_usd <= profile.max_daily_loss_usd + 1e-9
+    daily = next(a for a in plan.adjustments if a.code == DAILY_LOSS_CAP)
+    assert daily.message.startswith(
+        "Riesgo bajado de 50 a 30 USD: hoy ya perdiste 30 USD y tenés 40 USD en juego en "
+        "posiciones abiertas"
+    )
+    assert plan.to_dict()["day_state"]["loss_if_stopped_usd"] == pytest.approx(
+        70.0 + plan.position.risk_usd
+    )
+    # La entrada alternativa usa el mismo riesgo abierto.
+    assert plan.alternative is not None and plan.alternative.plan is not None
+    assert plan.alternative.plan.daily_open_risk_usd == 40.0
+
+
+def test_open_risk_without_losses_today(settings, profile):
+    state, verdict = state_and_verdict(settings, profile)
+    plan = plan_with(settings, profile, state=state, verdict=verdict, open_risk_usd=80.0)
+    assert plan.status == STATUS_LONG and plan.adjusted_risk_usd == pytest.approx(20.0)
+    daily = next(a for a in plan.adjustments if a.code == DAILY_LOSS_CAP)
+    assert daily.message.startswith(
+        "Riesgo bajado de 50 a 20 USD: hoy no perdiste nada, pero tenés 80 USD en juego en "
+        "posiciones abiertas"
+    )
+
+
+def test_open_risk_that_uses_the_whole_day_blocks_without_touching_the_risk(settings, profile):
+    state, verdict = state_and_verdict(settings, profile, trades=[trade(local(14, 10), -40.0)])
+    plan = plan_with(settings, profile, state=state, verdict=verdict, open_risk_usd=60.0)
+    assert plan.status == STATUS_NO_TRADE and plan.is_reference
+    assert failing(plan) == [DAILY_REMAINING_RULE]
+    assert plan.adjusted_risk_usd == pytest.approx(50.0)  # niveles de referencia
+    assert not plan.risk_capped_by_day
+    assert all(a.code != DAILY_LOSS_CAP for a in plan.adjustments)
+    rule = plan.blocking_rules[0]
+    assert rule.message == (
+        "No operar: hoy ya perdiste 40 USD y tenés 60 USD en juego en posiciones abiertas (lo "
+        "que perdés si saltan sus stops): entre las dos cosas ya usás todo tu límite de 100 USD "
+        "del día y no queda nada para otra operación."
+    )
+    assert rule.suggestion.startswith("Esperá a mañana, o a que alguna posición abierta")
+    assert plan.headline.startswith("No operar: hoy ya perdiste 40 USD y tenés 60 USD en juego")
+    assert plan.daily_remaining_usd == 0.0
+    # Más riesgo abierto que el límite: lo mismo (nunca negativo).
+    over = plan_with(settings, profile, open_risk_usd=150.0)
+    assert failing(over) == [DAILY_REMAINING_RULE] and over.daily_remaining_usd == 0.0
+    assert over.blocking_rules[0].message.startswith("No operar: hoy no perdiste nada, pero")
+
+
+def test_daily_limit_already_reached_does_not_repeat_the_open_risk_rule(settings, profile):
+    state, verdict = state_and_verdict(settings, profile, trades=[trade(local(14, 10), -100.0)])
+    plan = plan_with(settings, profile, state=state, verdict=verdict, open_risk_usd=30.0)
+    assert failing(plan) == [DAILY_LIMITS]
+
+
+def test_open_risk_flag_off_keeps_the_old_daily_cap(settings, profile):
+    s = without_open_risk_in_day(settings)
+    state, verdict = state_and_verdict(s, profile, trades=[trade(local(14, 10), -40.0)])
+    plan = plan_with(s, profile, state=state, verdict=verdict, open_risk_usd=50.0)
+    assert plan.status == STATUS_LONG and plan.adjusted_risk_usd == pytest.approx(50.0)
+    assert plan.daily_remaining_usd == pytest.approx(60.0) and not plan.risk_capped_by_day
+    risk = plan.to_dict()["risk"]
+    assert risk["open_risk_usd"] == 50.0 and risk["daily_open_risk_usd"] == 0.0
+    # Con 80 perdidos, el motivo es el de antes (sin posiciones abiertas).
+    state, verdict = state_and_verdict(s, profile, trades=[trade(local(14, 10), -80.0)])
+    plan = plan_with(s, profile, state=state, verdict=verdict, open_risk_usd=50.0)
+    daily = next(a for a in plan.adjustments if a.code == DAILY_LOSS_CAP)
+    assert daily.message.startswith("Riesgo bajado de 25 a 20 USD: hoy ya perdiste 80 de tus")
+
+
+def test_without_the_daily_cap_open_risk_only_warns(settings, profile):
+    tp = settings.trade_plan.model_copy(update={"cap_risk_to_daily_remaining": False})
+    s = settings.model_copy(update={"trade_plan": tp})
+    state, verdict = state_and_verdict(s, profile, trades=[trade(local(14, 10), -40.0)])
+    plan = plan_with(s, profile, state=state, verdict=verdict, open_risk_usd=60.0)
+    assert plan.status == STATUS_LONG and plan.adjusted_risk_usd == pytest.approx(50.0)
+    warning = next(w for w in plan.warnings if w.startswith("Ojo con el límite del día"))
+    assert warning.startswith(
+        "Ojo con el límite del día: hoy ya perdiste 40 USD y tenés 60 USD en juego en posiciones "
+        "abiertas (lo que perdés si saltan sus stops); si saltan todos los stops, también el de "
+        "esta operación, el día cerraría con "
+    )
+
+
+def test_open_risk_is_validated(settings, profile):
+    with pytest.raises(ValueError, match="posiciones abiertas"):
+        plan_with(settings, profile, open_risk_usd=float("nan"))
+    # Negativo (no debería pasar: cada posición con el stop en ganancia cuenta 0) = 0.
+    plan = plan_with(settings, profile, open_risk_usd=-20.0)
+    assert plan.open_risk_usd == 0.0 and plan.adjusted_risk_usd == pytest.approx(50.0)
+
+
+def test_steps_keep_their_order_and_the_last_one_below_the_minimum_is_the_reason(settings, profile):
+    # Régimen neutral × 0,75 (37,5) → la pérdida de 60 × 0,5 (18,75) → el día con 10 abiertos
+    # deja 30 (no toca) → la correlación (ETH long 65) deja 10 < 15: el motivo es la correlación.
+    from tests.test_plan import fake_regime
+
+    state, verdict = state_and_verdict(settings, profile, trades=[trade(local(14, 10), -60.0)])
+    plan = plan_with(
+        settings,
+        profile,
+        score=50.0,
+        regime=fake_regime("neutral"),
+        state=state,
+        verdict=verdict,
+        open_risk_usd=10.0,
+        correlation=exposure("long", position("ETH", "long", 65)),
+    )
+    sources = list(dict.fromkeys(a.source for a in plan.adjustments if a.source != "position"))
+    assert sources == ["regime", SOURCE_SAFETY, SOURCE_CORRELATION]
+    assert plan.to_dict()["risk"]["after_daily_usd"] == pytest.approx(18.75)  # el día no tocó
+    rule = next(r for r in plan.blocking_rules if r.code == MIN_OPERABLE_RISK)
+    assert rule.message.startswith("No operar: ya tenés una posición en long (compra) en ETH")
+    # Ahora el día (con 30 abiertos) deja 10 después de los frenos y la correlación no toca:
+    # el motivo es el del día.
+    plan = plan_with(
+        settings,
+        profile,
+        state=state,
+        verdict=verdict,
+        open_risk_usd=30.0,
+        correlation=exposure("long", position("ETH", "long", 30)),
+    )
+    sources = [a.source for a in plan.adjustments if a.source != "position"]
+    assert sources == [SOURCE_SAFETY, SOURCE_DAILY_LIMIT]
+    rule = next(r for r in plan.blocking_rules if r.code == MIN_OPERABLE_RISK)
+    assert rule.message.startswith("No operar: hoy ya perdiste 60 USD y tenés 30 USD en juego")
+    risk = plan.to_dict()["risk"]
+    assert risk["after_safety_usd"] == pytest.approx(25.0)
+    assert risk["after_daily_usd"] == pytest.approx(10.0)
+    assert risk["daily_open_risk_usd"] == 30.0
+
+
+# --- correlación desconocida (hallazgo 8) -------------------------------------------------
+
+
+def test_unknown_correlation_is_worded_as_unknown(settings, profile):
+    # Sin matriz (falló la descarga): ETH long se cuenta por las dudas, sin afirmar nada.
+    eth = [_obj({"symbol": "ETH", "side": "long", "risk_usd": 40.0})]
+    exposures = {s: correlated_exposure("BTC", s, eth, None, 0.8) for s in ("long", "short")}
+    plan = plan_with(settings, profile, correlation=exposures)
+    assert plan.status == STATUS_LONG and plan.adjusted_risk_usd == pytest.approx(35.0)
+    adj = next(a for a in plan.adjustments if a.source == SOURCE_CORRELATION)
+    assert adj.message == (
+        "Riesgo bajado de 50 a 35 USD: ya tenés una posición en long (compra) en ETH, con 40 USD "
+        "de riesgo (no hay datos para saber si ETH se mueve junto con BTC; por las dudas se "
+        "cuenta). Si el mercado se da vuelta pueden perder juntas: sumando el plan nuevo, no "
+        "pueden arriesgar más de 75 USD (1,5 × tu riesgo por operación de 50 USD)."
+    )
+    rule = next(r for r in plan.rules if r.code == CORRELATION_RULE)
+    assert rule.ok and rule.message == (
+        "Riesgo sumado con tus posiciones en long (compra) en ETH: 40 + 35 = 75 USD de 75 USD "
+        "permitidos (el plan se achicó para entrar). No hay datos para saber si ETH se mueve "
+        "junto con BTC; por las dudas se cuenta."
+    )
+    assert "junto con BTC, con" not in adj.message  # no lo afirma como un hecho
+    assert plan.to_dict()["correlation"]["unknown_symbols"] == ["ETH"]
+
+    # Debajo del mínimo y sin el tope que achica: los mismos textos sin afirmar.
+    big = [_obj({"symbol": "ETH", "side": "long", "risk_usd": 65.0})]
+    exposures = {s: correlated_exposure("BTC", s, big, None, 0.8) for s in ("long", "short")}
+    floor = plan_with(settings, profile, correlation=exposures)
+    assert floor.blocking_rules[0].message == (
+        "No operar: ya tenés una posición en long (compra) en ETH, con 65 USD de riesgo (no hay "
+        "datos para saber si ETH se mueve junto con BTC; por las dudas se cuenta); con el tope "
+        "de 75 USD para todas juntas, al plan nuevo le quedan 10 USD, menos que el mínimo "
+        "operable de 15 USD."
+    )
+    cfg = settings.correlation.model_copy(update={"cap_new_risk_to_limit": False})
+    s = settings.model_copy(update={"correlation": cfg})
+    exposures = {k: correlated_exposure("BTC", k, eth, None, 0.8) for k in ("long", "short")}
+    blocked = plan_with(s, profile, correlation=exposures)
+    assert blocked.blocking_rules[0].message.endswith(
+        "más que el tope de 75 USD para posiciones en la misma dirección que se mueven juntas "
+        "(o que no se sabe si lo hacen)."
+    )
+
+
+def test_mixed_known_and_unknown_correlation(settings, profile):
+    plan = plan_with(
+        settings,
+        profile,
+        correlation=exposure(
+            "long",
+            position("ETH", "long", 20),
+            position("SOL", "long", 10, "unknown_correlation"),
+        ),
+    )
+    adj = next(a for a in plan.adjustments if a.source == SOURCE_CORRELATION)
+    assert adj.message.startswith(
+        "Riesgo bajado de 50 a 45 USD: ya tenés 2 posiciones en long (compra) en ETH y SOL, con "
+        "30 USD de riesgo entre todas (ETH se mueve junto con BTC; de SOL no hay datos para saber "
+        "si se mueve junto con BTC y por las dudas se cuenta)."
+    )
+    # Sin motivo pero sin correlación (armado a mano): también "sin dato".
+    hand = CorrelatedPosition("ETH", "long", 40.0)
+    plan = plan_with(settings, profile, correlation=exposure("long", hand))
+    adj = next(a for a in plan.adjustments if a.source == SOURCE_CORRELATION)
+    assert "no hay datos para saber si ETH se mueve junto con BTC" in adj.message
+
+
+# --- otra moneda al revés no es cobertura (hallazgo 15) -----------------------------------
+
+
+def test_other_coin_in_the_opposite_direction_is_not_a_hedge_in_the_plan(settings, profile):
+    import numpy as np
+    import pandas as pd
+
+    idx = pd.date_range("2026-09-01", periods=300, freq="h", tz="UTC")
+    base = np.random.default_rng(1).normal(0, 0.01, len(idx))
+    returns = {
+        "BTC": pd.Series(base, index=idx),
+        "ETH": pd.Series(base + np.random.default_rng(2).normal(0, 0.002, len(idx)), index=idx),
+        "DOGE": pd.Series(np.random.default_rng(3).normal(0, 0.01, len(idx)), index=idx),
+    }
+    matrix = correlation_matrix(returns, min_overlap=200, high_threshold=0.8)
+    positions = [
+        _obj({"symbol": "ETH", "side": "short", "risk_usd": 30.0}),
+        _obj({"symbol": "DOGE", "side": "short", "risk_usd": 10.0}),
+    ]
+    exposures = {
+        s: correlated_exposure("BTC", s, positions, matrix, 0.8) for s in ("long", "short")
+    }
+    plan = plan_with(settings, profile, correlation=exposures)
+    assert plan.status == STATUS_LONG and plan.adjusted_risk_usd == pytest.approx(50.0)
+    assert not any("cobertura" in w for w in plan.warnings)
+    assert plan.to_dict()["correlation"]["hedges"] == []
+    skipped = {e.symbol: e.explanation for e in exposures["long"].skipped}
+    assert "se mueve parecido a BTC" in skipped["ETH"]
+    assert "no se mueve junto con BTC" in skipped["DOGE"]
+
+
+# --- el evento guardado va primero (hallazgo 22) ------------------------------------------
+
+
+def test_stored_volatility_event_goes_first_in_the_rules_and_headline(settings, profile):
+    event = {"id": 9, "starts_at": NOW, "until": NOW + timedelta(hours=1), "note": "Fed"}
+    state, verdict = state_and_verdict(settings, profile, vol=[event])
+    # Score sin dirección: antes el titular decía "el score ... no hay una dirección clara".
+    plan = plan_with(settings, profile, score=10.0, state=state, verdict=verdict)
+    assert failing(plan) == [HIGH_VOLATILITY_EVENT, "direction"]
+    assert plan.rules[0].code == HIGH_VOLATILITY_EVENT
+    assert plan.headline.startswith("No operar: marcaste un evento de alta volatilidad: «Fed»")
+    assert plan.headline.endswith("(y 1 motivo más).")
+    # Con otro freno que bloquea, van en el orden de los frenos (el evento después de la racha).
+    trades = [trade(local(14, h), -10.0) for h in (12, 13, 14)]
+    state, verdict = state_and_verdict(settings, profile, trades=trades, vol=[event])
+    plan = plan_with(settings, profile, state=state, verdict=verdict)
+    assert failing(plan)[:2] == ["safety_losing_streak", HIGH_VOLATILITY_EVENT]
+    assert [r.code for r in plan.rules].count(HIGH_VOLATILITY_EVENT) == 1
+
+
+# --- saldo de la billetera (hallazgo 14) -------------------------------------------------
+
+
+def test_empty_wallet_means_no_trade_with_the_levels_as_reference(settings, profile):
+    from app.risk.plan import WALLET_BALANCE_RULE
+
+    plan = plan_with(settings, profile, wallet_balance_usd=0.0)
+    assert plan.status == STATUS_NO_TRADE and plan.is_reference
+    assert failing(plan) == [WALLET_BALANCE_RULE]
+    rule = plan.blocking_rules[0]
+    assert rule.message == (
+        "No operar: tu billetera de futuros tiene 0 USD (según el saldo que anotaste y lo que "
+        "cargaste después): no hay plata para poner de margen."
+    )
+    assert 'make trade ARGS="deposit --amount ..."' in rule.suggestion
+    assert plan.headline.startswith("No operar: tu billetera de futuros tiene 0 USD")
+    # El riesgo no se toca: los niveles quedan como referencia.
+    assert plan.adjusted_risk_usd == pytest.approx(50.0)
+    day = plan.to_dict()["day_state"]
+    assert day["wallet_balance_usd"] == 0.0 and day["wallet_balance_assumed"] is False
+    # La entrada alternativa hereda el bloqueo.
+    alt = plan.alternative
+    assert alt is not None and alt.plan is not None
+    assert WALLET_BALANCE_RULE in [r.code for r in alt.plan.blocking_rules]
+
+
+def test_negative_assumed_wallet_says_it_is_assumed(settings, profile):
+    from app.risk.plan import WALLET_BALANCE_RULE
+
+    plan = plan_with(settings, profile, wallet_balance_usd=-12.5, wallet_balance_assumed=True)
+    rule = next(r for r in plan.rules if r.code == WALLET_BALANCE_RULE)
+    assert not rule.ok
+    assert rule.message.startswith(
+        "No operar: tu billetera de futuros tiene -12,50 USD (según la cuenta de la app (es un "
+        "saldo supuesto: nunca anotaste el saldo real;"
+    )
+
+
+def test_positive_wallet_adds_no_rule(settings, profile):
+    from app.risk.plan import WALLET_BALANCE_RULE
+
+    plan = plan_with(settings, profile, wallet_balance_usd=0.01, available_margin_usd=0.01)
+    assert WALLET_BALANCE_RULE not in [r.code for r in plan.rules]
+    # Con un centavo de margen la posición no llega al riesgo mínimo.
+    assert plan.status == STATUS_NO_TRADE and MIN_OPERABLE_RISK in failing(plan)
+
+
+def test_margin_capped_by_an_assumed_wallet_is_warned(settings, profile):
+    capped = plan_with(
+        settings,
+        profile,
+        available_margin_usd=60.0,
+        wallet_equity_usd=60.0,
+        wallet_balance_usd=60.0,
+        wallet_balance_assumed=True,
+    )
+    assert capped.position.margin_usd <= 60.0
+    assert any(
+        w.startswith("El margen quedó limitado por el saldo supuesto de tu billetera (60 USD)")
+        for w in capped.warnings
+    )
+    noted = plan_with(
+        settings,
+        profile,
+        available_margin_usd=60.0,
+        wallet_equity_usd=60.0,
+        wallet_balance_usd=60.0,
+    )
+    assert not any("saldo supuesto" in w for w in noted.warnings)
+
+
+def test_a_tiny_wallet_says_the_wallet_is_what_limits_the_position(settings, profile):
+    plan = plan_with(settings, profile, available_margin_usd=5.0, wallet_balance_usd=5.0)
+    rule = next(r for r in plan.blocking_rules if r.code == MIN_OPERABLE_RISK)
+    assert "aun con el margen máximo de 5 USD" in rule.message
+    assert rule.suggestion.startswith(
+        "El margen está limitado por el saldo de tu billetera (5 USD): con tan poca plata la "
+        "posición no llega al riesgo mínimo."
+    )
+    assumed = plan_with(
+        settings,
+        profile,
+        available_margin_usd=5.0,
+        wallet_balance_usd=5.0,
+        wallet_balance_assumed=True,
+    )
+    rule = next(r for r in assumed.blocking_rules if r.code == MIN_OPERABLE_RISK)
+    assert rule.suggestion.startswith(
+        "El margen está limitado por el saldo supuesto de tu billetera"
+    )

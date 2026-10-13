@@ -13,6 +13,10 @@ correlación, Hito 5) y el historial de análisis:
 - ``HighVolatilityEvent``: evento de alta volatilidad marcado a mano (Fed, CPI,
   etc.) con su nota y hora de fin; mientras dura, la capa de seguridad bloquea
   todos los planes (esquema 2).
+- ``SafetyLock``: cada vez que la app escribió el archivo LOCKED (bloqueo
+  total por la caída del mes), con los números del disparo. Si el usuario
+  borra el LOCKED, la caída del mes se vuelve a medir desde el saldo de ese
+  momento (esquema 3).
 - ``AnalysisRecord``: cada análisis generado, con el plan, el score, el
   veredicto de seguridad, la lectura del LLM y los datos de entrada en JSON.
 
@@ -108,7 +112,8 @@ class OpenPosition(SQLModel, table=True):
     """Posición abierta, cargada a mano.
 
     ``risk_usd`` es lo que el usuario pierde si toca el stop (obligatorio:
-    con eso se suma el riesgo de monedas correlacionadas).
+    con eso se suma el riesgo de monedas correlacionadas). 0 = stop en la
+    entrada; se puede cambiar después con ``Repository.update_position``.
     """
 
     __tablename__ = "open_positions"
@@ -161,6 +166,30 @@ class HighVolatilityEvent(SQLModel, table=True):
     note: str = Field(sa_type=Text)
 
 
+class SafetyLock(SQLModel, table=True):
+    """Un bloqueo total que escribió la app (esquema 3).
+
+    Se guarda cuando la capa de seguridad escribe el archivo LOCKED. Sirve para
+    saber desde cuándo medir de nuevo la caída del mes después de que el
+    usuario borró el LOCKED a mano (``monthly_drawdown_lock.restart_after_unlock``)
+    y como historial: ``triggered_at`` (cuándo), ``trigger_code`` (qué freno),
+    ``drawdown_pct`` / ``peak_usd`` / ``balance_usd`` (los números del disparo) y
+    dónde quedaron el informe y el LOCKED.
+    """
+
+    __tablename__ = "safety_locks"
+
+    id: int | None = Field(default=None, primary_key=True)
+    triggered_at: datetime = Field(sa_type=UTCDateTime, index=True)
+    trigger_code: str = Field(max_length=40)
+    drawdown_pct: float | None = None
+    peak_usd: float | None = None
+    balance_usd: float | None = None
+    report_path: str | None = Field(default=None, sa_type=Text)
+    lock_path: str | None = Field(default=None, sa_type=Text)
+    created_at: datetime = Field(default_factory=utc_now, sa_type=UTCDateTime)
+
+
 # --- historial de análisis -------------------------------------------------------
 
 
@@ -207,6 +236,7 @@ __all__ = [
     "HighVolatilityEvent",
     "ManualTrade",
     "OpenPosition",
+    "SafetyLock",
     "UTCDateTime",
     "WalletEvent",
     "utc_now",

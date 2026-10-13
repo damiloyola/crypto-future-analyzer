@@ -694,6 +694,22 @@ def test_drawdown_beside_threshold_is_not_rounded_to_it() -> None:
     assert "cayó **70,004 %**" in report(trigger=trig)
 
 
+def test_report_says_when_the_drop_was_measured_since_an_unlocked_lock() -> None:
+    """Después de desbloquear a mano, la caída se mide desde ese bloqueo, no desde el día 1."""
+    trig = {**TRIGGER, "wallet_peak_usd": 80.0, "current_balance_usd": 24.0, "measured_since": T0}
+    text = report(trigger=trig)
+    assert (
+        "- Desde el bloqueo del 05/10/2026 12:00 (que se desbloqueó a mano), la billetera llegó "
+        "a un máximo de **80 USD** y ahora tiene **24 USD**: cayó **70 %**"
+    ) in text
+    assert "La billetera del mes llegó" not in text
+    parsed = IncidentTrigger.from_value({**trig, "measured_since": "2026-10-05T15:00:00+00:00"})
+    assert parsed.measured_since == T0
+    assert parsed.to_dict()["measured_since"] == "2026-10-05T15:00:00+00:00"
+    assert IncidentTrigger.from_value(TRIGGER).to_dict()["measured_since"] is None
+    assert "La billetera del mes llegó a un máximo" in report()
+
+
 # --- escritura ------------------------------------------------------------------
 
 
@@ -779,3 +795,66 @@ def test_no_nan_leaks_into_report() -> None:
     text = report(trades=[trade(pnl_usd=float("nan"), risk_usd=float("nan"))])
     assert not re.search(r"\b(nan|inf)\b", text, flags=re.IGNORECASE)
     assert not math.isnan(summarize_trades([trade(pnl_usd=float("nan"))]).net_pnl_usd)
+
+
+# --- análisis de prueba y caída recortada (integración del Hito 5) ----------------------
+
+
+def test_analysis_test_marks() -> None:
+    from app.safety.incident import analysis_test_marks, fmt_analysis_marks
+
+    assert analysis_test_marks(None) == ()
+    assert analysis_test_marks({"offline": False, "day_overrides": []}) == ()
+    assert analysis_test_marks({"offline": True}) == ("datos sintéticos",)
+    assert analysis_test_marks({"day_overrides": [{"field": "pnl_today_usd"}]}) == (
+        "números de prueba",
+    )
+    both = analysis_test_marks({"offline": True, "day_overrides": [1]})
+    assert fmt_analysis_marks(both) == "(datos sintéticos y números de prueba)"
+    assert fmt_analysis_marks(()) == ""
+
+
+def test_test_analyses_are_marked_and_do_not_feed_the_plan_observations() -> None:
+    """Hallazgo 18: un análisis de prueba no dice nada del mercado real."""
+    fake = trade(
+        closed_at=at(1),
+        pnl_usd=-40.0,
+        side="long",
+        plan_status="NO_OPERAR",
+        regime_category="bajista",
+        regime_name="Bajista",
+        regime_confidence=0.99,
+        analysis_marks=("datos sintéticos",),
+    )
+    numbers = trade(
+        closed_at=at(2),
+        pnl_usd=-40.0,
+        side="short",
+        plan_status="LONG",
+        regime_category="bajista",
+        regime_name="Bajista",
+        analysis_marks=("números de prueba",),
+    )
+    items = sorted_trades([fake, numbers])
+    assert items[0].analysis_marks == ("datos sintéticos",)
+    assert not items[0].traded_on_no_trade and not items[0].against_regime
+    assert not items[1].against_plan
+    found = codes(find_observations(items))
+    assert OBS_TRADED_ON_NO_TRADE not in found and OBS_AGAINST_PLAN not in found
+    assert OBS_AGAINST_REGIME not in found
+    text = report(trades=[fake, numbers])
+    assert "| Bajista (99 %) (datos sintéticos) |" in text
+    assert "| Bajista (80 %) (números de prueba) |" in text
+    assert "**(datos sintéticos)** = el análisis ligado se hizo con datos inventados" in text
+    assert items[0].to_dict()["analysis_marks"] == ["datos sintéticos"]
+    assert "(datos sintéticos)" not in report(trades=[trade()])
+
+
+def test_drawdown_above_100_percent_is_shown_as_100() -> None:
+    trig = {**TRIGGER, "current_balance_usd": -1500.0, "drawdown_pct": 250.0}
+    text = report(trigger=trig)
+    assert "cayó **100 %** desde ese máximo" in text and "250" not in text.split("## Datos")[0]
+    assert (
+        "- Caída desde el máximo: 100 % (la cuenta dio 250 % porque el saldo calculado quedó "
+        "negativo: revisá lo cargado)"
+    ) in text
