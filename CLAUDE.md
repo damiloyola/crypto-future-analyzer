@@ -98,6 +98,10 @@ El frontend solo muestra lo que devuelve la API; no calcula riesgo.
   los depósitos lo suben); con una posición abierta correlacionada en la misma
   dirección, el plan nuevo se **achica** a lo que entra en 1,5 × riesgo
   (`correlation.cap_new_risk_to_limit`), y si queda debajo del mínimo, "No operar".
+- **Evento de alta volatilidad (Hito 5):** se guarda en la base con nota y
+  hora de fin; bloquea todos los planes hasta esa hora y después se apaga solo.
+  Una posición abierta en la misma moneda y dirección contraria es cobertura
+  (no suma riesgo) pero el plan muestra un aviso de que pueden saltar los dos stops.
 - Al usuario hay que explicarle todo en palabras simples (hace mucho que no
   opera futuros) y hacerle las preguntas con opciones (AskUserQuestion).
 
