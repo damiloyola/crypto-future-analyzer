@@ -50,6 +50,7 @@ class AppConfig(_Strict):
     data_dir: str = "data"
     lock_file: str = "data/LOCKED"
     incident_dir: str = "data/incidents"
+    database_file: str = "data/analyzer.db"
 
 
 class SymbolsConfig(_Strict):
@@ -475,6 +476,7 @@ class DailyLossBlock(_Strict):
 class LosingStreak(_Strict):
     consecutive_losses: int = Field(ge=1)
     cooldown_hours: float = Field(gt=0)
+    reset_after_cooldown: bool = True
 
 
 class WeeklyLossReduce(ReduceBreaker):
@@ -494,6 +496,9 @@ class CircuitBreakersConfig(_Strict):
     week_starts_on: Literal[
         "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
     ] = "monday"
+    loss_basis: Literal["net", "gross"] = "net"
+    month_starts: Literal["calendar"] = "calendar"
+    link_analysis_within_hours: float = Field(24, gt=0)
 
 
 class CorrelationConfig(_Strict):
@@ -501,6 +506,8 @@ class CorrelationConfig(_Strict):
     lookback_days: int = 30
     high_threshold: float = Field(0.8, gt=0, le=1)
     max_combined_risk_multiplier: float = Field(1.5, ge=1)
+    cap_new_risk_to_limit: bool = True
+    min_overlap_bars: int = Field(200, ge=10)
 
 
 # --- paneles educativos ------------------------------------------------------

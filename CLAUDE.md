@@ -90,6 +90,14 @@ El frontend solo muestra lo que devuelve la API; no calcula riesgo.
   sin rango típico del día = "No operar"; Euforia long sin funding = × 0,5;
   TP1 más allá del TP2 = sin TP1; la entrada alternativa saltea niveles a menos
   de 1 ATR; el funding estimado se muestra aparte (no entra en el riesgo).
+- **Frenos (Hito 5):** pérdida del día y de la semana = **neto** de lo cerrado
+  en el período (`circuit_breakers.loss_basis: net`, días/semanas en la zona
+  del usuario, semana desde el lunes); la racha de 3 pérdidas arranca de cero
+  después de la pausa de 4 h (`reset_after_cooldown`); el mes de la billetera
+  es el **mes calendario** (el día 1 el máximo vuelve al saldo de ese momento;
+  los depósitos lo suben); con una posición abierta correlacionada en la misma
+  dirección, el plan nuevo se **achica** a lo que entra en 1,5 × riesgo
+  (`correlation.cap_new_risk_to_limit`), y si queda debajo del mínimo, "No operar".
 - Al usuario hay que explicarle todo en palabras simples (hace mucho que no
   opera futuros) y hacerle las preguntas con opciones (AskUserQuestion).
 

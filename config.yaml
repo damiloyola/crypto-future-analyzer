@@ -27,6 +27,7 @@ app:
   data_dir: "data"          # SQLite, modelos HMM, estado manual, informes
   lock_file: "data/LOCKED"  # si existe, la app NO genera planes (ver safety)
   incident_dir: "data/incidents"
+  database_file: "data/analyzer.db"  # operaciones, posiciones, billetera y análisis (SQLite)
 
 symbols:
   # Monedas que se muestran como favoritas en el selector.
@@ -469,18 +470,34 @@ circuit_breakers:
   losing_streak:
     consecutive_losses: 3
     cooldown_hours: 4
+    # Decisión del usuario: terminada la pausa, la cuenta arranca de cero.
+    reset_after_cooldown: true
   weekly_loss_reduce:
     pct_of_monthly_wallet: 60  # pérdida de la semana >= 60 % de la billetera mensual
     risk_multiplier: 0.5       # hasta fin de semana
   monthly_drawdown_lock:
     pct_from_peak: 70          # billetera del mes cae >= 70 % desde su máximo: LOCK
   week_starts_on: "monday"
+  # Decisiones del usuario (Hito 5):
+  # - la pérdida del día y de la semana es el NETO (ganancias y pérdidas
+  #   cerradas en ese período, comisiones incluidas); "gross" = solo pérdidas;
+  loss_basis: "net"
+  # - el mes de la billetera es el mes calendario (el día 1 el máximo vuelve a
+  #   ser el saldo de ese momento; los depósitos lo suben);
+  month_starts: "calendar"
+  # Al cargar una operación se le adjunta el último análisis de esa moneda
+  # hecho dentro de estas horas (régimen, score y plan del momento).
+  link_analysis_within_hours: 24
 
 correlation:
   timeframe: "1h"
   lookback_days: 30
   high_threshold: 0.8           # correlación de retornos >= 0,8 = "muy correlacionadas"
   max_combined_risk_multiplier: 1.5  # riesgo combinado <= 1,5 × riesgo por operación
+  # Decisión del usuario: si el riesgo combinado pasaría el tope, el plan nuevo
+  # se achica a lo que entra; si eso queda debajo del mínimo operable, "No operar".
+  cap_new_risk_to_limit: true
+  min_overlap_bars: 200   # velas en común mínimas para confiar en una correlación
 
 # -----------------------------------------------------------------------------
 # Matemática de la billetera (panel educativo)
