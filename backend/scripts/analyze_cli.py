@@ -34,8 +34,11 @@ Opciones:
   lo cargado). El riesgo se achica a lo que queda del límite de pérdida del
   día (``trade_plan.cap_risk_to_daily_remaining``) y, si eso queda debajo del
   mínimo operable, "No operar"; el JSON trae el día en ``plan.day_state``.
-- ``--db RUTA``: otra base de estado de trading; el archivo LOCKED y los
-  informes del incidente van en su misma carpeta. Tiene que existir (si no,
+- ``--db RUTA``: otra base de estado de trading, con su propio archivo LOCKED
+  y su propia carpeta de informes al lado, con el nombre de la base
+  (``prueba.db`` → ``prueba.LOCKED`` y ``prueba_incidents/``): una base de
+  prueba en ``data/`` nunca comparte el LOCKED de la real. Si la ruta es la de
+  la base real, usa ``data/LOCKED`` y ``data/incidents/``. Tiene que existir (si no,
   sale con 1 sin crearla: una ruta mal escrita mostraría todo en verde); se
   crea la primera vez que cargás algo con ``scripts.trades``. Una ruta
   relativa es relativa a la carpeta desde donde corriste ``make`` (el
@@ -73,15 +76,20 @@ con colores ANSI solo si la salida es una terminal):
    ámbar o rojo) con el motivo, una tabla con cada freno (valor actual contra
    el umbral, barra de progreso y si está activo), el resultado del día y de
    la semana (con "llegaste a perder X" si un freno sigue trabado por la
-   pérdida más grande del período), la billetera del mes (saldo, máximo y
-   caída recortada a 100 %; después de borrar un LOCKED, la caída medida desde
-   ese bloqueo y, en gris, la de todo el mes), las posiciones abiertas, los
-   eventos de alta volatilidad (activos y programados, una sola vez) y los
-   avisos. Si la caída del mes
-   llegó al tope escribe el informe del incidente y el archivo LOCKED (una sola
-   vez). Con el LOCKED, un cartel rojo con el motivo, la fecha, el informe y
-   "revisá el informe y borrá el archivo a mano", y **no se arma el plan**
-   (``"plan": null`` y ``"locked": true`` en el JSON; el resto sale igual);
+   pérdida más grande del período), la billetera del mes (saldo, máximo y la
+   misma caída que mira el freno del mes, ``verdict.drawdown_measure``: con el
+   saldo calculado negativo, "más del 100 %" y el aviso de revisar los datos;
+   después de borrar un LOCKED, o con el LOCKED de un segundo bloqueo del mes,
+   la caída medida desde el bloqueo anterior y, en gris, la de todo el mes),
+   las posiciones abiertas, los eventos de alta volatilidad (activos y
+   programados, una sola vez) y los avisos. Con el máximo de operaciones del
+   día alcanzado el estado es ROJO hasta las 00:00. Si había un LOCKED de este
+   mes sin anotar en la base, lo anota y lo dice. Si la caída del mes llegó al
+   tope escribe el informe del incidente y el archivo LOCKED (una sola vez; si
+   no se puede escribir el LOCKED, sale con 1 y lo explica). Con el LOCKED, un
+   cartel rojo con el motivo, la fecha, el informe y "revisá el informe y
+   borrá el archivo a mano", y **no se arma el plan** (``"plan": null`` y
+   ``"locked": true`` en el JSON; el resto sale igual);
 2. precios: referencia (Binance, o Bybit si Binance falló; "no disponible"
    si no hubo ticker), Nexo (manual o "no disponible: se usa ..." con la fuente
    real del precio usado), diferencia y cambio 24 h;
@@ -122,15 +130,18 @@ con colores ANSI solo si la salida es una terminal):
    saltearon por estar pegados al precio, sus propios ajustes, liquidación,
    comisiones y stop por tiempo). Usa el régimen de 1h si está
    disponible. Con posiciones abiertas, una línea dice cuánto queda del límite
-   de pérdida del día descontando lo que perderías si saltan sus stops. El
-   saldo de la billetera (anotado o supuesto, el mismo de los frenos) es el
-   tope del margen; con 0 o menos, "No operar". Si no se opera pero los
+   de pérdida del día descontando lo que perderías si saltan sus stops (no se
+   muestra si una regla ya dice que llegaste al límite). El saldo de la
+   billetera (anotado o supuesto, el mismo de los frenos) es el tope del
+   margen; con 0 o menos, "No operar" y las filas de referencia dicen "sin
+   saldo" (sin margen, apalancamiento ni liquidación). Si no se opera pero los
    niveles se pudieron calcular, se muestran como "referencia, no operar".
 
 Sale con código 1 y un mensaje claro si no se pueden conseguir los datos
 esenciales (por ejemplo, Binance y Bybit caídos, o un símbolo que no existe) o
 si no se puede leer el estado de trading (sin eso no se sabe si un freno está
-activo, así que no se arma ningún plan; también si la base de ``--db`` no existe),
+activo, así que no se arma ningún plan; también si la base de ``--db`` no existe
+o si no se puede escribir el archivo LOCKED),
 con 2 si los argumentos o la configuración no son válidos (incluido un YAML mal
 escrito) y con 130 si se cancela con Ctrl+C (sale enseguida, también durante el
 entrenamiento del régimen, que no se guarda). Siempre cierra el cliente HTTP.
@@ -195,10 +206,11 @@ from app.risk.rules import fmt_leverage
 from app.risk.rules import price_decimals as _plan_price_decimals
 from app.risk.sizing import fraction_to_pct
 from app.safety.breakers import (
+    LockBackfillResult,
     LockTriggerResult,
+    LockWriteError,
     SafetyVerdict,
-    evaluate_breakers,
-    trigger_lock_if_needed,
+    run_safety_checks,
     upcoming_event_warning,
 )
 from app.safety.correlation import (
@@ -211,10 +223,10 @@ from app.safety.correlation import (
 from app.safety.incident import (
     analysis_test_marks,
     fmt_analysis_marks,
-    shown_drawdown_pct,
+    fmt_drawdown_pct,
     timezone_label,
 )
-from app.safety.state import TradingState, load_trading_state
+from app.safety.state import TradingState
 from app.scoring import compute_score, inputs_from_analysis
 from app.storage import Repository
 
@@ -523,8 +535,12 @@ class StatePaths:
     - ``kind="offline"``: una base de prueba en ``regime.synthetic_models_dir``,
       con su propio LOCKED y su carpeta de informes al lado: las corridas con
       datos sintéticos nunca tocan el estado real.
-    - ``kind="custom"``: la base de ``--db``, con el LOCKED y los informes en
-      la misma carpeta que esa base.
+    - ``kind="custom"``: la base de ``--db``, con su propio LOCKED y su propia
+      carpeta de informes en la misma carpeta que esa base, con el nombre de la
+      base: ``prueba.db`` → ``prueba.LOCKED`` y ``prueba_incidents/``
+      (``custom_state_names``). Así una base de prueba en ``data/`` nunca
+      comparte el LOCKED de la real. Una ``--db`` que es la base real (o la de
+      prueba de ``--offline``) usa las rutas de esa.
     """
 
     database: Path
@@ -545,26 +561,42 @@ class StatePaths:
         }
 
 
+def custom_state_names(db: Path, settings: AppSettings) -> tuple[Path, Path]:
+    """El LOCKED y la carpeta de informes de una base de ``--db``, con el nombre de la base.
+
+    ``data/prueba.db`` → ``data/prueba.LOCKED`` y ``data/prueba_incidents/``
+    (los sufijos salen de los nombres de ``app.lock_file`` y
+    ``app.incident_dir``).
+    """
+    lock_name = Path(settings.app.lock_file).name
+    incidents_name = Path(settings.app.incident_dir).name
+    return db.parent / f"{db.stem}.{lock_name}", db.parent / f"{db.stem}_{incidents_name}"
+
+
 def resolve_state_paths(
     settings: AppSettings, *, offline: bool = False, db: Path | str | None = None
 ) -> StatePaths:
     """Las rutas del estado de trading (ver ``StatePaths``)."""
     lock_name = Path(settings.app.lock_file).name
     incidents_name = Path(settings.app.incident_dir).name
-    if db is not None:
-        path = Path(db).expanduser().resolve()
-        return StatePaths(path, path.parent / lock_name, path.parent / incidents_name, STATE_CUSTOM)
-    if offline:
-        folder = settings.resolve_path(settings.regime.synthetic_models_dir)
-        return StatePaths(
-            folder / OFFLINE_DB_NAME, folder / lock_name, folder / incidents_name, STATE_OFFLINE
-        )
-    return StatePaths(
+    folder = settings.resolve_path(settings.regime.synthetic_models_dir)
+    offline_paths = StatePaths(
+        folder / OFFLINE_DB_NAME, folder / lock_name, folder / incidents_name, STATE_OFFLINE
+    )
+    real_paths = StatePaths(
         settings.resolve_path(settings.app.database_file),
         settings.resolve_path(settings.app.lock_file),
         settings.resolve_path(settings.app.incident_dir),
         STATE_REAL,
     )
+    if db is not None:
+        path = Path(db).expanduser().resolve()
+        for known in (real_paths, offline_paths):
+            if path == known.database.resolve():
+                return known
+        lock_file, incident_dir = custom_state_names(path, settings)
+        return StatePaths(path, lock_file, incident_dir, STATE_CUSTOM)
+    return offline_paths if offline else real_paths
 
 
 #: Variable de entorno con la carpeta desde donde se corrió ``make``: el Makefile
@@ -610,12 +642,17 @@ def display_path(path: Path | str) -> str:
 
 @dataclass(frozen=True)
 class SafetyContext:
-    """Estado de trading, veredicto de los frenos y, si hubo, qué hizo el bloqueo total."""
+    """Estado de trading, veredicto de los frenos y, si hubo, qué hizo el bloqueo total.
+
+    ``backfill``: si había un LOCKED de este mes sin anotar en la base, qué
+    pasó al anotarlo (``safety.breakers.backfill_unrecorded_lock``).
+    """
 
     paths: StatePaths
     state: TradingState
     verdict: SafetyVerdict
     lock_result: LockTriggerResult | None = None
+    backfill: LockBackfillResult | None = None
 
 
 def evaluate_safety(
@@ -629,25 +666,49 @@ def evaluate_safety(
 ) -> SafetyContext:
     """Lee el estado, evalúa los frenos y, si la caída del mes lo pide, bloquea la app.
 
-    Con ``trigger_lock`` escribe el informe del incidente y el archivo LOCKED
-    (una sola vez, ``safety.breakers.trigger_lock_if_needed``) y vuelve a
-    evaluar para que el veredicto ya lo muestre.
+    Es ``safety.breakers.run_safety_checks`` con las rutas de ``paths``:
+    primero anota en la base un LOCKED de este mes que no quedó anotado
+    (``monthly_drawdown_lock.backfill_unrecorded_lock``) y, con
+    ``trigger_lock``, escribe el informe del incidente y el archivo LOCKED (una
+    sola vez) y vuelve a evaluar para que el veredicto ya lo muestre. Si no se
+    puede escribir el LOCKED lanza ``LockWriteError`` (un ``OSError`` con el
+    mensaje listo para mostrar: ``lock_write_error_text``).
     """
-    state = load_trading_state(repo, settings, profile, now)
-    verdict = evaluate_breakers(state, profile, settings, now, lock_path=paths.lock_file)
-    lock_result: LockTriggerResult | None = None
-    if trigger_lock and verdict.needs_lock:
-        lock_result = trigger_lock_if_needed(
-            verdict,
-            state,
-            settings,
-            now,
-            repo=repo,
-            lock_path=paths.lock_file,
-            incident_dir=paths.incident_dir,
-        )
-        verdict = evaluate_breakers(state, profile, settings, now, lock_path=paths.lock_file)
-    return SafetyContext(paths=paths, state=state, verdict=verdict, lock_result=lock_result)
+    run = run_safety_checks(
+        repo,
+        settings,
+        profile,
+        now,
+        lock_path=paths.lock_file,
+        incident_dir=paths.incident_dir,
+        trigger_lock=trigger_lock,
+    )
+    return SafetyContext(
+        paths=paths,
+        state=run.state,
+        verdict=run.verdict,
+        lock_result=run.lock_result,
+        backfill=run.backfill,
+    )
+
+
+def lock_write_error_text(exc: LockWriteError) -> str:
+    """Qué decir cuando no se pudo escribir el archivo LOCKED (las dos consolas).
+
+    No es un problema de la base: es el archivo LOCKED (permisos, disco lleno).
+    Sin él no se arma ningún plan. El próximo intento reusa el informe del
+    incidente que ya quedó escrito (no se acumulan informes).
+    """
+    report = (
+        f" El informe del incidente sí quedó guardado: {display_path(exc.report_path)}."
+        if exc.report_path
+        else ""
+    )
+    return (
+        f"No se pudo escribir el archivo LOCKED ({display_path(exc.path)}): {exc.reason}. La "
+        "app no arma planes hasta que se pueda escribir: revisá los permisos de esa carpeta y "
+        f"el espacio en disco, y volvé a correr la app.{report}"
+    )
 
 
 def safety_to_dict(ctx: SafetyContext, overrides: Sequence[DayOverride] = ()) -> dict[str, Any]:
@@ -665,6 +726,7 @@ def safety_to_dict(ctx: SafetyContext, overrides: Sequence[DayOverride] = ()) ->
             "verdict": v.to_dict(),
             "state": ctx.state.to_dict(),
             "lock_trigger": None if ctx.lock_result is None else ctx.lock_result.to_dict(tz=tz),
+            "lock_backfill": None if ctx.backfill is None else ctx.backfill.to_dict(),
             "paths": {
                 **ctx.paths.to_dict(),
                 "database_display": display_path(ctx.paths.database),
@@ -724,10 +786,23 @@ def exposures_for(
     matrix: CorrelationMatrix | None,
     settings: AppSettings,
 ) -> dict[str, Exposure]:
-    """Exposición a las posiciones abiertas para un plan long y para uno short."""
+    """Exposición a las posiciones abiertas para un plan long y para uno short.
+
+    Una cobertura (misma moneda, dirección contraria) no suma al tope de
+    posiciones correlacionadas; su texto dice si cuenta en el límite del día
+    (``trade_plan.daily_cap_includes_open_risk``), igual que el aviso del plan.
+    """
     threshold = settings.correlation.high_threshold
     return {
-        side: correlated_exposure(symbol, side, positions, matrix, threshold)
+        side: correlated_exposure(
+            symbol,
+            side,
+            positions,
+            matrix,
+            threshold,
+            limit_multiple=settings.correlation.max_combined_risk_multiplier,
+            hedge_counts_in_day=settings.trade_plan.daily_cap_includes_open_risk,
+        )
         for side in ("long", "short")
     }
 
@@ -1740,14 +1815,55 @@ def _plan_level_rows(p: dict[str, Any], symbol: str) -> list[list[Cell | str]]:
     return rows
 
 
+def _empty_wallet(p: dict[str, Any]) -> float | None:
+    """El saldo de la billetera si es 0 o negativo (``None`` si hay plata o no se sabe).
+
+    Con la billetera vacía el plan da "No operar" y los niveles quedan como
+    referencia, pero no hay margen: el plan calculó la posición con el margen
+    del perfil, y mostrarlo inventaría una billetera que no existe.
+    """
+    balance = _finite((p.get("day_state") or {}).get("wallet_balance_usd"))
+    if balance is None or round(balance, 2) > 0:
+        return None
+    return balance
+
+
+def _plan_adjustments(p: dict[str, Any], adjustments: Sequence[dict[str, Any]]) -> list[Any]:
+    """Los ajustes a mostrar: con la billetera vacía, sin los del margen de la posición."""
+    if _empty_wallet(p) is None:
+        return list(adjustments)
+    return [a for a in adjustments if a.get("source") != "position"]
+
+
 def _plan_position_rows(
     p: dict[str, Any], symbol: str, tz: ZoneInfo
 ) -> list[tuple[str, Cell | str]]:
-    pos, liq, risk, fees = p["position"], p["liquidation"], p["risk"], p["fees"]
+    pos, liq = p["position"], p["liquidation"]
     d = price_decimals(p["entry"]["price"])
     rows: list[tuple[str, Cell | str]] = []
-    rows.append(("Margen", fmt_usd(pos["margin_usd"])))
+    empty = _empty_wallet(p)
     qty = fmt_num(pos["quantity"], max(4, d))
+    if empty is not None:
+        # Sin saldo no hay margen: ni apalancamiento ni liquidación (ver ``_empty_wallet``).
+        rows.append(
+            (
+                "Margen",
+                Cell(
+                    f"sin saldo: tu billetera tiene {fmt_usd(empty)}, no hay plata para poner de "
+                    "margen",
+                    "yellow",
+                ),
+            )
+        )
+        rows.append(("Tamaño de la posición", f"{fmt_usd(pos['size_usd'])} ({qty} {symbol})"))
+        rows.append(("Apalancamiento resultante", f"{DASH} (sin margen no hay apalancamiento)"))
+        rows.append(("Liquidación (aislada)", f"{DASH} (sin margen no se puede calcular)"))
+        if liq.get("wallet"):
+            rows.append(
+                ("Liquidación modelo Nexo", f"sin saldo (tu billetera tiene {fmt_usd(empty)})")
+            )
+        return rows + _plan_cost_rows(p, tz)
+    rows.append(("Margen", fmt_usd(pos["margin_usd"])))
     rows.append(("Tamaño de la posición", f"{fmt_usd(pos['size_usd'])} ({qty} {symbol})"))
     lev_text = (
         f"{fmt_num(pos['leverage'], 1)}x (tamaño / margen; tu tope es "
@@ -1794,6 +1910,13 @@ def _plan_position_rows(
                 + (" (saldo supuesto: nunca lo anotaste)" if assumed else ""),
             )
         )
+    return rows + _plan_cost_rows(p, tz)
+
+
+def _plan_cost_rows(p: dict[str, Any], tz: ZoneInfo) -> list[tuple[str, Cell | str]]:
+    """Pérdida máxima, riesgo pedido, comisiones, funding y stop por tiempo del plan."""
+    risk, fees = p["risk"], p["fees"]
+    rows: list[tuple[str, Cell | str]] = []
     if risk["fees_included"]:
         breakdown = "comisiones incluidas"
     else:
@@ -1841,7 +1964,7 @@ def _plan_position_rows(
                 "posiciones correlacionadas)"
             )
         rows.append(("Riesgo pedido", text))
-    if risk.get("reduced_by_position"):
+    if risk.get("reduced_by_position") and _empty_wallet(p) is None:
         rows.append(("", Cell("La posición se achicó: arriesgás menos que lo pedido.", "yellow")))
     fee_text = (
         f"{fmt_usd(fees['round_trip_at_stop_usd'])} ida y vuelta si sale en el stop "
@@ -1880,7 +2003,14 @@ def _plan_position_rows(
     return rows
 
 
-def _render_alternative(alt: dict[str, Any], entry: Any, style: Style) -> list[str]:
+def _render_alternative(
+    alt: dict[str, Any], entry: Any, style: Style, *, empty_wallet: float | None = None
+) -> list[str]:
+    """Resumen de la entrada alternativa (orden límite).
+
+    ``empty_wallet``: el saldo si es 0 o negativo (``_empty_wallet``): sin
+    margen, ni apalancamiento, ni liquidación, ni los ajustes del margen.
+    """
     d = price_decimals(entry)
     lines = ["", style.paint("  Entrada alternativa (orden límite)", "bold")]
     if not alt.get("available"):
@@ -1910,13 +2040,17 @@ def _render_alternative(alt: dict[str, Any], entry: Any, style: Style) -> list[s
     if targets:
         rows.append(("Objetivos", " · ".join(targets)))
     if alt.get("size_usd") is not None:
-        rows.append(
-            (
-                "Posición",
-                f"{fmt_usd(alt['size_usd'])} con {fmt_usd(alt['margin_usd'])} de margen "
-                f"({fmt_num(alt['leverage'], 1)}x)",
+        if empty_wallet is not None:
+            position_txt = (
+                f"{fmt_usd(alt['size_usd'])} (sin saldo: tu billetera tiene "
+                f"{fmt_usd(empty_wallet)}, no hay plata para poner de margen)"
             )
-        )
+        else:
+            position_txt = (
+                f"{fmt_usd(alt['size_usd'])} con {fmt_usd(alt['margin_usd'])} de margen "
+                f"({fmt_num(alt['leverage'], 1)}x)"
+            )
+        rows.append(("Posición", position_txt))
         rows.append(("Pérdida máxima", fmt_usd(alt["max_loss_usd"])))
     if alt.get("net_gain_tp2_usd") is not None:
         rows.append(
@@ -1926,7 +2060,7 @@ def _render_alternative(alt: dict[str, Any], entry: Any, style: Style) -> list[s
                 f"{fmt_num(alt['net_rr_tp2'], 2)})",
             )
         )
-    liq = alt.get("liquidation")
+    liq = None if empty_wallet is not None else alt.get("liquidation")
     if liq:
         if liq.get("price") is None:
             liq_text = "no se puede liquidar con este margen (1x)"
@@ -1954,7 +2088,11 @@ def _render_alternative(alt: dict[str, Any], entry: Any, style: Style) -> list[s
         )
     lines += _kv(rows, style, indent=4)
     # Los del régimen son los mismos que los del plan principal: acá solo los propios.
-    adjustments = [a for a in alt.get("adjustments") or [] if a.get("source") == "position"]
+    adjustments = [
+        a
+        for a in alt.get("adjustments") or []
+        if a.get("source") == "position" and empty_wallet is None
+    ]
     if adjustments:
         lines.append(style.paint("    Ajustes de esta entrada:", "bold"))
         for a in adjustments:
@@ -1964,24 +2102,56 @@ def _render_alternative(alt: dict[str, Any], entry: Any, style: Style) -> list[s
     return lines
 
 
-def day_room_text(day: dict[str, Any]) -> str | None:
+def day_room_text(day: dict[str, Any], latched_loss: Any = None) -> str | None:
     """Lo que queda del límite de pérdida del día contando las posiciones abiertas.
 
     ``"Límite del día: hoy perdiste 40 USD y tenés 50 USD en juego en posiciones
     abiertas (lo que perdés si saltan sus stops): te quedan 10 USD de 100 USD."``
     ``None`` si las posiciones abiertas no cuentan para el día (no hay, tienen
     el stop en ganancia o ``daily_cap_includes_open_risk`` está apagado).
+
+    ``latched_loss`` (D1): la pérdida más grande a la que se llegó hoy, si es
+    mayor que la actual (hubo ganancias después). Los frenos del día la siguen
+    mirando, pero el límite salta recién si la pérdida de ahora llega al tope:
+    lo que queda se cuenta desde la pérdida de ahora, y el texto lo aclara.
     """
     open_risk = _finite(day.get("daily_open_risk_usd")) or 0.0
     if open_risk <= 0:
         return None
     loss = _finite(day.get("loss_today_usd")) or 0.0
     lost = f"hoy perdiste {fmt_usd(loss)}" if round(loss, 2) > 0 else "hoy no perdiste nada"
+    peak = _finite(latched_loss)
+    if peak is not None and round(peak, 2) > round(loss, 2):
+        lost = (
+            f"{lost} (antes llegaste a perder {fmt_usd(peak)}: eso mantiene trabados los frenos "
+            "del día que ya saltaron, pero lo que queda del límite se cuenta desde lo que perdés "
+            "ahora)"
+        )
     return (
         f"Límite del día: {lost} y tenés {fmt_usd(open_risk)} en juego en posiciones abiertas "
         "(lo que perdés si saltan sus stops): te quedan "
         f"{fmt_usd(day.get('daily_remaining_usd'))} de {fmt_usd(day.get('max_daily_loss_usd'))}."
     )
+
+
+#: Reglas del plan que, si fallan, ya dicen todo sobre el límite del día: con
+#: ellas no se muestra además "te quedan X USD" (se contradiría con "llegaste a
+#: tu límite").
+_DAY_LIMIT_RULES = frozenset({"daily_remaining", "daily_limits", "safety_daily_loss_block"})
+
+
+def _plan_latched_day_loss(r: dict[str, Any]) -> float | None:
+    """La pérdida más grande de hoy si los frenos del día la miran en vez de la actual (D1).
+
+    ``None`` si no hay estado cargado, si el día del plan se puso a mano
+    (``--pnl-today``) o si no hubo ganancias después de la peor pérdida.
+    """
+    safety = r.get("safety") or {}
+    if not safety or safety.get("day_state_source") == "manual":
+        return None
+    breakers = (safety.get("verdict") or {}).get("breakers") or []
+    block = next((b for b in breakers if b.get("code") == "daily_loss_block"), None)
+    return _latched_loss(block, (safety.get("state") or {}).get("day_loss_usd"))
 
 
 def _render_plan(r: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
@@ -2055,10 +2225,11 @@ def _render_plan(r: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
         lines.append("")
         lines.append(style.paint(f"  Sin stop: {printable(p['stop_missing_reason'])}", "yellow"))
 
-    if p["adjustments"]:
+    adjustments = _plan_adjustments(p, p["adjustments"])
+    if adjustments:
         lines.append("")
         lines.append(style.paint("  Ajustes", "bold"))
-        for a in p["adjustments"]:
+        for a in adjustments:
             lines.append(f"    · {printable(a['message'])}")
 
     failed = [rule for rule in p["rules"] if not rule["ok"]]
@@ -2078,12 +2249,14 @@ def _render_plan(r: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
         daily = next((x for x in p["rules"] if x["code"] == "daily_limits"), None)
         if daily is not None and daily["ok"]:
             lines.append(f"    {printable(daily['message'])}")
-    # Si una regla ya falló por lo que queda del día, su mensaje dice lo mismo.
+    # Si una regla ya falló por el límite del día (lo que queda, el límite
+    # alcanzado o el freno del día), su mensaje ya lo dice: "te quedan X USD" se
+    # contradiría con "llegaste a tu límite" (D1).
     failed_codes = {rule["code"] for rule in failed}
-    said = "daily_remaining" in failed_codes or (
+    said = bool(failed_codes & _DAY_LIMIT_RULES) or (
         "min_operable_risk" in failed_codes and day.get("risk_capped_by_day")
     )
-    room = None if said else day_room_text(day)
+    room = None if said else day_room_text(day, _plan_latched_day_loss(r))
     if room:
         lines.append(f"    {room}")
 
@@ -2098,7 +2271,9 @@ def _render_plan(r: dict[str, Any], style: Style, tz: ZoneInfo) -> list[str]:
             lines.append(style.paint(f"    · {printable(w)}", color))
 
     if p.get("alternative"):
-        lines += _render_alternative(p["alternative"], p["entry"]["price"], style)
+        lines += _render_alternative(
+            p["alternative"], p["entry"]["price"], style, empty_wallet=_empty_wallet(p)
+        )
     return lines
 
 
@@ -2188,10 +2363,77 @@ def _latched_loss(breaker: dict[str, Any] | None, current_loss: Any) -> float | 
     return largest
 
 
-def _drawdown_text(pct: Any) -> str:
-    """Caída de la billetera para mostrar, recortada a 100 % (``incident.shown_drawdown_pct``)."""
-    v = _finite(pct)
-    return fmt_pct(None if v is None else shown_drawdown_pct(v), 1)
+def _drawdown_text(pct: Any, threshold: Any = None) -> str:
+    """Caída de la billetera para mostrar: ``"71,67 %"`` o ``"más del 100 %"``.
+
+    La misma forma que los textos de los frenos, el LOCKED y el informe
+    (``incident.fmt_drawdown_pct``): más de 100 % solo pasa con el saldo
+    calculado negativo, y eso casi siempre es un dato mal cargado.
+    """
+    return fmt_drawdown_pct(pct, threshold)
+
+
+def _wallet_rows(
+    wallet: dict[str, Any], measure: dict[str, Any], tz: ZoneInfo, *, warn_negative: bool
+) -> list[tuple[str, Cell | str]]:
+    """Las filas "Billetera del mes" con la misma caída que mira el freno del mes.
+
+    - ``measure`` es ``verdict.drawdown_measure`` (la caída que miró el freno:
+      la del mes calendario o la medida desde un bloqueo que ya
+      desbloqueaste). Con el LOCKED de un segundo bloqueo del mes, es la de ese
+      bloqueo: el cartel, el motivo, la fila del freno y esta fila dicen lo
+      mismo; la del mes entero va aparte, en gris.
+    - Con el saldo calculado negativo: "más del 100 %" y, si ``warn_negative``
+      (el mensaje del freno no lo dijo ya), el aviso de revisar los datos.
+    """
+    assumed = " (supuesto)" if wallet.get("assumed") else ""
+    balance_txt = f"saldo {fmt_usd(wallet.get('current_balance_usd'))}{assumed}"
+    if not measure:
+        month_txt = (
+            f"máximo del mes {fmt_usd(wallet.get('month_peak_usd'))} · caída "
+            f"{_drawdown_text(wallet.get('drawdown_pct'))}"
+        )
+        return [("Billetera del mes", f"{balance_txt} · {month_txt}")]
+    month = measure.get("month") or {}
+    month_txt = (
+        f"máximo del mes {fmt_usd(month.get('peak_usd'))} · caída "
+        f"{month.get('drawdown_text') or _drawdown_text(month.get('drawdown_pct'))}"
+    )
+    dd_txt = measure.get("drawdown_text") or _drawdown_text(measure.get("drawdown_pct"))
+    rows: list[tuple[str, Cell | str]] = []
+    if measure.get("since_unlock"):
+        since = measure.get("measured_since_text") or fmt_time(measure.get("measured_since"), tz)
+        if measure.get("while_locked"):
+            # Segundo bloqueo del mes: la caída que lo disparó (D5).
+            how = (
+                f"la caída que bloqueó la app se midió desde el bloqueo del {since} (que "
+                "desbloqueaste)"
+            )
+        else:
+            # Después de borrar el LOCKED la caída se mide desde el bloqueo (D5).
+            how = f"la caída se mide de nuevo desde el bloqueo del {since} (que ya desbloqueaste)"
+        rows.append(
+            (
+                "Billetera del mes",
+                f"{balance_txt} · {how}: máximo {fmt_usd(measure.get('peak_usd'))} · caída "
+                f"{dd_txt}",
+            )
+        )
+        rows.append(
+            ("", Cell(f"En todo el mes: {month_txt} (ya no cuenta para el bloqueo).", "dim"))
+        )
+    else:
+        rows.append(
+            (
+                "Billetera del mes",
+                f"{balance_txt} · máximo del mes {fmt_usd(measure.get('peak_usd'))} · caída "
+                f"{dd_txt}",
+            )
+        )
+    negative = measure.get("negative_balance_warning")
+    if warn_negative and negative:
+        rows.append(("", Cell(printable(negative), "yellow")))
+    return rows
 
 
 def _period_line(period: dict[str, Any]) -> str:
@@ -2216,6 +2458,24 @@ def _position_text(p: dict[str, Any], tz: ZoneInfo) -> str:
         f"#{p.get('id')} {printable(p.get('symbol'))} {p.get('side')}: riesgo "
         f"{fmt_usd(p.get('risk_usd'))}{entry} (abierta {fmt_time(p.get('opened_at'), tz)})"
     )
+
+
+def _backfill_lines(backfill: dict[str, Any] | None, style: Style) -> list[str]:
+    """Qué pasó con un LOCKED de este mes que no estaba anotado en la base (E2).
+
+    Si se anotó ahora, lo dice. Si la base falló, muestra el error (el aviso
+    de qué pasa si se borra el LOCKED así ya va en "Avisos").
+    """
+    b = backfill or {}
+    if b.get("action") == "recorded" and b.get("message"):
+        return [style.paint(f"  {printable(b['message'])}", "yellow")]
+    if b.get("action") == "failed" and b.get("db_error"):
+        return [
+            style.paint(
+                f"  No se pudo anotar el bloqueo en la base: {printable(b['db_error'])}.", "yellow"
+            )
+        ]
+    return []
 
 
 def render_safety_section(
@@ -2243,6 +2503,7 @@ def render_safety_section(
             lines.append(style.paint(f"  {printable(trigger['report_error'])}", "yellow"))
     if trigger.get("db_error"):
         lines.append(style.paint(f"  {printable(trigger['db_error'])}", "yellow"))
+    lines += _backfill_lines(safety.get("lock_backfill"), style)
     status = verdict.get("status") or "verde"
     lines.append(
         "  "
@@ -2305,29 +2566,14 @@ def render_safety_section(
         )
     rows2.append(("Semana", Cell(week_txt, _signed_color(week.get("net_pnl_usd")))))
     if wallet:
-        assumed = " (supuesto)" if wallet.get("assumed") else ""
-        month_txt = (
-            f"máximo del mes {fmt_usd(wallet.get('month_peak_usd'))} · caída "
-            f"{_drawdown_text(wallet.get('drawdown_pct'))}"
+        # El aviso del saldo negativo ya va en el mensaje del freno del mes si está activo.
+        monthly_shown = any(b.get("code") == "monthly_drawdown_lock" for b in active)
+        rows2 += _wallet_rows(
+            wallet,
+            verdict.get("drawdown_measure") or {},
+            tz,
+            warn_negative=not monthly_shown,
         )
-        restart = None if verdict.get("locked") else wallet.get("restart")
-        balance_txt = f"saldo {fmt_usd(wallet.get('current_balance_usd'))}"
-        if restart:
-            # Después de borrar el LOCKED la caída se mide desde el bloqueo (D5).
-            rows2.append(
-                (
-                    "Billetera del mes",
-                    f"{balance_txt}{assumed} · la caída se mide de nuevo desde el bloqueo del "
-                    f"{fmt_time(restart.get('locked_at'), tz)} (que ya desbloqueaste): máximo "
-                    f"{fmt_usd(restart.get('peak_usd'))} · caída "
-                    f"{_drawdown_text(restart.get('drawdown_pct'))}",
-                )
-            )
-            rows2.append(
-                ("", Cell(f"En todo el mes: {month_txt} (ya no cuenta para el bloqueo).", "dim"))
-            )
-        else:
-            rows2.append(("Billetera del mes", f"{balance_txt} · {month_txt}{assumed}"))
     positions = state.get("open_positions") or []
     if positions:
         rows2.append(("Posiciones abiertas", _position_text(positions[0], tz)))
@@ -2924,6 +3170,10 @@ def _run(
     repo_now = Repository(repo.engine, clock=lambda: now)
     try:
         safety = evaluate_safety(repo_now, settings, profile, now, paths)
+    except LockWriteError as exc:
+        # El problema es el archivo LOCKED, no la base: sin él no hay plan.
+        print(lock_write_error_text(exc), file=err)
+        return EXIT_DATA
     except (OSError, ValueError, SQLAlchemyError) as exc:
         print(
             "No se pudieron evaluar los frenos de seguridad (sin eso no se arma ningún plan): "

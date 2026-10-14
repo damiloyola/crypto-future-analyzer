@@ -1081,3 +1081,247 @@ def test_load_trading_state_works_with_a_source_without_locks(settings, profile)
 
     state = load_trading_state(Source(), settings, profile, NOW)
     assert state.month_locks == () and state.wallet.restart is None
+
+
+# --- Fix 7: decisiones de la tercera ronda y revisión 6 ----------------------------------
+
+#: 300 el 01/10 y -200 el 05/10: saldo 100, máximo 300 (66,67 % abajo).
+REFILL_BASE = [wallet(local(10, 1, 9), "balance", 300.0)]
+REFILL_TRADES = [trade(local(10, 5), -200.0)]
+
+
+def refill_state(settings, profile, moves, extra_trades=()):
+    events = [*REFILL_BASE, *(wallet(local(10, 6, 10 + i), k, a) for i, (k, a) in enumerate(moves))]
+    return build(settings, profile, trades=[*REFILL_TRADES, *extra_trades], events=events)
+
+
+def test_config_has_the_third_round_decisions(settings):
+    dd = settings.circuit_breakers.monthly_drawdown_lock
+    assert dd.deposit_refills_withdrawals is True
+    assert dd.backfill_unrecorded_lock is True
+    assert settings.circuit_breakers.max_trades_blocks_status is True
+
+
+@pytest.mark.parametrize(
+    ("moves", "peak", "pct"),
+    [
+        ([], 300.0, 200 / 3),
+        ([("withdrawal", 100.0), ("deposit", 100.0)], 300.0, 200 / 3),  # retira todo y vuelve
+        ([("withdrawal", 90.0), ("deposit", 90.0)], 300.0, 200 / 3),
+        ([("deposit", 200.0)], 500.0, 40.0),  # sin retiros: D4 igual que antes
+    ],
+)
+def test_withdrawing_and_depositing_back_keeps_the_drawdown(settings, profile, moves, peak, pct):
+    """Tercera ronda (E1): retirar X y volver a depositar X deja el % igual."""
+    w = refill_state(settings, profile, moves).wallet
+    assert w.current_balance_usd == (300.0 if moves == [("deposit", 200.0)] else 100.0)
+    assert w.month_peak_usd == pytest.approx(peak)
+    assert w.drawdown_pct == pytest.approx(pct, abs=1e-9)
+    assert w.deposit_refills_withdrawals is True
+    assert w.month_withdrawn_open_usd == 0.0
+
+
+def test_deposit_then_withdraw_follows_the_rules_in_order(settings, profile):
+    """Tercera ronda (E1), documentado: depositar 90 y después retirar 90 da 51,28 %.
+
+    El depósito no tiene nada que devolver (no hubo retiros): sube el máximo
+    90 (300 → 390, saldo 190, 51,28 %). El retiro baja el máximo en la misma
+    proporción que el saldo (390 × 100 / 190 = 205,26): el % queda en 51,28.
+    """
+    w = refill_state(settings, profile, [("deposit", 90.0), ("withdrawal", 90.0)]).wallet
+    assert w.current_balance_usd == 100.0
+    assert w.month_peak_usd == pytest.approx(205.26, abs=0.01)
+    assert w.drawdown_pct == pytest.approx(200 / 390 * 100, abs=0.01)  # 51,28 %
+    assert w.month_withdrawn_open_usd == 90.0  # un depósito futuro lo devuelve sin cambiar el %
+
+
+def test_a_round_trip_no_longer_dodges_the_lock(settings, profile):
+    """Revisión 6: con la ida y vuelta, otra pérdida de 69 tiene que bloquear (89,67 %)."""
+    from app.safety.breakers import MONTHLY_DRAWDOWN_LOCK, evaluate_breakers
+    from app.safety.lockfile import LockInfo
+
+    moves = [("withdrawal", 100.0), ("deposit", 100.0)]
+    state = refill_state(settings, profile, moves, [trade(local(10, 7), -69.0)])
+    assert state.wallet.drawdown_pct == pytest.approx(269 / 3, abs=1e-9)
+    v = evaluate_breakers(state, profile, settings, NOW, lock=LockInfo(False, "LOCKED"))
+    assert v.breaker(MONTHLY_DRAWDOWN_LOCK).triggered and v.needs_lock
+
+
+def test_a_bigger_deposit_refills_first_and_raises_the_peak_with_the_rest(settings, profile):
+    # Retira 50 (100 → 50, máximo 150, 66,67 %) y deposita 150: 50 vuelven sin
+    # cambiar el % (máximo 300, saldo 100) y los otros 100 suben el máximo (400).
+    w = refill_state(settings, profile, [("withdrawal", 50.0), ("deposit", 150.0)]).wallet
+    assert w.current_balance_usd == 200.0
+    assert w.month_peak_usd == pytest.approx(400.0)
+    assert w.drawdown_pct == pytest.approx(50.0)
+
+
+def test_partial_refills_and_trades_in_between(settings, profile):
+    # Retira 100 (todo), deposita 40 (vuelve con el % recordado: máximo 120,
+    # saldo 40), gana 20 (60) y deposita 60: completa lo retirado con el % de
+    # ese momento (120/60 = 2 → máximo 240, saldo 120: 50 %).
+    moves = [("withdrawal", 100.0), ("deposit", 40.0)]
+    events = [
+        *REFILL_BASE,
+        *(wallet(local(10, 6, 10 + i), k, a) for i, (k, a) in enumerate(moves)),
+        wallet(local(10, 8), "deposit", 60.0),
+    ]
+    trades = [*REFILL_TRADES, trade(local(10, 7), 20.0)]
+    w = build(settings, profile, trades=trades, events=events).wallet
+    assert w.current_balance_usd == 120.0
+    assert w.month_peak_usd == pytest.approx(240.0)
+    assert w.drawdown_pct == pytest.approx(50.0)
+    assert w.month_withdrawn_open_usd == 0.0
+
+
+def test_refills_follow_the_inverse_of_the_withdrawal_rule():
+    events = [
+        *REFILL_BASE,
+        wallet(local(10, 6), "withdrawal", 50.0),
+        wallet(local(10, 7), "deposit", 50.0),
+    ]
+    for rule, peak in (("subtract", 300.0), ("none", 300.0), ("proportional", 300.0)):
+        w = wallet_state(
+            events,
+            REFILL_TRADES,
+            NOW,
+            month_start=MONTH_START,
+            assumed_start_usd=300.0,
+            withdrawal_peak=rule,
+            deposit_refills_withdrawals=True,
+        )
+        assert w.month_peak_usd == pytest.approx(peak), rule
+        assert w.drawdown_pct == pytest.approx(200 / 3), rule
+    old = wallet_state(events, REFILL_TRADES, NOW, month_start=MONTH_START, assumed_start_usd=300.0)
+    assert old.month_peak_usd == pytest.approx(200.0)  # sin la regla nueva: 150 + 50
+
+
+def test_state_without_refills_keeps_the_old_deposit_rule(settings, profile):
+    off = with_drawdown(settings, deposit_refills_withdrawals=False)
+    moves = [("withdrawal", 100.0), ("deposit", 100.0)]
+    w = refill_state(off, profile, moves).wallet
+    assert w.drawdown_pct == 0.0 and w.deposit_refills_withdrawals is False
+    d = refill_state(settings, profile, moves).to_dict()["wallet"]
+    assert d["deposit_refills_withdrawals"] is True and d["month_withdrawn_open_usd"] == 0.0
+
+
+def test_restart_can_refill_a_withdrawal_made_before_the_lock(settings, profile):
+    # 300 → 80 (bloqueo 05/10 12:00); antes del bloqueo retiró 0. Después del
+    # desbloqueo: pierde 40 (80 → 40, 50 % desde el bloqueo), retira 20
+    # (proporcional: máximo 40) y vuelve a depositar 20: sigue en 50 %.
+    events = [
+        *LOCK_EVENTS,
+        wallet(local(10, 7), "withdrawal", 20.0),
+        wallet(local(10, 8), "deposit", 20.0),
+    ]
+    trades = [*LOCK_TRADES, trade(local(10, 6), -40.0)]
+    state = build(settings, profile, trades=trades, events=events, locks=[lock(local(10, 5, 12))])
+    r = state.wallet.restart
+    assert r is not None
+    assert r.current_balance_usd == 40.0
+    assert r.drawdown_pct == pytest.approx(50.0)
+    assert r.withdrawn_open_usd == 0.0
+
+
+def test_a_balance_noted_exactly_at_the_month_start_is_the_start_balance():
+    """Revisión 6: un saldo anotado el 01/10 00:00 es el saldo de arranque, no una caída."""
+    trades = [trade(local(9, 10), -50.0)]  # septiembre: 300 → 250 calculado
+    for ts in (MONTH_START, MONTH_START - timedelta(minutes=1)):
+        events = [wallet(local(9, 1, 9), "balance", 300.0), wallet(ts, "balance", 200.0)]
+        w = wallet_of(events, trades)
+        assert w.month_start_balance_usd == 200.0
+        assert (w.month_peak_usd, w.current_balance_usd, w.drawdown_pct) == (200.0, 200.0, 0.0)
+        assert w.anchor is not None and w.anchor.amount_usd == 200.0
+    # Una operación del mismo instante ya está incluida en ese saldo.
+    same = [wallet(local(9, 1, 9), "balance", 300.0), wallet(MONTH_START, "balance", 200.0)]
+    w = wallet_of(same, [*trades, trade(MONTH_START, -30.0)])
+    assert (w.month_start_balance_usd, w.current_balance_usd, w.drawdown_pct) == (200.0, 200.0, 0.0)
+    # Un saldo más bajo un rato después sí es una caída del mes.
+    later = [wallet(local(9, 1, 9), "balance", 300.0), wallet(local(10, 1, 0, 1), "balance", 200.0)]
+    w = wallet_of(later, trades)
+    assert w.month_start_balance_usd == 250.0 and w.drawdown_pct == 20.0
+
+
+def test_a_loss_after_a_win_during_the_pause_stretches_it():
+    """Revisión 6 (D2): cualquier pérdida durante la pausa la estira, aunque antes ganara."""
+    losses = [trade(local(10, 13, h), -5.0) for h in (9, 10, 11)]  # pausa 11:00-15:00
+    win = trade(local(10, 13, 12), 5.0)
+    late_loss = trade(local(10, 13, 13), -5.0)
+    s = streak([*losses, win, late_loss], now=local(10, 13, 14, 30))
+    assert s.cooldown_started_at == local(10, 13, 11)
+    assert s.cooldown_until == local(10, 13, 17)
+    assert s.cooldown_active() and s.count == 1
+    assert s.cooldown_trigger_ids == tuple(t["id"] for t in losses)
+    assert s.cooldown_extended_at == local(10, 13, 13)
+    assert s.cooldown_extended_by_id == late_loss["id"]
+    assert s.losses_during_cooldown == 1
+    d = s.to_dict()
+    assert d["cooldown_trigger_ids"] == [t["id"] for t in losses]
+    assert d["cooldown_extended_at"] == local(10, 13, 13).astimezone(UTC).isoformat()
+    # A las 15:30 sigue la pausa; a las 17:00 terminó y la cuenta vuelve a cero.
+    assert streak([*losses, win, late_loss], now=local(10, 13, 15, 30)).cooldown_active()
+    done = streak([*losses, win, late_loss], now=local(10, 13, 17))
+    assert not done.cooldown_active() and done.count == 0
+    # Una pérdida justo a la hora de fin no la estira y cuenta 1.
+    edge = streak([*losses, trade(local(10, 13, 15), -5.0)], now=local(10, 13, 15, 30))
+    assert edge.cooldown_until == local(10, 13, 15) and edge.count == 1
+    assert edge.cooldown_extended_at is None
+
+
+def test_a_late_loss_closed_before_the_lock_is_part_of_that_incident(settings, profile):
+    """Tercera ronda (E3): cargada tarde pero cerrada antes del bloqueo: no es caída nueva."""
+    late = trade(local(10, 5, 11), -30.0)  # cerró antes del bloqueo de las 12:00
+    state = build(
+        settings,
+        profile,
+        trades=[*LOCK_TRADES, late],
+        events=LOCK_EVENTS,
+        locks=[lock(local(10, 5, 12))],
+    )
+    r = state.wallet.restart
+    assert r is not None
+    assert r.start_balance_usd == 50.0  # 300 - 220 - 30
+    assert r.drawdown_pct == 0.0
+    assert state.wallet.drawdown_pct == pytest.approx(250 / 3)  # el mes sí lo cuenta
+
+
+def test_restarts_are_measured_from_every_lock_of_the_month(settings, profile):
+    first = lock(local(10, 5, 12))
+    second = lock(local(10, 7, 12))
+    trades = [*LOCK_TRADES, trade(local(10, 7, 10), -56.0)]  # 80 → 24 (70 % desde 80)
+    state = build(settings, profile, trades=trades, events=LOCK_EVENTS, locks=[second, first])
+    w = state.wallet
+    assert [r.lock_id for r in w.restarts] == [first["id"], second["id"]]
+    assert w.restart is w.restarts[-1]
+    earlier = w.restart_before(local(10, 7, 12))
+    assert earlier is not None and earlier.lock_id == first["id"]
+    assert (earlier.peak_usd, earlier.current_balance_usd, earlier.drawdown_pct) == (
+        80.0,
+        24.0,
+        70.0,
+    )
+    assert w.restart_before(local(10, 5, 12)) is None
+    d = state.to_dict()["wallet"]
+    assert [r["lock_id"] for r in d["restarts"]] == [first["id"], second["id"]]
+
+
+def test_negative_balance_is_flagged_for_the_texts():
+    w = wallet_of([wallet(local(10, 1, 9), "balance", 50.0)], [trade(local(10, 5), -80.0)])
+    assert w.negative_balance is True
+    assert w.to_dict()["negative_balance"] is True
+    assert any("mal tipeado" in x for x in w.warnings)
+    assert wallet_of().negative_balance is False
+
+
+def test_records_keep_the_planned_risk(settings, profile):
+    pos = PositionRecord.from_value(
+        {"id": 1, "symbol": "btc", "side": "long", "risk_usd": 0, "initial_risk_usd": 40.0}
+    )
+    assert (pos.risk_usd, pos.initial_risk_usd, pos.planned_risk_usd) == (0.0, 40.0, 40.0)
+    assert pos.to_dict()["planned_risk_usd"] == 40.0
+    legacy = PositionRecord.from_value({"id": 2, "symbol": "eth", "side": "short", "risk_usd": 30})
+    assert legacy.initial_risk_usd is None and legacy.planned_risk_usd == 30.0
+    t = TradeRecord.from_value(trade(local(10, 5), -80.0, risk_usd=80.0, initial_risk_usd=50.0))
+    assert t.planned_risk_usd == 50.0 and t.to_dict()["initial_risk_usd"] == 50.0
+    state = build(settings, profile, positions=[pos, legacy])
+    assert state.open_risk_usd == 30.0  # el límite del día usa el riesgo de ahora

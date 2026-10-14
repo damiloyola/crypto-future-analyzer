@@ -17,6 +17,7 @@ from app.safety.lockfile import (
     LOCK_HEADER_PREFIX,
     UNLOCK_INSTRUCTION,
     LockInfo,
+    LockWriteError,
     build_lock_text,
     is_locked,
     parse_lock_header,
@@ -352,9 +353,65 @@ def test_build_and_parse_are_inverse() -> None:
         "triggered_at": WHEN,
         "report_path": REPORT,
         "trigger_code": "x",
+        "drawdown_pct": None,
+        "peak_usd": None,
+        "balance_usd": None,
+        "measured_since": None,
     }
     assert parse_lock_header("sin encabezado") is None
     assert text.endswith("\n")
+
+
+def test_the_header_keeps_the_numbers_of_the_trigger(tmp_path: Path) -> None:
+    """Fix 7 / E2: con los números en el LOCKED, la app puede anotarlo en la base después."""
+    since = datetime(2026, 10, 5, 15, 0, tzinfo=UTC)
+    text = build_lock_text(
+        reason=REASON,
+        triggered_at=WHEN,
+        report_path=REPORT,
+        trigger_code="monthly_drawdown_lock",
+        drawdown_pct=73.333333333,
+        peak_usd=300.0,
+        balance_usd=80.0,
+        measured_since=since,
+    )
+    header = parse_lock_header(text)
+    assert header is not None
+    assert header["drawdown_pct"] == pytest.approx(73.333333)
+    assert (header["peak_usd"], header["balance_usd"]) == (300.0, 80.0)
+    assert header["measured_since"] == since
+    written = write_lock(
+        tmp_path / "LOCKED",
+        reason=REASON,
+        triggered_at=WHEN,
+        report_path=None,
+        peak_usd=300.0,
+        balance_usd=float("nan"),  # un número raro no rompe nada: no se guarda
+    )
+    assert written.lock.peak_usd == 300.0 and written.lock.balance_usd is None
+    assert written.lock.to_dict()["peak_usd"] == 300.0
+    bad = 'LOCKED {"reason": "x", "peak_usd": "mucho", "drawdown_pct": true}'
+    assert parse_lock_header(bad)["peak_usd"] is None
+    assert parse_lock_header(bad)["drawdown_pct"] is None
+
+
+def test_a_disk_error_is_a_clear_lock_write_error(tmp_path: Path, monkeypatch) -> None:
+    """Fix 7: un error al escribir el LOCKED dice qué pasa (y sigue siendo un OSError)."""
+
+    def no_space(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(lockfile, "create_new_file", no_space)
+    with pytest.raises(LockWriteError) as info:
+        write_lock(tmp_path / "LOCKED", reason=REASON, triggered_at=WHEN, report_path=REPORT)
+    err = info.value
+    assert isinstance(err, OSError)
+    assert err.path == str(tmp_path / "LOCKED") and err.report_path == REPORT
+    text = str(err)
+    assert text.startswith(f"No se pudo escribir el archivo LOCKED ({tmp_path / 'LOCKED'})")
+    assert "No space left on device" in text
+    assert "La app no arma planes hasta que se pueda escribir" in text
+    assert f"El informe del incidente sí quedó guardado: {REPORT}." in text
 
 
 def test_unknown_timezone_falls_back_to_utc() -> None:

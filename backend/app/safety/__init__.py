@@ -14,13 +14,16 @@ Módulos (cada uno puro salvo las funciones de I/O que se nombran):
   de la billetera, su máximo del mes, la caída y la caída medida desde el
   último bloqueo total). I/O: ``load_trading_state(repo, settings, profile,
   now)``.
-- ``breakers``: un ``BreakerStatus`` por freno (pérdida del día, pausa por
-  pérdidas seguidas, pérdida de la semana, caída del mes, evento de alta
-  volatilidad y archivo LOCKED) y ``evaluate_breakers(...) -> SafetyVerdict``
-  (verde / ámbar / rojo, multiplicador de riesgo y motivos de bloqueo). I/O:
-  la lectura del LOCKED dentro de ``evaluate_breakers`` (salvo que se pase
-  ``lock``) y ``trigger_lock_if_needed``, que escribe el informe del incidente
-  y el LOCKED una sola vez y anota el bloqueo en la base.
+- ``breakers``: un ``BreakerStatus`` por freno (pérdida del día, máximo de
+  operaciones del día, pausa por pérdidas seguidas, pérdida de la semana,
+  caída del mes, evento de alta volatilidad y archivo LOCKED) y
+  ``evaluate_breakers(...) -> SafetyVerdict`` (verde / ámbar / rojo,
+  multiplicador de riesgo, motivos de bloqueo y la caída que miró el freno del
+  mes). I/O: la lectura del LOCKED dentro de ``evaluate_breakers`` (salvo que
+  se pase ``lock``), ``trigger_lock_if_needed`` (escribe el informe del
+  incidente y el LOCKED una sola vez y anota el bloqueo en la base),
+  ``backfill_unrecorded_lock`` (anota un LOCKED de este mes que no quedó
+  anotado) y ``run_safety_checks`` (todo junto, lo que hace cada consola).
 - ``correlation``: matriz de correlación de retornos de 1h y riesgo combinado
   de posiciones correlacionadas (``combined_risk_limit``). I/O:
   ``fetch_correlation_matrix``.
@@ -30,11 +33,11 @@ Módulos (cada uno puro salvo las funciones de I/O que se nombran):
 
 Flujo típico de un análisis::
 
-    state = load_trading_state(repo, settings, profile, now)
-    verdict = evaluate_breakers(state, profile, settings, now)
-    trigger_lock_if_needed(verdict, state, settings, now, repo=repo)
+    run = run_safety_checks(repo, settings, profile, now, lock_path=..., incident_dir=...)
+    state, verdict = run.state, run.verdict
     # verdict.blocked -> "No operar"; verdict.risk_multiplier -> achica el riesgo;
     # state.trades_today y state.plan_pnl_today_usd -> PlanInputs.
+    # Un LockWriteError (es un OSError) dice que no se pudo escribir el LOCKED.
 
 Esta capa está debajo de ``storage`` y no lo importa: lee los registros por
 "duck typing" (ver ``state.TradingStateSource``).

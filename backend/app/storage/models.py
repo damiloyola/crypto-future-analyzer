@@ -17,6 +17,8 @@ correlación, Hito 5) y el historial de análisis:
   total por la caída del mes), con los números del disparo. Si el usuario
   borra el LOCKED, la caída del mes se vuelve a medir desde el saldo de ese
   momento (esquema 3).
+- Esquema 4: ``initial_risk_usd`` en ``OpenPosition`` y ``ManualTrade`` (el
+  riesgo previsto al abrir; ``risk_usd`` es el del stop actual o el del cierre).
 - ``AnalysisRecord``: cada análisis generado, con el plan, el score, el
   veredicto de seguridad, la lectura del LLM y los datos de entrada en JSON.
 
@@ -80,7 +82,10 @@ class ManualTrade(SQLModel, table=True):
     """Operación cerrada, cargada a mano.
 
     ``pnl_usd`` es el resultado neto realizado (comisiones y funding
-    incluidos): negativo = pérdida. Los campos de contexto (``analysis_id``,
+    incluidos): negativo = pérdida. ``risk_usd`` es el riesgo con el stop con
+    el que cerró e ``initial_risk_usd`` (esquema 4) el previsto al abrir (si se
+    movió el stop, difieren; ``NULL`` en las filas viejas = igual a
+    ``risk_usd``). Los campos de contexto (``analysis_id``,
     ``regime_*``, ``score_total``, ``plan_status``, ``profile_name``) se copian
     del análisis que el usuario siguió, si siguió alguno; sirven para el
     informe del incidente ("en qué régimen estaba, qué decía el score").
@@ -95,6 +100,7 @@ class ManualTrade(SQLModel, table=True):
     closed_at: datetime = Field(sa_type=UTCDateTime, index=True)
     pnl_usd: float
     risk_usd: float | None = None
+    initial_risk_usd: float | None = None
     entry_price: float | None = None
     exit_price: float | None = None
     notes: str | None = Field(default=None, sa_type=Text)
@@ -114,6 +120,8 @@ class OpenPosition(SQLModel, table=True):
     ``risk_usd`` es lo que el usuario pierde si toca el stop (obligatorio:
     con eso se suma el riesgo de monedas correlacionadas). 0 = stop en la
     entrada; se puede cambiar después con ``Repository.update_position``.
+    ``initial_risk_usd`` (esquema 4) es el riesgo previsto al abrir: no cambia
+    al mover el stop (``NULL`` en las posiciones de antes = igual a ``risk_usd``).
     """
 
     __tablename__ = "open_positions"
@@ -124,6 +132,7 @@ class OpenPosition(SQLModel, table=True):
     opened_at: datetime = Field(sa_type=UTCDateTime)
     entry_price: float | None = None
     risk_usd: float
+    initial_risk_usd: float | None = None
     notes: str | None = Field(default=None, sa_type=Text)
     analysis_id: int | None = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=utc_now, sa_type=UTCDateTime)

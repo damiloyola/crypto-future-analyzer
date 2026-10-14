@@ -9,6 +9,7 @@ Buenos Aires.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -302,8 +303,13 @@ def test_two_losses_in_a_row_warn_about_the_next_one(settings, profile):
     assert "si la próxima también pierde" in b.message
 
 
+def opened_yesterday(closed: datetime, pnl: float, **kw) -> dict:
+    """Operación abierta ayer (no cuenta para el máximo de operaciones de hoy)."""
+    return trade(closed, pnl, opened_at=local(10, 12, 20), **kw)
+
+
 def test_third_loss_blocks_for_four_hours(settings, profile):
-    trades = [trade(local(10, 13, h), -5.0) for h in (12, 13, 14)]
+    trades = [opened_yesterday(local(10, 13, h), -5.0) for h in (12, 13, 14)]
     state = state_for(settings, profile, trades=trades)
     b = losing_streak_breaker(state, profile, settings, NOW)
     assert b.triggered and b.blocks
@@ -345,8 +351,41 @@ def test_a_loss_during_the_pause_stretches_it_four_hours(settings, profile):
     trades.append(trade(local(10, 13, 14), -5.0))  # operó igual y perdió
     b = losing_streak_breaker(state_for(settings, profile, trades=trades), profile, settings, NOW)
     assert b.triggered and b.until == local(10, 13, 18).astimezone(UTC)
-    assert "(la última cerró el 13/10/2026 14:00)" in b.message
+    assert b.message.startswith(
+        "Perdiste 3 operaciones seguidas (la última cerró el 13/10/2026 13:00): pausa de 4 horas"
+    )
+    assert (
+        "Después volviste a perder durante la pausa (la operación que cerró el 13/10/2026 "
+        "14:00), así que la pausa se estiró 4 horas desde esa pérdida."
+    ) in b.message
+    assert b.message.endswith("No se generan planes hasta hoy a las 18:00.")
     assert "la pausa se estira 4 horas desde esa pérdida" in b.description
+
+
+def test_a_loss_during_the_pause_after_a_win_still_stretches_it(settings, profile):
+    """Revisión 6 (D2): ganada y después perdida dentro de la pausa: la estira igual."""
+    trades = [opened_yesterday(local(10, 13, h), -5.0) for h in (9, 10, 11)]  # hasta 15:00
+    trades.append(opened_yesterday(local(10, 13, 12), 5.0))  # ganó
+    trades.append(opened_yesterday(local(10, 13, 13), -5.0))  # y perdió, en la pausa
+    now = local(10, 13, 14, 30)
+    state = state_for(settings, profile, trades=trades, now=now)
+    assert state.streak.cooldown_until == local(10, 13, 17).astimezone(UTC)
+    b = losing_streak_breaker(state, profile, settings, now)
+    assert b.triggered and b.until == local(10, 13, 17).astimezone(UTC)
+    assert b.message == (
+        "Perdiste 3 operaciones seguidas (la última cerró el 13/10/2026 11:00): pausa de 4 "
+        "horas para enfriar la cabeza. Después volviste a perder durante la pausa (la operación "
+        "que cerró el 13/10/2026 13:00), así que la pausa se estiró 4 horas desde esa pérdida. "
+        "No se generan planes hasta hoy a las 17:00."
+    )
+    assert b.current == 3.0
+    later = local(10, 13, 15, 30)  # antes, a esta hora ya no bloqueaba
+    late_state = state_for(settings, profile, trades=trades, now=later)
+    assert losing_streak_breaker(late_state, profile, settings, later).triggered
+    done = local(10, 13, 17)
+    end_state = state_for(settings, profile, trades=trades, now=done)
+    after = losing_streak_breaker(end_state, profile, settings, done)
+    assert not after.triggered and after.current == 0.0  # y la cuenta vuelve a cero
 
 
 def test_without_extension_the_pause_ends_at_the_planned_time(settings, profile):
@@ -358,7 +397,10 @@ def test_without_extension_the_pause_ends_at_the_planned_time(settings, profile)
     trades.append(trade(local(10, 13, 14), -5.0))
     b = losing_streak_breaker(state_for(custom, profile, trades=trades), profile, custom, NOW)
     assert b.triggered and b.until == local(10, 13, 17).astimezone(UTC)
-    assert "la pausa empezó con la que cerró el 13/10/2026 13:00" in b.message
+    assert "Perdiste 3 operaciones seguidas (la última cerró el 13/10/2026 13:00)" in b.message
+    assert (
+        "Volviste a perder durante la pausa, pero la pausa termina igual a la hora prevista."
+    ) in b.message
     assert "la pausa termina igual a la hora prevista" in b.description
     at_end = local(10, 13, 17)
     late = state_for(custom, profile, trades=trades, now=at_end)
@@ -682,7 +724,9 @@ def test_multipliers_of_the_day_and_the_week_multiply(settings, profile):
 
 
 def test_red_verdict_lists_every_block_and_puts_the_lock_first(settings, profile):
-    trades = [trade(local(10, 5), -150.0)] + [trade(local(10, 13, h), -25.0) for h in (12, 13, 14)]
+    trades = [trade(local(10, 5), -150.0)] + [
+        opened_yesterday(local(10, 13, h), -25.0) for h in (12, 13, 14)
+    ]
     v = verdict_for(settings, profile, trades=trades)  # día -75, racha 3, mes -225 (75 %)
     assert v.status == "rojo"
     assert set(v.block_codes) == {LOSING_STREAK, MONTHLY_DRAWDOWN_LOCK}
@@ -1207,14 +1251,341 @@ def test_upcoming_event_warning_is_the_same_text_in_the_verdict(settings, profil
     )
 
 
-def test_monthly_drawdown_texts_are_capped_at_100_percent(settings, profile):
-    """Más de 100 % solo pasa con el saldo calculado negativo: se muestra 100 %."""
+def test_monthly_drawdown_above_100_percent_says_so_and_asks_to_check_the_data(settings, profile):
+    """Fix 7 / E5: con el saldo calculado negativo, "más del 100 %" y revisar los datos."""
     state = state_for(settings, profile, trades=[trade(local(10, 5), -700.0)])
     v = evaluate_breakers(state, profile, settings, NOW, lock=NO_LOCK)
     monthly = v.breaker(MONTHLY_DRAWDOWN_LOCK)
     assert monthly.current == pytest.approx(700 / 3)  # 300 → -400: 233 %, sin recortar
-    assert monthly.current_text == "100 %"
-    assert "cayó 100 % desde su máximo del mes (300 USD → -400 USD)" in monthly.message
+    assert monthly.current_text == "más del 100 %"
+    assert "cayó más del 100 % desde su máximo del mes (300 USD → -400 USD)" in monthly.message
+    assert "Ojo: el saldo calculado de tu billetera da negativo (-400 USD)" in monthly.message
+    assert "un resultado o un retiro mal tipeado" in monthly.message
+    assert monthly.summary == "la billetera del mes cayó más del 100 % desde su máximo (tope 70 %)"
+    assert v.headline.startswith("No se generan planes: la billetera del mes cayó más del 100 %")
     assert "233" not in monthly.message + monthly.summary + v.headline
     reason = br._lock_reason(state, settings, br._month_measure(state, settings, locked=False))
-    assert "cayó 100 % desde su máximo" in reason and "233" not in reason
+    assert "cayó más del 100 % desde su máximo" in reason and "233" not in reason
+    assert "mal tipeado" in reason
+    d = v.to_dict()["drawdown_measure"]
+    assert d["negative_balance"] is True and d["drawdown_text"] == "más del 100 %"
+    assert "mal tipeado" in d["negative_balance_warning"]
+
+
+# --- Fix 7: tercera ronda y revisión 6 --------------------------------------------------
+
+
+def opened_today(hour: int, pnl: float = 5.0) -> dict:
+    return trade(local(10, 13, hour), pnl)
+
+
+def test_max_trades_of_the_day_blocks_until_midnight(settings, profile):
+    """Tercera ronda (E4): con el máximo de operaciones del día, el estado queda en ROJO."""
+    v = verdict_for(settings, profile, trades=[opened_today(h) for h in (9, 10, 11)])
+    b = v.breaker(br.MAX_TRADES_TODAY)
+    assert b.triggered and b.blocks and b.kind == "block"
+    assert (b.threshold, b.current, b.progress) == (3.0, 3.0, 1.0)
+    assert (b.current_text, b.threshold_text) == ("3", "3 operaciones")  # "3 de 3 operaciones"
+    assert b.until == local(10, 14).astimezone(UTC)
+    assert b.message == (
+        "Ya hiciste 3 de 3 operaciones permitidas hoy: no se generan planes hasta que termine "
+        "el día (a las 00:00). Mañana arrancás de cero."
+    )
+    assert b.summary == "ya hiciste 3 de 3 operaciones permitidas hoy"
+    assert v.status == "rojo" and v.blocked
+    assert v.block_codes == (br.MAX_TRADES_TODAY,)
+    assert v.headline == (
+        "No se generan planes: ya hiciste 3 de 3 operaciones permitidas hoy, hasta que "
+        "termine el día (a las 00:00)."
+    )
+    assert v.to_dict()["breakers"][2]["code"] == br.MAX_TRADES_TODAY
+
+
+def test_max_trades_below_the_limit_and_switched_off(settings, profile):
+    two = verdict_for(settings, profile, trades=[opened_today(h) for h in (9, 10)])
+    b = two.breaker(br.MAX_TRADES_TODAY)
+    assert not b.triggered and two.status == "verde"
+    assert b.message == (
+        "Hoy hiciste 2 de 3 operaciones permitidas. Con una más llegás al máximo y no hay más "
+        "planes hasta mañana."
+    )
+    off = with_breakers(settings, max_trades_blocks_status=False)
+    v = verdict_for(off, profile, trades=[opened_today(h) for h in (9, 10, 11, 12)])
+    b = v.breaker(br.MAX_TRADES_TODAY)
+    assert not b.triggered and v.status == "verde"
+    assert b.message.startswith("Ya hiciste 4 operaciones hoy y el máximo es 3.")
+    zero = dataclasses.replace(get_profile("agresivo", settings), max_trades_per_day=0)
+    b = verdict_for(settings, zero).breaker(br.MAX_TRADES_TODAY)
+    assert b.triggered and b.message.startswith("Tu perfil no permite operaciones")
+
+
+def test_the_lock_file_does_not_count_as_one_more_breaker(settings, profile):
+    """Revisión 6: el LOCKED es el mismo bloqueo que la caída del mes, no "1 freno más"."""
+    lock = LockInfo(exists=True, path="LOCKED", reason="anterior")
+    v = verdict_for(settings, profile, trades=[trade(local(10, 5), -250.0)], lock=lock)
+    assert set(v.block_codes) == {MONTHLY_DRAWDOWN_LOCK, LOCK_FILE}
+    assert "freno más" not in v.headline
+    assert v.headline.startswith("No se generan planes: la billetera del mes cayó 83,33 %")
+
+
+def test_wallet_rules_text_explains_the_refill(settings, profile):
+    b = verdict_for(settings, profile).breaker(MONTHLY_DRAWDOWN_LOCK)
+    assert (
+        "Un depósito primero devuelve lo que retiraste en el mes, sin cambiar el % de caída"
+    ) in b.description
+    off = with_breakers(
+        settings,
+        monthly_drawdown_lock=settings.circuit_breakers.monthly_drawdown_lock.model_copy(
+            update={"deposit_refills_withdrawals": False}
+        ),
+    )
+    assert "devuelve" not in verdict_for(off, profile).breaker(MONTHLY_DRAWDOWN_LOCK).description
+
+
+def second_lock_flow(tmp_path: Path, settings, profile) -> LockFlow:
+    """300 → 80 (bloqueo 05/10 12:00), desbloqueo, 80 → 24 (segundo bloqueo 07/10 12:00)."""
+    flow = LockFlow(tmp_path, settings, profile)
+    flow.loss(local(10, 5, 10), -220.0)
+    flow.run(local(10, 5, 12))
+    flow.lock_path.unlink()
+    flow.loss(local(10, 7, 10), -56.0)
+    _, verdict, result, _ = flow.run(local(10, 7, 12))
+    assert result.action == "locked"
+    return flow
+
+
+def test_while_the_second_lock_exists_the_breaker_shows_the_drop_that_fired_it(
+    tmp_path: Path, settings, profile
+):
+    """Revisión 6: con el LOCKED del segundo bloqueo, la caída es la medida desde el desbloqueo."""
+    flow = second_lock_flow(tmp_path, settings, profile)
+    state, verdict, result, _ = flow.run(local(10, 7, 13))
+    assert result.action == "not_needed" and verdict.locked
+    b = verdict.breaker(MONTHLY_DRAWDOWN_LOCK)
+    assert b.current == 70.0 and b.triggered  # no el 92 % del mes calendario
+    assert "Después del bloqueo del 05/10 12:00 (que desbloqueaste)" in b.message
+    assert "volvió a caer 70 % desde su máximo (80 USD → 24 USD)" in b.message
+    assert (
+        "En todo el mes la caída es 92 % (300 USD → 24 USD), pero esa cifra ya no cuenta para "
+        "el bloqueo."
+    ) in b.message
+    assert verdict.headline.startswith(
+        "No se generan planes: después del bloqueo del 05/10 12:00, la billetera volvió a caer "
+        "70 % (tope 70 %)"
+    )
+    assert "freno más" not in verdict.headline
+    m = verdict.drawdown_measure
+    assert m is not None and m.since_unlock and m.while_locked
+    assert (m.peak_usd, m.balance_usd, m.month_peak_usd) == (80.0, 24.0, 300.0)
+    assert m.month_drawdown_pct == pytest.approx(92.0)
+    d = verdict.to_dict()["drawdown_measure"]
+    assert d["basis"] == "since_unlock" and d["measured_since_text"] == "05/10 12:00"
+    assert d["drawdown_text"] == "70 %" and d["month"]["drawdown_text"] == "92 %"
+    lock = read_lock(flow.lock_path)
+    assert lock.reason is not None and "volvió a caer 70 %" in lock.reason
+    assert lock.measured_since == local(10, 5, 12).astimezone(UTC)
+    assert (lock.peak_usd, lock.balance_usd) == (80.0, 24.0)
+    assert verdict.lock_recorded is True
+    # El primer bloqueo (sin uno anterior en el mes) sigue mostrando el mes calendario.
+    assert state.wallet.drawdown_pct == pytest.approx(92.0)
+
+
+def test_a_lock_that_could_not_be_recorded_is_backfilled_and_unlock_does_not_relock(
+    tmp_path: Path, settings, profile, monkeypatch
+):
+    """Tercera ronda (E2): el LOCKED sin anotar se anota solo; borrarlo no vuelve a bloquear."""
+    flow = LockFlow(tmp_path, settings, profile)
+    flow.loss(local(10, 5, 10), -220.0)
+    real_add = flow.repo.add_safety_lock
+
+    def broken(**_kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(flow.repo, "add_safety_lock", broken)
+    _, _, result, after = flow.run(local(10, 5, 12))
+    assert result.action == "locked" and result.db_error is not None
+    assert flow.repo.list_safety_locks() == []
+    # La base sigue fallando: el aviso se repite en cada corrida.
+    _, verdict, result, _ = flow.run(local(10, 5, 13))
+    assert result.backfill is not None and result.backfill.action == "failed"
+    assert "database is locked" in (result.backfill.db_error or "")
+    assert verdict.lock_recorded is False
+    assert any("no está anotado en la base" in w for w in verdict.warnings)
+    # La base vuelve a andar: la próxima corrida lo anota con la fecha y los números del LOCKED.
+    monkeypatch.setattr(flow.repo, "add_safety_lock", real_add)
+    _, verdict, result, _ = flow.run(local(10, 5, 14))
+    assert result.backfill is not None and result.backfill.action == "recorded"
+    assert "se anotó ahora con su fecha" in result.backfill.message
+    (stored,) = flow.repo.list_safety_locks()
+    assert stored.triggered_at == local(10, 5, 12).astimezone(UTC)
+    assert (stored.peak_usd, stored.balance_usd) == (300.0, 80.0)
+    assert stored.drawdown_pct == pytest.approx(73.333, abs=0.001)
+    assert stored.lock_path == str(flow.lock_path)
+    # Ya anotado: no se duplica y no hay aviso.
+    state, verdict, result, _ = flow.run(local(10, 5, 15))
+    assert result.backfill is not None and result.backfill.action == "already_recorded"
+    assert len(flow.repo.list_safety_locks()) == 1
+    assert not any("no está anotado" in w for w in verdict.warnings)
+    # El usuario borra el LOCKED al día siguiente: no se vuelve a bloquear ni hay otro informe.
+    flow.lock_path.unlink()
+    _, verdict, result, _ = flow.run(local(10, 6, 13))
+    assert not verdict.blocked and result.action == "not_needed"
+    assert len(flow.reports()) == 1
+    assert "Después del bloqueo del 05/10 12:00" in verdict.breaker(MONTHLY_DRAWDOWN_LOCK).message
+
+
+def test_an_old_lock_without_numbers_is_backfilled_too(tmp_path: Path, settings, profile):
+    """Un LOCKED de la versión anterior (sin números en el encabezado) se anota con su fecha."""
+    flow = LockFlow(tmp_path, settings, profile)
+    flow.loss(local(10, 5, 10), -220.0)
+    write_lock(
+        flow.lock_path,
+        reason="La billetera del mes cayó 73,33 %",
+        triggered_at=local(10, 5, 12),
+        report_path=None,
+        trigger_code=MONTHLY_DRAWDOWN_LOCK,
+    )
+    run = br.run_safety_checks(
+        flow.repo,
+        settings,
+        profile,
+        local(10, 5, 13),
+        lock_path=flow.lock_path,
+        incident_dir=flow.incidents,
+    )
+    assert run.backfill is not None and run.backfill.recorded
+    (stored,) = flow.repo.list_safety_locks()
+    assert stored.peak_usd is None and stored.balance_usd is None
+    assert run.verdict.lock_recorded is True and run.lock_result is None
+    assert [lk.id for lk in run.state.month_locks] == [stored.id]
+    d = run.to_dict()
+    assert json.loads(json.dumps(d, allow_nan=False)) == d
+    flow.lock_path.unlink()
+    after = br.run_safety_checks(
+        flow.repo, settings, profile, local(10, 6, 9), lock_path=flow.lock_path
+    )
+    assert not after.verdict.blocked  # se mide desde el bloqueo anotado
+
+
+def test_backfill_ignores_locks_of_other_months_other_breakers_or_when_disabled(
+    tmp_path: Path, settings, profile
+):
+    repo = Repository.open(tmp_path / "db.sqlite", clock=lambda: NOW)
+    path = tmp_path / "LOCKED"
+    assert br.backfill_unrecorded_lock(repo, settings, NOW, lock_path=path).action == (
+        "not_applicable"
+    )
+    write_lock(
+        path,
+        reason="x",
+        triggered_at=local(9, 25),
+        report_path=None,
+        trigger_code=MONTHLY_DRAWDOWN_LOCK,
+    )
+    assert br.backfill_unrecorded_lock(repo, settings, NOW, lock_path=path).action == (
+        "not_applicable"
+    )  # septiembre
+    path.unlink()
+    write_lock(path, reason="x", triggered_at=local(10, 5), report_path=None, trigger_code="otro")
+    assert br.backfill_unrecorded_lock(repo, settings, NOW, lock_path=path).action == (
+        "not_applicable"
+    )
+    off = with_breakers(
+        settings,
+        monthly_drawdown_lock=settings.circuit_breakers.monthly_drawdown_lock.model_copy(
+            update={"backfill_unrecorded_lock": False}
+        ),
+    )
+    assert br.backfill_unrecorded_lock(repo, off, NOW, lock_path=path).action == "disabled"
+    assert repo.list_safety_locks() == []
+
+
+def test_a_lock_write_error_is_clear_and_does_not_pile_up_reports(
+    tmp_path: Path, settings, profile, monkeypatch
+):
+    """Revisión 6: sin poder escribir el LOCKED, error claro y un solo informe."""
+    flow = LockFlow(tmp_path, settings, profile)
+    flow.loss(local(10, 5, 10), -220.0)
+    real_write = br.write_lock
+
+    def no_permission(path, **_kwargs):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(br, "write_lock", no_permission)
+    for minute in (0, 1, 2):
+        with pytest.raises(br.LockWriteError) as info:
+            br.run_safety_checks(
+                flow.repo,
+                settings,
+                profile,
+                local(10, 5, 12, minute),
+                lock_path=flow.lock_path,
+                incident_dir=flow.incidents,
+            )
+        assert isinstance(info.value, OSError)
+        assert str(info.value).startswith(
+            f"No se pudo escribir el archivo LOCKED ({flow.lock_path})"
+        )
+        assert "Permission denied" in str(info.value)
+        assert info.value.report_path is not None
+    assert len(flow.reports()) == 1  # el mismo informe en los tres intentos
+    assert not flow.lock_path.exists()
+    monkeypatch.setattr(br, "write_lock", real_write)
+    run = br.run_safety_checks(
+        flow.repo,
+        settings,
+        profile,
+        local(10, 5, 12, 3),
+        lock_path=flow.lock_path,
+        incident_dir=flow.incidents,
+    )
+    assert run.lock_result is not None and run.lock_result.action == "locked"
+    assert run.lock_result.report_reused is True
+    assert flow.reports() == [Path(run.lock_result.report_path).name]
+    assert read_lock(flow.lock_path).report_path == str(run.lock_result.report_path)
+    assert run.lock_result.to_dict()["report_reused"] is True
+    assert run.verdict.locked and run.verdict.lock_recorded is None  # recién escrito
+
+
+def test_a_new_loss_makes_a_new_report_after_a_failed_lock(
+    tmp_path: Path, settings, profile, monkeypatch
+):
+    flow = LockFlow(tmp_path, settings, profile)
+    flow.loss(local(10, 5, 10), -220.0)
+    monkeypatch.setattr(br, "write_lock", lambda path, **_k: (_ for _ in ()).throw(OSError("x")))
+    with pytest.raises(br.LockWriteError):
+        br.run_safety_checks(
+            flow.repo,
+            settings,
+            profile,
+            local(10, 5, 12),
+            lock_path=flow.lock_path,
+            incident_dir=flow.incidents,
+        )
+    flow.loss(local(10, 5, 12, 30), -5.0)  # datos nuevos: el informe cambia
+    with pytest.raises(br.LockWriteError):
+        br.run_safety_checks(
+            flow.repo,
+            settings,
+            profile,
+            local(10, 5, 13),
+            lock_path=flow.lock_path,
+            incident_dir=flow.incidents,
+        )
+    assert len(flow.reports()) == 2
+
+
+def test_a_late_loss_before_the_lock_does_not_relock_after_unlocking(
+    tmp_path: Path, settings, profile
+):
+    """Tercera ronda (E3): una pérdida cargada tarde que cerró antes del bloqueo es parte de él."""
+    flow = LockFlow(tmp_path, settings, profile)
+    flow.loss(local(10, 5, 10), -220.0)
+    flow.run(local(10, 5, 12))
+    flow.loss(local(10, 5, 11), -60.0)  # cargada después, cerró antes del bloqueo (80 → 20)
+    flow.lock_path.unlink()
+    state, verdict, result, _ = flow.run(local(10, 6, 9))
+    assert not verdict.blocked and result.action == "not_needed"
+    r = state.wallet.restart
+    assert r is not None and r.start_balance_usd == 20.0 and r.drawdown_pct == 0.0
+    assert len(flow.reports()) == 1

@@ -30,7 +30,13 @@ apertura, riesgo negativo (0 vale: es el stop movido a la entrada), precios
 textos obligatorios vacíos, análisis inexistente o de otra moneda.
 
 Posiciones abiertas: ``update_position`` cambia el riesgo (por ejemplo, al
-mover el stop: 0 = stop en la entrada), el precio de entrada o la nota.
+mover el stop: 0 = stop en la entrada), el precio de entrada o la nota. El
+riesgo previsto al abrir queda aparte (``initial_risk_usd``, esquema 4) y no
+cambia al mover el stop (solo si se corrige a propósito con
+``update_position(initial_risk_usd=...)``). Al cerrar, la operación hereda los
+dos: ``risk_usd`` (el del stop con el que cerró) e ``initial_risk_usd`` (el
+previsto). ``planned_risk_usd`` da el previsto (en las filas de antes del
+esquema 4, que no lo tienen aparte, es ``risk_usd``).
 
 Bloqueos totales (``add_safety_lock`` / ``list_safety_locks``, esquema 3):
 cada vez que la capa de seguridad escribe el archivo LOCKED lo anota acá, con
@@ -135,11 +141,17 @@ class StoredTrade:
     plan_status: str | None
     profile_name: str | None
     created_at: datetime
+    initial_risk_usd: float | None = None
 
     @property
     def is_loss(self) -> bool:
         """``True`` si el resultado neto es negativo (un empate no es pérdida)."""
         return self.pnl_usd < 0
+
+    @property
+    def planned_risk_usd(self) -> float | None:
+        """El riesgo previsto al abrir (``initial_risk_usd`` o, si no está, ``risk_usd``)."""
+        return self.risk_usd if self.initial_risk_usd is None else self.initial_risk_usd
 
     def to_dict(self) -> dict[str, Any]:
         return json_safe(
@@ -152,6 +164,8 @@ class StoredTrade:
                 "pnl_usd": self.pnl_usd,
                 "is_loss": self.is_loss,
                 "risk_usd": self.risk_usd,
+                "initial_risk_usd": self.initial_risk_usd,
+                "planned_risk_usd": self.planned_risk_usd,
                 "entry_price": self.entry_price,
                 "exit_price": self.exit_price,
                 "notes": self.notes,
@@ -188,12 +202,18 @@ class StoredTrade:
             plan_status=row.plan_status,
             profile_name=row.profile_name,
             created_at=row.created_at,
+            initial_risk_usd=row.initial_risk_usd,
         )
 
 
 @dataclass(frozen=True)
 class StoredPosition:
-    """Posición abierta tal como quedó guardada (ver ``models.OpenPosition``)."""
+    """Posición abierta tal como quedó guardada (ver ``models.OpenPosition``).
+
+    ``risk_usd`` es el riesgo con el stop de ahora (lo que usan el límite del
+    día y la correlación); ``initial_risk_usd`` el previsto al abrir (``None``
+    en las posiciones de antes del esquema 4).
+    """
 
     id: int
     symbol: str
@@ -204,6 +224,12 @@ class StoredPosition:
     notes: str | None
     analysis_id: int | None
     created_at: datetime
+    initial_risk_usd: float | None = None
+
+    @property
+    def planned_risk_usd(self) -> float:
+        """El riesgo previsto al abrir (``initial_risk_usd`` o, si no está, ``risk_usd``)."""
+        return self.risk_usd if self.initial_risk_usd is None else self.initial_risk_usd
 
     def to_dict(self) -> dict[str, Any]:
         return json_safe(
@@ -214,6 +240,8 @@ class StoredPosition:
                 "opened_at": _iso(self.opened_at),
                 "entry_price": self.entry_price,
                 "risk_usd": self.risk_usd,
+                "initial_risk_usd": self.initial_risk_usd,
+                "planned_risk_usd": self.planned_risk_usd,
                 "notes": self.notes,
                 "analysis_id": self.analysis_id,
                 "created_at": _iso(self.created_at),
@@ -233,6 +261,7 @@ class StoredPosition:
             notes=row.notes,
             analysis_id=row.analysis_id,
             created_at=row.created_at,
+            initial_risk_usd=row.initial_risk_usd,
         )
 
 
@@ -729,12 +758,15 @@ class Repository:
         score_total: float | None = None,
         plan_status: str | None = None,
         profile_name: str | None = None,
+        initial_risk_usd: float | None = None,
     ) -> StoredTrade:
         """Guarda una operación cerrada.
 
         ``pnl_usd``: resultado neto realizado, comisiones incluidas (negativo =
         pérdida; 0 = empate). ``closed_at`` por defecto es ahora. Si viene
         ``analysis_id``, el contexto que falte se copia de ese análisis.
+        ``initial_risk_usd``: el riesgo previsto al abrir, si el stop se movió
+        (por defecto, el mismo ``risk_usd``).
         """
         with session_scope(self._engine) as session:
             row = self._build_trade(
@@ -755,6 +787,7 @@ class Repository:
                 score_total=score_total,
                 plan_status=plan_status,
                 profile_name=profile_name,
+                initial_risk_usd=initial_risk_usd,
             )
             session.add(row)
             session.flush()
@@ -785,13 +818,20 @@ class Repository:
             for key, value in ctx.items():
                 if value is None:
                     ctx[key] = getattr(record, key)
+        risk = _opt_non_negative(kw["risk_usd"], "El riesgo")
+        planned = _opt_non_negative(kw.get("initial_risk_usd"), "El riesgo previsto")
+        if kw.get("inherit_initial_risk"):
+            initial = planned  # de una posición: el previsto tal como estaba (o nada)
+        else:
+            initial = risk if planned is None else planned
         return ManualTrade(
             symbol=symbol,
             side=side,
             opened_at=opened_at,
             closed_at=closed_at,
             pnl_usd=pnl,
-            risk_usd=_opt_non_negative(kw["risk_usd"], "El riesgo"),
+            risk_usd=risk,
+            initial_risk_usd=initial,
             entry_price=_opt_positive(kw["entry_price"], "El precio de entrada"),
             exit_price=_opt_positive(kw["exit_price"], "El precio de salida"),
             notes=_notes(kw["notes"]),
@@ -865,17 +905,20 @@ class Repository:
         """Guarda una posición abierta. ``risk_usd``: USD que se pierden si toca el stop.
 
         ``risk_usd`` puede ser 0 (stop en la entrada: si salta, no se pierde
-        nada); negativo se rechaza. ``opened_at`` por defecto es ahora. Se
-        permiten varias posiciones en la misma moneda (la correlación suma sus
-        riesgos).
+        nada); negativo se rechaza. También queda como riesgo previsto
+        (``initial_risk_usd``), que no cambia al mover el stop. ``opened_at``
+        por defecto es ahora. Se permiten varias posiciones en la misma moneda
+        (la correlación suma sus riesgos).
         """
         sym = _symbol(symbol)
+        risk = _non_negative(risk_usd, "El riesgo")
         row = OpenPosition(
             symbol=sym,
             side=_side(side),
             opened_at=self._user_date(opened_at, "La fecha de apertura", default_now=True),
             entry_price=_opt_positive(entry_price, "El precio de entrada"),
-            risk_usd=_non_negative(risk_usd, "El riesgo"),
+            risk_usd=risk,
+            initial_risk_usd=risk,
             notes=_notes(notes),
             analysis_id=_opt_record_id(analysis_id, "El número de análisis"),
             created_at=self._now(),
@@ -909,11 +952,16 @@ class Repository:
         risk_usd: float | None = None,
         entry_price: float | None = None,
         note: str | None = None,
+        initial_risk_usd: float | None = None,
     ) -> StoredPosition:
         """Cambia el riesgo, el precio de entrada o la nota de una posición abierta.
 
         - ``risk_usd``: lo nuevo que se pierde si toca el stop (por ejemplo,
           después de mover el stop). 0 vale (stop en la entrada); negativo no.
+          El riesgo previsto al abrir (``initial_risk_usd``) **no** cambia: así
+          el informe del incidente puede decir si se agrandó o se movió el stop.
+        - ``initial_risk_usd``: corrige el riesgo previsto (por ejemplo, si se
+          tipeó mal al abrir). 0 vale; negativo no.
         - ``entry_price``: mayor a 0.
         - ``note``: reemplaza la nota; ``""`` (o solo espacios) la borra.
 
@@ -922,11 +970,12 @@ class Repository:
         quedó.
         """
         pid = _record_id(position_id, "El número de posición")
-        if risk_usd is None and entry_price is None and note is None:
+        if risk_usd is None and entry_price is None and note is None and initial_risk_usd is None:
             raise ValueError(
                 "No hay nada para cambiar: indicá el riesgo, el precio de entrada o la nota."
             )
         new_risk = _opt_non_negative(risk_usd, "El riesgo")
+        new_initial = _opt_non_negative(initial_risk_usd, "El riesgo previsto")
         new_entry = _opt_positive(entry_price, "El precio de entrada")
         new_note = None if note is None else _notes(note)
         with session_scope(self._engine) as session:
@@ -934,7 +983,12 @@ class Repository:
             if row is None:
                 raise ValueError(f"No existe la posición abierta {pid}.")
             if new_risk is not None:
+                if row.initial_risk_usd is None:
+                    # Posición de antes del esquema 4: el previsto era el que estaba.
+                    row.initial_risk_usd = row.risk_usd
                 row.risk_usd = new_risk
+            if new_initial is not None:
+                row.initial_risk_usd = new_initial
             if new_entry is not None:
                 row.entry_price = new_entry
             if note is not None:
@@ -970,8 +1024,10 @@ class Repository:
         """Cierra la posición y la guarda como operación, todo junto (o nada).
 
         La operación hereda moneda, dirección, apertura, precio de entrada,
-        riesgo, notas (si no se pasan otras) y ``analysis_id`` (con su
-        contexto). ``ValueError`` si la posición no existe.
+        riesgo (el del stop con el que cerró en ``risk_usd`` y el previsto al
+        abrir en ``initial_risk_usd``), notas (si no se pasan otras) y
+        ``analysis_id`` (con su contexto). ``ValueError`` si la posición no
+        existe.
         """
         pid = _record_id(position_id, "El número de posición")
         with session_scope(self._engine) as session:
@@ -986,6 +1042,8 @@ class Repository:
                 opened_at=pos.opened_at,
                 closed_at=closed_at,
                 risk_usd=pos.risk_usd,
+                initial_risk_usd=pos.initial_risk_usd,
+                inherit_initial_risk=True,
                 entry_price=pos.entry_price,
                 exit_price=exit_price,
                 notes=pos.notes if _notes(notes) is None else notes,

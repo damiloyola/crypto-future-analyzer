@@ -11,15 +11,21 @@ Breakers (una función pura cada uno, devuelve ``BreakerStatus``)
   × 0,5 hasta que termine el día.
 - ``daily_loss_block``: pérdida del día >= 100 % del límite diario → bloqueo
   hasta el día siguiente.
-- ``losing_streak``: 3 pérdidas seguidas → pausa de 4 h (enfriamiento); una
-  pérdida durante la pausa la estira (``extend_cooldown_on_loss``).
+- ``max_trades_today``: con el máximo de operaciones del día del perfil
+  alcanzado → bloqueo hasta las 00:00 (``max_trades_blocks_status``: el
+  estado queda en rojo, igual que lo que dice el plan).
+- ``losing_streak``: 3 pérdidas seguidas → pausa de 4 h (enfriamiento);
+  cualquier pérdida durante la pausa la estira (``extend_cooldown_on_loss``).
 - ``weekly_loss_reduce``: pérdida de la semana >= 60 % de la billetera mensual
   → riesgo × 0,5 hasta que termine la semana.
 - ``monthly_drawdown_lock``: la billetera del mes cae >= 70 % desde su máximo
   → bloqueo total con archivo LOCKED. Si el usuario ya borró el LOCKED y hay
   un bloqueo anotado en la base este mes (``restart_after_unlock``), la caída
   se mide desde el saldo del momento de ese bloqueo (``WalletState.restart``):
-  solo vuelve a bloquear con una caída nueva del tope desde ahí.
+  solo vuelve a bloquear con una caída nueva del tope desde ahí. Mientras
+  existe el LOCKED de un segundo bloqueo del mes, el freno muestra la caída
+  que lo disparó (medida desde el bloqueo anterior) y la del mes calendario
+  va aparte (``SafetyVerdict.drawdown_measure``).
 - ``volatility_event``: hay un evento de alta volatilidad activo → bloqueo
   hasta su hora de fin; si otro evento empieza antes de que termine (o justo
   a esa hora), el bloqueo sigue hasta el fin de la cadena.
@@ -52,11 +58,19 @@ Qué hay acá
     - ``trigger_lock_if_needed(verdict, state, settings, now, *, repo=None)``:
       **con I/O**. Si la caída del mes disparó el bloqueo y todavía no hay
       archivo LOCKED, escribe el informe del incidente
-      (``incident.write_incident_report``), después el LOCKED
-      (``lockfile.write_lock``), una sola vez, y anota el bloqueo en la base
-      (``repo.add_safety_lock``) para poder medir de nuevo la caída cuando el
-      usuario lo borre. Un error en el informe o en la base no impide el
-      LOCKED.
+      (``incident.write_incident_report``; si ya hay uno idéntico de un
+      intento anterior, lo reusa), después el LOCKED (``lockfile.write_lock``),
+      una sola vez, y anota el bloqueo en la base (``repo.add_safety_lock``)
+      para poder medir de nuevo la caída cuando el usuario lo borre. Un error
+      en el informe o en la base no impide el LOCKED; un error al escribir el
+      LOCKED se lanza como ``LockWriteError``.
+    - ``backfill_unrecorded_lock(repo, settings, now, ...)``: **con I/O**. Si
+      hay un LOCKED de este mes que no quedó anotado en la base (versión vieja
+      o falla de la base), lo anota con su fecha y sus números
+      (``monthly_drawdown_lock.backfill_unrecorded_lock``).
+    - ``run_safety_checks(repo, settings, profile, now, ...)``: **con I/O**. Lo
+      que hacen las consolas en cada corrida: anotar un LOCKED sin anotar,
+      cargar el estado, evaluar, bloquear si hace falta y volver a evaluar.
 
 Veredicto
     - ``rojo``: algún breaker bloquea (bloqueo, pausa, evento, LOCKED o la
@@ -90,7 +104,6 @@ from app.risk.rules import (
     fmt_multiplier,
     fmt_num,
     fmt_percent,
-    fmt_percent_beside,
     fmt_usd,
     json_safe,
 )
@@ -98,20 +111,26 @@ from app.safety.incident import (
     IncidentTrade,
     IncidentTrigger,
     analysis_test_marks,
+    find_identical_report,
     fmt_datetime,
-    shown_drawdown_pct,
+    fmt_drawdown_pct,
+    incident_fingerprint,
+    negative_balance_warning,
     write_incident_report,
 )
-from app.safety.lockfile import LockInfo, is_locked, read_lock, write_lock
+from app.safety.lockfile import LockInfo, LockWriteError, is_locked, read_lock, write_lock
 from app.safety.state import (
     DrawdownRestart,
     PositionRecord,
     ProfileLimits,
+    SafetyLockRecord,
     TradeRecord,
     TradingState,
     TradingStateSource,
     VolatilityEventRecord,
     WalletRecord,
+    load_trading_state,
+    period_bounds,
     resolve_user_timezone,
 )
 
@@ -123,6 +142,7 @@ LockTriggerAction = Literal["not_needed", "already_locked", "locked"]
 
 DAILY_LOSS_REDUCE = "daily_loss_reduce"
 DAILY_LOSS_BLOCK = "daily_loss_block"
+MAX_TRADES_TODAY = "max_trades_today"
 LOSING_STREAK = "losing_streak"
 WEEKLY_LOSS_REDUCE = "weekly_loss_reduce"
 MONTHLY_DRAWDOWN_LOCK = "monthly_drawdown_lock"
@@ -133,6 +153,7 @@ LOCK_FILE = "lock_file"
 BREAKER_CODES: tuple[str, ...] = (
     DAILY_LOSS_REDUCE,
     DAILY_LOSS_BLOCK,
+    MAX_TRADES_TODAY,
     LOSING_STREAK,
     WEEKLY_LOSS_REDUCE,
     MONTHLY_DRAWDOWN_LOCK,
@@ -264,6 +285,12 @@ class SafetyVerdict:
       usuario ya borró un LOCKED anotado este mes (``restart_after_unlock``),
       cuenta la caída medida desde ese bloqueo, no la del mes calendario.
     - ``lock``: lo que se leyó del archivo LOCKED.
+    - ``drawdown_measure``: la caída que miró el freno del mes (la del mes
+      calendario o la medida desde un desbloqueo), con la del mes calendario
+      aparte; ``drawdown_threshold_pct``: el tope.
+    - ``lock_recorded``: si el LOCKED de este mes (de la caída del mes) está
+      anotado en la base (``None`` si no hay LOCKED, no se puede leer, es de
+      otro mes o de otro freno). En ``False`` hay un aviso en ``warnings``.
     """
 
     status: VerdictStatus
@@ -280,6 +307,9 @@ class SafetyVerdict:
     warnings: tuple[str, ...]
     evaluated_at: datetime
     timezone: str
+    drawdown_measure: DrawdownMeasure | None = None
+    drawdown_threshold_pct: float | None = None
+    lock_recorded: bool | None = None
 
     def breaker(self, code: str) -> BreakerStatus:
         """El ``BreakerStatus`` con ese código (``KeyError`` si no existe)."""
@@ -305,6 +335,14 @@ class SafetyVerdict:
                 "warnings": list(self.warnings),
                 "evaluated_at": _iso(self.evaluated_at),
                 "timezone": self.timezone,
+                "drawdown_measure": (
+                    None
+                    if self.drawdown_measure is None
+                    else self.drawdown_measure.to_dict(
+                        threshold_pct=self.drawdown_threshold_pct, tz=self.timezone
+                    )
+                ),
+                "lock_recorded": self.lock_recorded,
             }
         )
 
@@ -564,7 +602,8 @@ def losing_streak_breaker(
     active = streak.cooldown_active(moment)
     # Durante la pausa se muestran las pérdidas que la dispararon, aunque después
     # haya una ganada (la pausa sigue igual: es por tiempo).
-    paused = max(count, required)
+    trigger_count = len(streak.cooldown_trigger_ids) or required
+    paused = max(count, trigger_count)
     until = streak.cooldown_until if active else None
     until_text = (
         until_phrase(streak.cooldown_until, moment, state.timezone)
@@ -573,23 +612,25 @@ def losing_streak_breaker(
     )
     losses_txt = _plural(count, "pérdida seguida", "pérdidas seguidas")
     if active:
-        last = fmt_datetime(streak.last_loss_at, state.timezone)
-        started = streak.cooldown_started_at
-        if (
-            not cfg.extend_cooldown_on_loss
-            and started is not None
-            and streak.last_loss_at is not None
-            and streak.last_loss_at > started
-        ):
-            # Perdió otra vez durante la pausa, pero la pausa no se estira.
-            when = f"la pausa empezó con la que cerró el {fmt_datetime(started, state.timezone)}"
-        else:
-            when = f"la última cerró el {last}"
+        # La racha que empezó la pausa (no la última pérdida: puede haber una
+        # ganada en el medio) y, aparte, la pérdida que la estiró.
+        started = fmt_datetime(streak.cooldown_started_at, state.timezone)
         message = (
-            f"Perdiste {_plural(paused, 'operación seguida', 'operaciones seguidas')} "
-            f"({when}): pausa de {hours_txt} para enfriar la cabeza. "
-            f"No se generan planes {until_text}."
+            f"Perdiste {_plural(trigger_count, 'operación seguida', 'operaciones seguidas')} "
+            f"(la última cerró el {started}): pausa de {hours_txt} para enfriar la cabeza."
         )
+        if streak.cooldown_extended_at is not None:
+            extended = fmt_datetime(streak.cooldown_extended_at, state.timezone)
+            message += (
+                f" Después volviste a perder durante la pausa (la operación que cerró el "
+                f"{extended}), así que la pausa se estiró {hours_txt} desde esa pérdida."
+            )
+        elif streak.losses_during_cooldown:
+            message += (
+                " Volviste a perder durante la pausa, pero la pausa termina igual a la hora "
+                "prevista."
+            )
+        message += f" No se generan planes {until_text}."
     elif count == 0:
         message = (
             f"No venís con pérdidas seguidas. Con {required} seguidas, la app hace una pausa "
@@ -649,6 +690,83 @@ def losing_streak_breaker(
             if active
             else f"{losses_txt} de {required}"
         ),
+    )
+
+
+def max_trades_today_breaker(
+    state: TradingState, profile: Any, settings: AppSettings, now: datetime
+) -> BreakerStatus:
+    """Operaciones de hoy >= ``max_trades_per_day`` del perfil → no hay planes hasta las 00:00.
+
+    Con ``circuit_breakers.max_trades_blocks_status`` en ``false`` no salta
+    (el límite lo sigue aplicando la regla de límites del día del plan) y solo
+    informa cuántas van.
+    """
+    prof = _profile(profile)
+    moment = _aware_utc(now, "La hora")
+    enabled = settings.circuit_breakers.max_trades_blocks_status
+    cap = prof.max_trades_per_day
+    done = int(state.trades_today)
+    day_end = state.periods.day_end
+    reached = cap is not None and done >= cap
+    triggered = bool(enabled and reached)
+    until = day_end if triggered else None
+    until_text = until_phrase(day_end, moment, state.timezone) if triggered else None
+    ops = _plural(done, "operación", "operaciones")
+    if cap is None:
+        message = f"Hoy hiciste {ops}. Tu perfil no tiene un máximo de operaciones por día."
+        summary = f"{ops} hoy"
+        threshold_text = "sin máximo"
+    else:
+        threshold_text = _plural(cap, "operación", "operaciones")
+        if cap == 0:
+            done_txt = "tu perfil no permite operaciones (máximo 0 por día)"
+        elif done > cap:
+            done_txt = f"ya hiciste {ops} hoy y el máximo es {cap}"
+        else:
+            done_txt = f"ya hiciste {done} de {cap} operaciones permitidas hoy"
+        if triggered:
+            message = (
+                f"{done_txt[:1].upper()}{done_txt[1:]}: no se generan planes {until_text}. "
+                "Mañana arrancás de cero."
+            )
+            summary = done_txt
+        elif reached:
+            message = (
+                f'{done_txt[:1].upper()}{done_txt[1:]}. El plan dice "No operar" hasta mañana.'
+            )
+            summary = done_txt
+        else:
+            left = cap - done
+            message = f"Hoy hiciste {done} de {cap} operaciones permitidas."
+            if left == 1:
+                message += " Con una más llegás al máximo y no hay más planes hasta mañana."
+            summary = f"{done} de {cap} operaciones hoy"
+    return BreakerStatus(
+        code=MAX_TRADES_TODAY,
+        label="Operaciones del día: máximo",
+        description=(
+            "Si llegás al máximo de operaciones por día de tu perfil"
+            + ("" if cap is None else f" ({threshold_text})")
+            + ", no se generan planes hasta el día siguiente (a las 00:00). Cuentan las "
+            "operaciones que abriste hoy, cerradas o abiertas."
+        ),
+        kind="block",
+        threshold=None if cap is None else float(cap),
+        current=float(done),
+        unit="operaciones",
+        threshold_text=threshold_text,
+        # "3 de 3 operaciones" en la fila de la consola (valor "de" umbral).
+        current_text=ops if cap is None else str(done),
+        progress=1.0 if reached else (0.0 if not cap else _progress(done, cap)),
+        triggered=triggered,
+        action="block" if triggered else "none",
+        risk_multiplier=1.0,
+        until=until,
+        until_text=until_text,
+        resets_at=day_end,
+        message=message,
+        summary=summary,
     )
 
 
@@ -725,32 +843,139 @@ def _short_datetime(dt: datetime, tz: str | tzinfo) -> str:
     return f"{dt.astimezone(resolve_user_timezone(tz)):%d/%m %H:%M}"
 
 
-@dataclass(frozen=True)
-class _MonthMeasure:
-    """La caída que mira el freno del mes: la del mes calendario o la medida desde el bloqueo."""
+MEASURE_MONTH = "month"
+MEASURE_SINCE_UNLOCK = "since_unlock"
 
+
+@dataclass(frozen=True)
+class DrawdownMeasure:
+    """La caída que mira el freno del mes, con la del mes calendario aparte.
+
+    - ``basis``: ``"month"`` (desde el máximo del mes calendario) o
+      ``"since_unlock"`` (desde el saldo de un bloqueo que el usuario ya
+      desbloqueó: ``restart``).
+    - ``peak_usd`` / ``balance_usd`` / ``drawdown_usd`` / ``drawdown_pct``: los
+      números de esa medida (``drawdown_pct`` sin recortar).
+    - ``while_locked``: la medida se eligió con el LOCKED puesto (es la que
+      disparó el bloqueo vigente).
+    - ``month_*``: los del mes calendario, siempre (para mostrarlos como dato
+      aparte cuando la medida es desde un desbloqueo).
+    """
+
+    basis: str
     peak_usd: float
     balance_usd: float
     drawdown_usd: float
     drawdown_pct: float
+    month_peak_usd: float
+    month_drawdown_usd: float
+    month_drawdown_pct: float
     restart: DrawdownRestart | None = None
+    while_locked: bool = False
+
+    @property
+    def since_unlock(self) -> bool:
+        return self.basis == MEASURE_SINCE_UNLOCK
+
+    @property
+    def negative_balance(self) -> bool:
+        """El saldo calculado da negativo: la caída pasa el 100 % (dato mal cargado)."""
+        return round(self.balance_usd, 2) < 0
+
+    def drawdown_text(self, threshold_pct: float | None = None) -> str:
+        """``"73,33 %"`` o ``"más del 100 %"`` (``incident.fmt_drawdown_pct``)."""
+        return fmt_drawdown_pct(self.drawdown_pct, threshold_pct)
+
+    def to_dict(self, *, threshold_pct: float | None = None, tz: Any = None) -> dict[str, Any]:
+        r = self.restart
+        return json_safe(
+            {
+                "basis": self.basis,
+                "since_unlock": self.since_unlock,
+                "while_locked": self.while_locked,
+                "peak_usd": self.peak_usd,
+                "balance_usd": self.balance_usd,
+                "drawdown_usd": self.drawdown_usd,
+                "drawdown_pct": self.drawdown_pct,
+                "drawdown_text": self.drawdown_text(threshold_pct),
+                "negative_balance": self.negative_balance,
+                "negative_balance_warning": negative_balance_warning(
+                    self.balance_usd, self.drawdown_pct
+                ),
+                "measured_since": None if r is None else _iso(r.locked_at),
+                "measured_since_text": (
+                    None if r is None or tz is None else _short_datetime(r.locked_at, tz)
+                ),
+                "lock_id": None if r is None else r.lock_id,
+                "start_balance_usd": None if r is None else r.start_balance_usd,
+                "month": {
+                    "peak_usd": self.month_peak_usd,
+                    "balance_usd": self.balance_usd,
+                    "drawdown_usd": self.month_drawdown_usd,
+                    "drawdown_pct": self.month_drawdown_pct,
+                    "drawdown_text": fmt_drawdown_pct(self.month_drawdown_pct, threshold_pct),
+                },
+            }
+        )
 
 
-def _month_measure(state: TradingState, settings: AppSettings, *, locked: bool) -> _MonthMeasure:
-    """Qué caída mira el freno del mes.
+def month_drawdown_measure(
+    state: TradingState,
+    settings: AppSettings,
+    *,
+    locked: bool,
+    lock: LockInfo | None = None,
+) -> DrawdownMeasure:
+    """Qué caída mira el freno del mes (pura).
 
-    Si el usuario ya borró el LOCKED (``locked=False``), está prendido
-    ``restart_after_unlock`` y hay un bloqueo anotado este mes, la medida
-    desde ese bloqueo (``wallet.restart``). Si no, la del mes calendario.
+    - Sin LOCKED (``locked=False``), con ``restart_after_unlock`` y un bloqueo
+      anotado este mes: la medida desde el último bloqueo (``wallet.restart``).
+    - Con el LOCKED puesto: la medida con la que se escribió ese LOCKED. Si
+      antes de él (``lock.triggered_at``) hubo otro bloqueo este mes que el
+      usuario desbloqueó, la medida desde ese bloqueo anterior; si no (o si el
+      LOCKED no se puede leer), la del mes calendario.
+    - Si no, la del mes calendario.
     """
     w = state.wallet
     cfg = settings.circuit_breakers.monthly_drawdown_lock
-    r = w.restart if cfg.restart_after_unlock and not locked else None
+    r: DrawdownRestart | None = None
+    if cfg.restart_after_unlock:
+        if not locked:
+            r = w.restart
+        elif lock is not None and lock.readable and lock.triggered_at is not None:
+            r = w.restart_before(lock.triggered_at)
+    month = {
+        "month_peak_usd": w.month_peak_usd,
+        "month_drawdown_usd": w.drawdown_usd,
+        "month_drawdown_pct": w.drawdown_pct,
+    }
     if r is not None:
-        return _MonthMeasure(
-            r.peak_usd, r.current_balance_usd, r.drawdown_usd, r.drawdown_pct, restart=r
+        return DrawdownMeasure(
+            MEASURE_SINCE_UNLOCK,
+            r.peak_usd,
+            r.current_balance_usd,
+            r.drawdown_usd,
+            r.drawdown_pct,
+            restart=r,
+            while_locked=locked,
+            **month,
         )
-    return _MonthMeasure(w.month_peak_usd, w.current_balance_usd, w.drawdown_usd, w.drawdown_pct)
+    return DrawdownMeasure(
+        MEASURE_MONTH,
+        w.month_peak_usd,
+        w.current_balance_usd,
+        w.drawdown_usd,
+        w.drawdown_pct,
+        while_locked=locked,
+        **month,
+    )
+
+
+def _month_measure(
+    state: TradingState, settings: AppSettings, *, locked: bool, lock: LockInfo | None = None
+) -> DrawdownMeasure:
+    """Alias interno de ``month_drawdown_measure`` (lo usan los tests viejos)."""
+    return month_drawdown_measure(state, settings, locked=locked, lock=lock)
 
 
 def _wallet_rules_text(settings: AppSettings) -> str:
@@ -762,6 +987,16 @@ def _wallet_rules_text(settings: AppSettings) -> str:
         if cfg.deposit_raises_peak
         else "Un depósito sube el saldo; el máximo sube solo si el saldo lo pasa."
     )
+    if cfg.deposit_refills_withdrawals:
+        rest = (
+            "lo que pase de eso sube el máximo en lo mismo (la pérdida de antes sigue contando)."
+            if cfg.deposit_raises_peak
+            else "lo que pase de eso sube el saldo, y el máximo sube solo si el saldo lo pasa."
+        )
+        deposit = (
+            "Un depósito primero devuelve lo que retiraste en el mes, sin cambiar el % de caída "
+            f"(retirar y volver a depositar no borra la caída); {rest}"
+        )
     withdrawal = {
         "proportional": (
             "Un retiro baja el máximo en la misma proporción que el saldo: sacar plata no cambia "
@@ -787,24 +1022,27 @@ def monthly_drawdown_lock_breaker(
     now: datetime,
     *,
     locked: bool = False,
+    lock: LockInfo | None = None,
 ) -> BreakerStatus:
     """Billetera del mes cae >= ``pct_from_peak`` % desde su máximo → bloqueo total (LOCKED).
 
-    ``locked``: si existe el archivo LOCKED. Sin LOCKED, con
-    ``restart_after_unlock`` y un bloqueo anotado este mes, la caída se mide
-    desde el saldo del momento de ese bloqueo (ver ``_month_measure``).
+    ``locked``: si existe el archivo LOCKED (``lock``: lo que se leyó de él).
+    Sin LOCKED, con ``restart_after_unlock`` y un bloqueo anotado este mes, la
+    caída se mide desde el saldo del momento de ese bloqueo; con el LOCKED de
+    un segundo bloqueo, desde el bloqueo anterior (ver
+    ``month_drawdown_measure``).
     """
     cfg = settings.circuit_breakers.monthly_drawdown_lock
     _aware_utc(now, "La hora")
     w = state.wallet
     tz = state.timezone
-    m = _month_measure(state, settings, locked=locked)
+    m = month_drawdown_measure(state, settings, locked=locked, lock=lock)
     threshold = float(cfg.pct_from_peak)
     current = m.drawdown_pct
     triggered = _reached(current, threshold)
-    # Los textos muestran la caída hasta 100 % (más solo pasa con el saldo
-    # calculado negativo, que ya tiene su aviso); ``current`` queda sin recortar.
-    dd_txt = fmt_percent_beside(shown_drawdown_pct(current), threshold)
+    # Más de 100 % solo pasa con el saldo calculado negativo: el texto dice
+    # "más del 100 %" y pide revisar los datos; ``current`` queda sin recortar.
+    dd_txt = m.drawdown_text(threshold)
     top = fmt_percent(threshold)
     trip = f"{fmt_usd(m.peak_usd)} → {fmt_usd(m.balance_usd)}"
     assumed = (
@@ -813,13 +1051,25 @@ def monthly_drawdown_lock_breaker(
         if w.assumed
         else ""
     )
+    negative = negative_balance_warning(m.balance_usd, m.drawdown_pct)
+    if negative is not None:
+        assumed += f" {negative}"
     r = m.restart
     if r is not None:
         since = _short_datetime(r.locked_at, tz)
+        unlocked_word = "que desbloqueaste" if m.while_locked else "que ya desbloqueaste"
         after_unlock = (
-            f"Después del bloqueo del {since} (que ya desbloqueaste), la caída se mide de nuevo "
+            f"Después del bloqueo del {since} ({unlocked_word}), la caída se mide de nuevo "
             f"desde el saldo de ese momento ({fmt_usd(r.start_balance_usd)})"
         )
+        month_txt = ""
+        if round(m.month_drawdown_pct, 2) != round(current, 2):
+            month_txt = (
+                f" En todo el mes la caída es {fmt_drawdown_pct(m.month_drawdown_pct)} "
+                f"({fmt_usd(m.month_peak_usd)} → {fmt_usd(m.balance_usd)}), pero esa cifra ya no "
+                "cuenta para el bloqueo."
+            )
+        assumed = month_txt + assumed
         if triggered:
             message = (
                 f"{after_unlock} y tu billetera volvió a caer {dd_txt} desde su máximo ({trip}); "
@@ -1039,7 +1289,11 @@ def _headline(
         # Primero el bloqueo total (es el que más dura), después el resto en orden.
         ordered = sorted(blocking, key=lambda b: 0 if b.kind == "lock" else 1)
         first = ordered[0]
-        more = len(ordered) - 1
+        rest = ordered[1:]
+        if first.code == MONTHLY_DRAWDOWN_LOCK:
+            # El archivo LOCKED es el mismo bloqueo, no otro freno.
+            rest = [b for b in rest if b.code != LOCK_FILE]
+        more = len(rest)
         tail = "" if more == 0 else f" (y {more} {'freno' if more == 1 else 'frenos'} más)"
         if first.kind == "lock":
             return (
@@ -1081,11 +1335,14 @@ def evaluate_breakers(
     - ``lock_path``: dónde buscar el LOCKED (por defecto ``app.lock_file``).
     - ``lock``: un ``LockInfo`` ya leído; si viene, no se lee el disco.
 
-    Mientras exista el LOCKED, el freno del mes mira la caída del mes
-    calendario (y el del archivo bloquea). Sin LOCKED, si hay un bloqueo
-    anotado este mes y ``restart_after_unlock`` está prendido, mira la caída
-    medida desde ese bloqueo. Los próximos eventos de alta volatilidad se
-    avisan en ``warnings`` aunque ya haya uno activo.
+    Mientras exista el LOCKED, el freno del mes mira la caída con la que se
+    escribió (la del mes calendario o, si antes hubo otro bloqueo este mes que
+    el usuario desbloqueó, la medida desde ese bloqueo) y el del archivo
+    bloquea. Sin LOCKED, si hay un bloqueo anotado este mes y
+    ``restart_after_unlock`` está prendido, mira la caída medida desde ese
+    bloqueo. Los próximos eventos de alta volatilidad se avisan en
+    ``warnings`` aunque ya haya uno activo, y también un LOCKED de este mes
+    que no está anotado en la base.
     """
     moment = _aware_utc(now, "La hora")
     if not state.periods.contains_day(moment):
@@ -1100,9 +1357,12 @@ def evaluate_breakers(
     breakers = (
         daily_loss_reduce_breaker(state, profile, settings, moment),
         daily_loss_block_breaker(state, profile, settings, moment),
+        max_trades_today_breaker(state, profile, settings, moment),
         losing_streak_breaker(state, profile, settings, moment),
         weekly_loss_reduce_breaker(state, profile, settings, moment),
-        monthly_drawdown_lock_breaker(state, profile, settings, moment, locked=lock.exists),
+        monthly_drawdown_lock_breaker(
+            state, profile, settings, moment, locked=lock.exists, lock=lock
+        ),
         volatility_event_breaker(state, profile, settings, moment),
         lock_file_breaker(lock, tz=tz),
     )
@@ -1135,6 +1395,10 @@ def evaluate_breakers(
             "El archivo LOCKED existe pero no se pudo leer (¿se editó a mano?): la app sigue "
             "bloqueada igual."
         )
+    recorded = lock_is_recorded(lock, state)
+    if recorded is False:
+        warnings.append(unrecorded_lock_warning(lock, tz))
+    measure = month_drawdown_measure(state, settings, locked=lock.exists, lock=lock)
     return SafetyVerdict(
         status=status,
         headline=_headline(status, blocking, reducing, multiplier),
@@ -1150,6 +1414,66 @@ def evaluate_breakers(
         warnings=tuple(warnings),
         evaluated_at=moment,
         timezone=tz,
+        drawdown_measure=measure,
+        drawdown_threshold_pct=float(settings.circuit_breakers.monthly_drawdown_lock.pct_from_peak),
+        lock_recorded=recorded,
+    )
+
+
+#: Diferencia que se tolera entre la hora del LOCKED y la del bloqueo anotado.
+_LOCK_MATCH_SECONDS = 1.0
+
+
+def _month_lock_of(lock: LockInfo, month_start: datetime, month_end: datetime) -> bool:
+    """El LOCKED es de la caída del mes y de este mes (se puede anotar en la base)."""
+    return (
+        lock.exists
+        and lock.readable
+        and lock.trigger_code == MONTHLY_DRAWDOWN_LOCK
+        and lock.triggered_at is not None
+        and month_start <= lock.triggered_at < month_end
+    )
+
+
+def _same_lock(when: datetime, records: Sequence[Any]) -> bool:
+    for record in records:
+        at = getattr(record, "triggered_at", None)
+        if at is None and isinstance(record, dict):
+            at = record.get("triggered_at")
+        if (
+            isinstance(at, datetime)
+            and at.tzinfo is not None
+            and abs((at - when).total_seconds()) <= _LOCK_MATCH_SECONDS
+        ):
+            return True
+    return False
+
+
+def lock_is_recorded(lock: LockInfo, state: TradingState) -> bool | None:
+    """Si el LOCKED de este mes está anotado en la base (pura, con ``state.month_locks``).
+
+    ``None`` si no hay LOCKED, si no se puede leer, si es de otro freno o de
+    otro mes (no hay nada que anotar).
+    """
+    p = state.periods
+    if not _month_lock_of(lock, p.month_start, p.month_end):
+        return None
+    assert lock.triggered_at is not None
+    if lock.triggered_at >= state.now - timedelta(seconds=_LOCK_MATCH_SECONDS):
+        # Escrito en esta misma corrida (o "en el futuro"): el estado se leyó
+        # antes de anotarlo, no se puede saber todavía.
+        return None
+    return _same_lock(lock.triggered_at, state.month_locks)
+
+
+def unrecorded_lock_warning(lock: LockInfo, tz: str | tzinfo | None) -> str:
+    """El aviso de un LOCKED de este mes que no está anotado en la base."""
+    when = "" if lock.triggered_at is None else f" del {fmt_datetime(lock.triggered_at, tz)}"
+    return (
+        f"El bloqueo{when} no está anotado en la base (no se pudo anotar). Si borrás el LOCKED "
+        "así, la caída se va a medir desde el máximo del mes y la app puede volver a "
+        "bloquearse enseguida. La app lo intenta anotar sola en cada corrida; si el aviso "
+        "sigue, revisá que la base no esté abierta en otro programa."
     )
 
 
@@ -1171,6 +1495,11 @@ class LockTriggerResult:
       si no se anotó: sin ``repo`` o porque falló).
     - ``db_error``: qué falló con la base (releer los datos del informe o
       anotar el bloqueo). El LOCKED queda escrito igual.
+    - ``report_reused``: ``True`` si no se escribió un informe nuevo porque ya
+      había uno idéntico (mismo mes, misma medida y mismos datos) de un
+      intento anterior, por ejemplo uno en el que no se pudo escribir el LOCKED.
+    - ``backfill``: si había un LOCKED de este mes sin anotar en la base, qué
+      pasó al anotarlo (``backfill_unrecorded_lock``).
     """
 
     action: LockTriggerAction
@@ -1180,6 +1509,8 @@ class LockTriggerResult:
     lock: LockInfo | None = None
     lock_record_id: int | None = None
     db_error: str | None = None
+    report_reused: bool = False
+    backfill: LockBackfillResult | None = None
 
     @property
     def created(self) -> bool:
@@ -1196,16 +1527,132 @@ class LockTriggerResult:
                 "lock": None if self.lock is None else self.lock.to_dict(tz=tz),
                 "lock_record_id": self.lock_record_id,
                 "db_error": self.db_error,
+                "report_reused": self.report_reused,
+                "backfill": None if self.backfill is None else self.backfill.to_dict(),
             }
         )
 
 
-def _lock_reason(state: TradingState, settings: AppSettings, measure: _MonthMeasure) -> str:
+LockBackfillAction = Literal["disabled", "not_applicable", "already_recorded", "recorded", "failed"]
+
+
+@dataclass(frozen=True)
+class LockBackfillResult:
+    """Qué hizo ``backfill_unrecorded_lock``.
+
+    - ``action``: ``"disabled"`` (``backfill_unrecorded_lock`` apagado),
+      ``"not_applicable"`` (no hay LOCKED de la caída de este mes, no se puede
+      leer, o la base no sabe anotar bloqueos), ``"already_recorded"`` (ya
+      estaba anotado), ``"recorded"`` (se anotó ahora) o ``"failed"`` (la base
+      falló: ``db_error``; se vuelve a intentar en la próxima corrida).
+    - ``message``: qué pasó, en castellano simple (``""`` si no hay nada que
+      contar).
+    - ``lock_record_id``: el número del bloqueo anotado ahora.
+    """
+
+    action: LockBackfillAction
+    message: str = ""
+    lock_record_id: int | None = None
+    db_error: str | None = None
+
+    @property
+    def recorded(self) -> bool:
+        return self.action == "recorded"
+
+    def to_dict(self) -> dict[str, Any]:
+        return json_safe(
+            {
+                "action": self.action,
+                "recorded": self.recorded,
+                "message": self.message,
+                "lock_record_id": self.lock_record_id,
+                "db_error": self.db_error,
+            }
+        )
+
+
+def backfill_unrecorded_lock(
+    repo: Any,
+    settings: AppSettings,
+    now: datetime,
+    *,
+    lock_path: Path | str | None = None,
+    lock: LockInfo | None = None,
+) -> LockBackfillResult:
+    """Anota en la base un LOCKED de este mes que no quedó anotado (**con I/O**).
+
+    Pasa cuando el LOCKED lo escribió una versión vieja de la app o cuando la
+    base falló justo al anotarlo. Si existe un LOCKED que se puede leer, de la
+    caída del mes (``trigger_code`` ``monthly_drawdown_lock``), con fecha de
+    este mes (y no en el futuro), y la base no tiene un bloqueo con esa fecha
+    (±1 segundo), lo anota con la fecha y los números del LOCKED (si los
+    tiene). Así, cuando el usuario lo borre, la caída se vuelve a medir desde
+    ese momento (``restart_after_unlock``) en vez de volver a bloquearse.
+
+    ``monthly_drawdown_lock.backfill_unrecorded_lock`` en ``false`` → no hace
+    nada. Nunca lanza por la base: un error queda en ``db_error`` (y el
+    veredicto lo sigue avisando en cada corrida, ver ``lock_is_recorded``).
+    """
+    moment = _aware_utc(now, "La hora")
+    cb = settings.circuit_breakers
+    if not cb.monthly_drawdown_lock.backfill_unrecorded_lock:
+        return LockBackfillResult(action="disabled")
+    path = Path(default_lock_path(settings) if lock_path is None else lock_path)
+    info = read_lock(path) if lock is None else lock
+    periods = period_bounds(moment, settings.app.user_timezone, cb.week_starts_on)
+    add = getattr(repo, "add_safety_lock", None)
+    listing = getattr(repo, "list_safety_locks", None)
+    if (
+        not _month_lock_of(info, periods.month_start, periods.month_end)
+        or not callable(add)
+        or not callable(listing)
+    ):
+        return LockBackfillResult(action="not_applicable")
+    when = info.triggered_at
+    assert when is not None
+    if when > moment:
+        return LockBackfillResult(action="not_applicable")
+    tz = settings.app.user_timezone
+    when_txt = fmt_datetime(when, tz)
+    try:
+        records = [SafetyLockRecord.from_value(x) for x in listing()]
+        if _same_lock(when, records):
+            return LockBackfillResult(action="already_recorded")
+        stored = add(
+            triggered_at=when,
+            trigger_code=MONTHLY_DRAWDOWN_LOCK,
+            drawdown_pct=info.drawdown_pct,
+            peak_usd=info.peak_usd,
+            balance_usd=info.balance_usd,
+            report_path=info.report_path,
+            lock_path=path,
+        )
+    except Exception as exc:
+        logger.warning("No se pudo anotar en la base el LOCKED sin anotar.", exc_info=True)
+        return LockBackfillResult(
+            action="failed",
+            message=(
+                f"No se pudo anotar en la base el bloqueo del {when_txt} "
+                f"({_error_text(exc)}). La app lo vuelve a intentar en la próxima corrida."
+            ),
+            db_error=_error_text(exc),
+        )
+    return LockBackfillResult(
+        action="recorded",
+        message=(
+            f"El bloqueo del {when_txt} no estaba anotado en la base: se anotó ahora con su "
+            "fecha. Cuando borres el LOCKED, la caída se va a medir desde el saldo de ese momento."
+        ),
+        lock_record_id=_record_id(stored),
+    )
+
+
+def _lock_reason(state: TradingState, settings: AppSettings, measure: DrawdownMeasure) -> str:
     """Motivo corto del bloqueo total (va en el informe y en el archivo LOCKED)."""
     w = state.wallet
     top = float(settings.circuit_breakers.monthly_drawdown_lock.pct_from_peak)
     trip = f"({fmt_usd(measure.peak_usd)} → {fmt_usd(measure.balance_usd)})"
-    dd = fmt_percent_beside(shown_drawdown_pct(measure.drawdown_pct), top)
+    dd = measure.drawdown_text(top)
     if measure.restart is not None:
         since = _short_datetime(measure.restart.locked_at, state.timezone)
         text = (
@@ -1221,10 +1668,13 @@ def _lock_reason(state: TradingState, settings: AppSettings, measure: _MonthMeas
             f" El saldo es supuesto: nunca se anotó, así que se tomó "
             f"{fmt_usd(w.assumed_start_usd or 0.0)} al empezar el mes."
         )
+    negative = negative_balance_warning(measure.balance_usd, measure.drawdown_pct)
+    if negative is not None:
+        text += f" {negative}"
     return text
 
 
-def _safe_lock_reason(state: TradingState, settings: AppSettings, measure: _MonthMeasure) -> str:
+def _safe_lock_reason(state: TradingState, settings: AppSettings, measure: DrawdownMeasure) -> str:
     """``_lock_reason`` que nunca falla: el LOCKED se escribe aunque el texto no se pueda armar."""
     try:
         return _lock_reason(state, settings, measure)
@@ -1323,18 +1773,25 @@ def trigger_lock_if_needed(
 ) -> LockTriggerResult:
     """Escribe el informe del incidente y el LOCKED si la caída del mes lo pide (una sola vez).
 
-    - Si ``verdict.needs_lock`` es ``False``: no hace nada (``"not_needed"``).
+    - Si ``verdict.needs_lock`` es ``False``: no escribe nada
+      (``"not_needed"``).
     - Si ya existe el LOCKED (lo escribió otra corrida, o el usuario no lo
       borró): no escribe nada (``"already_locked"``).
+    - En los dos casos, con ``repo``, si el LOCKED de este mes no está anotado
+      en la base, lo anota (``backfill_unrecorded_lock``; queda en
+      ``backfill``).
     - Si no: primero el informe (``incident.write_incident_report`` en
       ``app.incident_dir``, con las operaciones del mes, los movimientos de la
       billetera, las posiciones abiertas y los números del disparo) y después
       el LOCKED (``lockfile.write_lock`` en ``app.lock_file``), que apunta al
       informe. Si el informe falla por **cualquier** motivo (disco lleno, un
       dato raro, un error del armado), el LOCKED se escribe igual y
-      ``report_error`` dice qué pasó. Solo un error al escribir el LOCKED se
-      propaga: quien llama tiene que enterarse de que el bloqueo no quedó
-      escrito.
+      ``report_error`` dice qué pasó. Si ya hay un informe idéntico de un
+      intento anterior (misma huella: mismo mes, misma medida y mismos datos),
+      se reusa en vez de escribir otro (``report_reused``). Solo un error al
+      escribir el LOCKED se propaga, como ``LockWriteError`` (un ``OSError``
+      con un mensaje claro): quien llama tiene que enterarse de que el bloqueo
+      no quedó escrito. El próximo intento reusa el informe.
     - Escrito el LOCKED, si ``repo`` sabe anotar bloqueos
       (``add_safety_lock``), lo anota en la base con los números del disparo:
       con eso, cuando el usuario borre el LOCKED, la caída se mide de nuevo
@@ -1354,14 +1811,29 @@ def trigger_lock_if_needed(
     tz = state.timezone
     path = Path(default_lock_path(settings) if lock_path is None else lock_path)
     if not verdict.needs_lock:
+        backfill = (
+            None
+            if repo is None
+            else backfill_unrecorded_lock(repo, settings, moment, lock_path=path)
+        )
         return LockTriggerResult(
-            action="not_needed", message="No hace falta bloquear la app.", lock=None
+            action="not_needed",
+            message="No hace falta bloquear la app.",
+            lock=None,
+            backfill=backfill,
         )
     if is_locked(path):
+        current = read_lock(path)
+        backfill = (
+            None
+            if repo is None
+            else backfill_unrecorded_lock(repo, settings, moment, lock_path=path, lock=current)
+        )
         return LockTriggerResult(
             action="already_locked",
             message="La app ya estaba bloqueada: no se escribió nada nuevo.",
-            lock=read_lock(path),
+            lock=current,
+            backfill=backfill,
         )
 
     db_errors: list[str] = []
@@ -1397,13 +1869,15 @@ def trigger_lock_if_needed(
         else:
             trades, wallet_events, positions = fresh_trades, tuple(fresh_events), fresh_positions
 
-    measure = _month_measure(state, settings, locked=False)
+    measure = month_drawdown_measure(state, settings, locked=False)
     reason = _safe_lock_reason(state, settings, measure)
+    since = None if measure.restart is None else measure.restart.locked_at
     folder = (
         settings.resolve_path(settings.app.incident_dir) if incident_dir is None else incident_dir
     )
     report_path: Path | None = None
     report_error: str | None = None
+    reused = False
     try:
         trigger = IncidentTrigger(
             code=MONTHLY_DRAWDOWN_LOCK,
@@ -1412,21 +1886,27 @@ def trigger_lock_if_needed(
             current_balance_usd=measure.balance_usd,
             drawdown_pct=measure.drawdown_pct,
             threshold_pct=float(settings.circuit_breakers.monthly_drawdown_lock.pct_from_peak),
-            measured_since=None if measure.restart is None else measure.restart.locked_at,
+            measured_since=since,
         )
-        report_path = write_incident_report(
-            folder,
-            triggered_at=moment,
-            trigger=trigger,
-            trades=trades,
-            wallet_events=wallet_events,
-            open_positions=positions,
-            profile=state.profile,
-            settings_info=_report_settings_info(state, settings),
-            losing_streak=settings.circuit_breakers.losing_streak.consecutive_losses,
-            lock_path=path,
-            tz=tz,
-        )
+        report_args: dict[str, Any] = {
+            "triggered_at": moment,
+            "trigger": trigger,
+            "trades": trades,
+            "wallet_events": wallet_events,
+            "open_positions": positions,
+            "profile": state.profile,
+            "settings_info": _report_settings_info(state, settings),
+            "losing_streak": settings.circuit_breakers.losing_streak.consecutive_losses,
+            "lock_path": path,
+            "tz": tz,
+        }
+        # Un intento anterior con los mismos datos (por ejemplo, uno en el que
+        # no se pudo escribir el LOCKED) ya dejó este informe: no se repite.
+        existing = find_identical_report(folder, incident_fingerprint(**report_args))
+        if existing is not None:
+            report_path, reused = existing, True
+        else:
+            report_path = write_incident_report(folder, **report_args)
     except OSError as exc:
         logger.warning("No se pudo escribir el informe del incidente.", exc_info=True)
         report_error = f"No se pudo escribir el informe del incidente: {exc}"
@@ -1436,14 +1916,23 @@ def trigger_lock_if_needed(
             "No se pudo escribir el informe del incidente por un error inesperado "
             f"({_error_text(exc)}). La app quedó bloqueada igual."
         )
-    written = write_lock(
-        path,
-        reason=reason,
-        triggered_at=moment,
-        report_path=report_path,
-        trigger_code=MONTHLY_DRAWDOWN_LOCK,
-        tz=tz,
-    )
+    try:
+        written = write_lock(
+            path,
+            reason=reason,
+            triggered_at=moment,
+            report_path=report_path,
+            trigger_code=MONTHLY_DRAWDOWN_LOCK,
+            tz=tz,
+            drawdown_pct=measure.drawdown_pct,
+            peak_usd=measure.peak_usd,
+            balance_usd=measure.balance_usd,
+            measured_since=since,
+        )
+    except LockWriteError:
+        raise
+    except OSError as exc:
+        raise LockWriteError(path, exc, report_path=report_path) from exc
     if not written.created:
         return LockTriggerResult(
             action="already_locked",
@@ -1455,6 +1944,7 @@ def trigger_lock_if_needed(
             report_error=report_error,
             lock=written.lock,
             db_error=" ".join(db_errors) or None,
+            report_reused=reused,
         )
 
     lock_record_id: int | None = None
@@ -1474,8 +1964,9 @@ def trigger_lock_if_needed(
             logger.warning("No se pudo anotar el bloqueo total en la base.", exc_info=True)
             db_errors.append(
                 f"No se pudo anotar el bloqueo en la base ({_error_text(exc)}). El archivo "
-                "LOCKED quedó escrito igual. Ojo: si lo borrás, la caída se va a medir desde el "
-                "máximo del mes y la app puede volver a bloquearse enseguida."
+                "LOCKED quedó escrito igual y la app lo intenta anotar sola en las próximas "
+                "corridas. Ojo: mientras no quede anotado, si lo borrás, la caída se va a medir "
+                "desde el máximo del mes y la app puede volver a bloquearse enseguida."
             )
         else:
             lock_record_id = _record_id(stored)
@@ -1491,7 +1982,81 @@ def trigger_lock_if_needed(
         lock=written.lock,
         lock_record_id=lock_record_id,
         db_error=" ".join(db_errors) or None,
+        report_reused=reused,
     )
+
+
+# --- corrida completa (I/O) --------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SafetyRun:
+    """Resultado de ``run_safety_checks``: el estado, el veredicto y lo que se escribió."""
+
+    state: TradingState
+    verdict: SafetyVerdict
+    lock_result: LockTriggerResult | None = None
+    backfill: LockBackfillResult | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        tz = self.state.timezone
+        return json_safe(
+            {
+                "verdict": self.verdict.to_dict(),
+                "state": self.state.to_dict(),
+                "lock_trigger": None
+                if self.lock_result is None
+                else self.lock_result.to_dict(tz=tz),
+                "backfill": None if self.backfill is None else self.backfill.to_dict(),
+            }
+        )
+
+
+def run_safety_checks(
+    repo: Any,
+    settings: AppSettings,
+    profile: Any,
+    now: datetime,
+    *,
+    lock_path: Path | str | None = None,
+    incident_dir: Path | str | None = None,
+    trigger_lock: bool = True,
+) -> SafetyRun:
+    """Lo que hacen las consolas en cada corrida (**con I/O**).
+
+    1. Si hay un LOCKED de este mes sin anotar en la base, lo anota
+       (``backfill_unrecorded_lock``).
+    2. Lee el estado (``state.load_trading_state``) y evalúa los frenos.
+    3. Con ``trigger_lock`` y la caída del mes pidiendo el bloqueo: escribe el
+       informe y el LOCKED (``trigger_lock_if_needed``), vuelve a leer el
+       estado (para que tenga el bloqueo recién anotado; si la lectura falla,
+       sigue con el de antes) y vuelve a evaluar.
+
+    Un error al escribir el LOCKED sale como ``LockWriteError``; uno de la
+    base al leer el estado, como lo lance la base.
+    """
+    moment = _aware_utc(now, "La hora")
+    path = Path(default_lock_path(settings) if lock_path is None else lock_path)
+    backfill = backfill_unrecorded_lock(repo, settings, moment, lock_path=path)
+    state = load_trading_state(repo, settings, profile, moment)
+    verdict = evaluate_breakers(state, profile, settings, moment, lock_path=path)
+    lock_result: LockTriggerResult | None = None
+    if trigger_lock and verdict.needs_lock:
+        lock_result = trigger_lock_if_needed(
+            verdict,
+            state,
+            settings,
+            moment,
+            repo=repo,
+            lock_path=path,
+            incident_dir=incident_dir,
+        )
+        try:
+            state = load_trading_state(repo, settings, profile, moment)
+        except Exception:  # el LOCKED ya está escrito: alcanza con el estado de antes
+            logger.warning("No se pudo releer el estado después de bloquear.", exc_info=True)
+        verdict = evaluate_breakers(state, profile, settings, moment, lock_path=path)
+    return SafetyRun(state=state, verdict=verdict, lock_result=lock_result, backfill=backfill)
 
 
 __all__ = [
@@ -1500,6 +2065,9 @@ __all__ = [
     "DAILY_LOSS_REDUCE",
     "LOCK_FILE",
     "LOSING_STREAK",
+    "MAX_TRADES_TODAY",
+    "MEASURE_MONTH",
+    "MEASURE_SINCE_UNLOCK",
     "MONTHLY_DRAWDOWN_LOCK",
     "STATUS_AMBER",
     "STATUS_GREEN",
@@ -1508,19 +2076,30 @@ __all__ = [
     "WEEKLY_LOSS_REDUCE",
     "BreakerAction",
     "BreakerStatus",
+    "DrawdownMeasure",
+    "LockBackfillAction",
+    "LockBackfillResult",
     "LockTriggerAction",
     "LockTriggerResult",
+    "LockWriteError",
     "SafetyAdjustment",
+    "SafetyRun",
     "SafetyVerdict",
     "VerdictStatus",
+    "backfill_unrecorded_lock",
     "daily_loss_block_breaker",
     "daily_loss_reduce_breaker",
     "default_lock_path",
     "evaluate_breakers",
     "lock_file_breaker",
+    "lock_is_recorded",
     "losing_streak_breaker",
+    "max_trades_today_breaker",
+    "month_drawdown_measure",
     "monthly_drawdown_lock_breaker",
+    "run_safety_checks",
     "trigger_lock_if_needed",
+    "unrecorded_lock_warning",
     "until_phrase",
     "upcoming_event_warning",
     "volatility_event_breaker",

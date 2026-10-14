@@ -1294,6 +1294,16 @@ def _state_repo(db: Path) -> Repository:
     return Repository.open(db, clock=lambda: FIXED_NOW)
 
 
+def _lock_of(db: Path) -> Path:
+    """El LOCKED de una base de ``--db``: con el nombre de la base (``estado.LOCKED``)."""
+    return db.parent / f"{db.stem}.LOCKED"
+
+
+def _incidents_of(db: Path) -> Path:
+    """La carpeta de informes de una base de ``--db`` (``estado_incidents/``)."""
+    return db.parent / f"{db.stem}_incidents"
+
+
 def _new_db(tmp_path: Path) -> Path:
     """Una base vacía (``--db`` tiene que existir: la consola no la crea)."""
     db = tmp_path / "estado.db"
@@ -1343,6 +1353,7 @@ def test_json_has_safety_and_correlation(btc_json):
     assert [b["code"] for b in safety["verdict"]["breakers"]] == [
         "daily_loss_reduce",
         "daily_loss_block",
+        "max_trades_today",
         "losing_streak",
         "weekly_loss_reduce",
         "monthly_drawdown_lock",
@@ -1450,6 +1461,12 @@ def test_same_coin_open_position_shrinks_the_plan_and_hedge_warns(tmp_path):
     corr = text[text.index(f"━━ {CORRELATION_TITLE}") : text.index(f"━━ {PLAN_TITLE}")]
     assert "Riesgo sumado para el plan (short)" in corr
     assert "Ya usado: 40,00 USD. Le queda al plan: 35,00 USD." in corr
+    # D6: la cobertura no suma al tope de correlación, pero sí al límite del día.
+    assert (
+        "No suma al tope de posiciones correlacionadas (1,5 × tu riesgo), pero su riesgo sí "
+        "cuenta en lo que te queda del límite del día"
+    ) in corr
+    assert "así que no suma riesgo" not in text
     assert "(lo que entra en el tope con tus posiciones correlacionadas)" in text
 
 
@@ -1458,10 +1475,10 @@ def test_lock_file_means_no_plan(tmp_path):
 
     db = _new_db(tmp_path)
     write_lock(
-        tmp_path / "LOCKED",
+        _lock_of(db),
         reason="La billetera del mes cayó 72 % desde su máximo.",
         triggered_at=FIXED_NOW,
-        report_path=tmp_path / "incidents" / "informe.md",
+        report_path=_incidents_of(db) / "informe.md",
     )
     code, out, err = run("SOL", "--offline", "--json", "--now", FIXED_NOW_ISO, "--db", str(db))
     assert code == 0, err
@@ -1472,7 +1489,7 @@ def test_lock_file_means_no_plan(tmp_path):
     assert LEAKS.search(text) is None
     assert LOCKED_TITLE in text
     assert "La billetera del mes cayó 72 % desde su máximo." in text
-    assert f"Revisá el informe y borrá {tmp_path / 'LOCKED'} a mano" in text
+    assert f"Revisá el informe y borrá {_lock_of(db)} a mano" in text
     plan_block = _plan_block(text)
     assert "No hay plan: la app está bloqueada por el archivo LOCKED" in plan_block
     assert "NO OPERAR" not in plan_block and "Niveles" not in plan_block
@@ -1491,13 +1508,13 @@ def test_drawdown_writes_the_lock_once_and_then_no_plan(tmp_path):
             opened_at=_local(day, 10),
             closed_at=_local(day, 12),
         )
-    lock = tmp_path / "LOCKED"
+    lock = _lock_of(db)
     code, out, err = run("BTC", "--offline", "--json", "--now", FIXED_NOW_ISO, "--db", str(db))
     assert code == 0, err
     report = json.loads(out)
     assert lock.exists() and report["plan"] is None and report["locked"] is True
     assert report["safety"]["lock_trigger"]["action"] == "locked"
-    reports = list((tmp_path / "incidents").glob("*.md"))
+    reports = list(_incidents_of(db).glob("*.md"))
     assert len(reports) == 1
     assert "Recién se bloqueó la app" in render_text(report)
     first = lock.read_text(encoding="utf-8")
@@ -1506,7 +1523,7 @@ def test_drawdown_writes_the_lock_once_and_then_no_plan(tmp_path):
     again = json.loads(out)
     assert again["safety"]["lock_trigger"] is None and again["plan"] is None
     assert lock.read_text(encoding="utf-8") == first
-    assert len(list((tmp_path / "incidents").glob("*.md"))) == 1
+    assert len(list(_incidents_of(db).glob("*.md"))) == 1
 
 
 def test_day_overrides_warn_and_say_where_the_numbers_came_from(tmp_path):
@@ -1649,8 +1666,8 @@ def test_lock_then_manual_unlock_brings_plans_back_until_a_new_drop(tmp_path):
             opened_at=_local(day, 11),
             closed_at=_local(day, 12),
         )
-    lock = tmp_path / "LOCKED"
-    incidents = tmp_path / "incidents"
+    lock = _lock_of(db)
+    incidents = _incidents_of(db)
 
     # 1) 300 → 85 USD: 71,67 % abajo. Se escribe el informe y el LOCKED, una vez.
     first = _run_db(db, "BTC", "--no-regime")
@@ -1675,9 +1692,9 @@ def test_lock_then_manual_unlock_brings_plans_back_until_a_new_drop(tmp_path):
     block = _safety_block(render_text(unlocked))
     assert (
         "saldo 85,00 USD · la caída se mide de nuevo desde el bloqueo del 12/10 11:37 (que ya "
-        "desbloqueaste): máximo 85,00 USD · caída 0,0 %" in block
+        "desbloqueaste): máximo 85,00 USD · caída 0 %" in block
     )
-    assert "En todo el mes: máximo del mes 300,00 USD · caída 71,7 % (ya no cuenta" in block
+    assert "En todo el mes: máximo del mes 300,00 USD · caída 71,67 % (ya no cuenta" in block
 
     # 3) Una pérdida chica después (85 → 65, 23,5 %) no vuelve a bloquear.
     r = Repository.open(db, clock=lambda: FIXED_NOW + timedelta(days=3))
@@ -1845,7 +1862,7 @@ def test_assumed_wallet_caps_the_margin_like_the_safety_section(tmp_path):
     assert plan["day_state"]["wallet_balance_assumed"] is True
     text = render_text(report)
     assert "con la billetera de 115 USD (saldo supuesto: nunca lo anotaste)" in text
-    assert "saldo 115,00 USD · máximo del mes 300,00 USD · caída 61,7 % (supuesto)" in text
+    assert "saldo 115,00 USD (supuesto) · máximo del mes 300,00 USD · caída 61,67 %" in text
 
 
 def test_wallet_noted_at_zero_means_no_trade(tmp_path):
@@ -1870,3 +1887,239 @@ def test_json_has_the_new_safety_fields(btc_json):
     assert plan["risk"]["open_risk_usd"] == 0.0
     assert plan["day_state"]["wallet_balance_usd"] == 300.0
     assert plan["day_state"]["wallet_balance_assumed"] is True
+
+
+# --- tercera ronda del Hito 5: lo que muestra la consola -----------------------------------
+
+
+def test_custom_db_has_its_own_lock_named_after_it(tmp_path):
+    """Una --db de prueba en data/ no comparte el LOCKED ni los informes de la base real."""
+    from app.config import load_settings
+
+    settings = load_settings(write_small_config(tmp_path))
+    real = resolve_state_paths(settings)
+    test_db = real.database.parent / "prueba.db"
+    custom = resolve_state_paths(settings, db=test_db)
+    assert custom.kind == "custom"
+    assert custom.lock_file == real.database.parent / "prueba.LOCKED"
+    assert custom.incident_dir == real.database.parent / "prueba_incidents"
+    assert custom.lock_file != real.lock_file and custom.incident_dir != real.incident_dir
+    # La base real elegida con --db usa sus rutas de siempre.
+    assert resolve_state_paths(settings, db=real.database) == real
+    offline = resolve_state_paths(settings, offline=True)
+    assert resolve_state_paths(settings, db=offline.database) == offline
+
+
+def test_max_trades_turns_the_status_red_like_make_safety(tmp_path):
+    """E4: con 3 de 3 operaciones hoy, la consola dice ROJO, igual que make safety."""
+    from scripts import trades
+
+    db = tmp_path / "estado.db"
+    r = _state_repo(db)
+    r.add_wallet_event(kind="balance", amount_usd=300.0, ts=_local(1, 9))
+    for hour in (8, 9, 10):
+        closed = _local(12, hour)
+        r.add_trade(symbol="BTC", side="long", pnl_usd=5.0, opened_at=closed, closed_at=closed)
+    report = _run_db(db, "SOL", "--no-regime")
+    assert report["safety"]["status"] == "rojo"
+    block = _safety_block(render_text(report))
+    expected = (
+        "Estado: ROJO · No se generan planes: ya hiciste 3 de 3 operaciones permitidas hoy, "
+        "hasta que termine el día (a las 00:00)."
+    )
+    assert expected in block and "Ningún freno activo" not in block
+    out = io.StringIO()
+    code = trades.main(
+        ["status", "--db", str(db), "--config", str(_CONFIG["path"])],
+        out=out,
+        err=io.StringIO(),
+        clock=lambda: FIXED_NOW,
+    )
+    assert code == 0 and expected in out.getvalue()
+
+
+def test_second_lock_shows_one_drop_everywhere(tmp_path):
+    """D5: con el LOCKED de un segundo bloqueo, la sección muestra la misma caída que el motivo."""
+    db = tmp_path / "estado.db"
+    r = _state_repo(db)
+    r.add_wallet_event(kind="balance", amount_usd=300.0, ts=_local(1, 9))
+    for day, pnl in ((5, -100.0), (7, -100.0), (8, 10.0), (11, -25.0)):
+        r.add_trade(
+            symbol="BTC",
+            side="long",
+            pnl_usd=pnl,
+            opened_at=_local(day, 11),
+            closed_at=_local(day, 12),
+        )
+    _run_db(db, "BTC", "--no-regime")  # primer bloqueo (300 → 85)
+    _lock_of(db).unlink()
+    r = Repository.open(db, clock=lambda: FIXED_NOW + timedelta(days=2))
+    r.add_trade(
+        symbol="BTC", side="long", pnl_usd=-65.0, opened_at=_local(13, 9), closed_at=_local(13, 10)
+    )
+    relock = _run_db(db, "BTC", "--no-regime", now="2026-10-14T15:00:00Z")
+    assert relock["locked"] is True
+    measure = relock["safety"]["verdict"]["drawdown_measure"]
+    assert measure["basis"] == "since_unlock" and measure["while_locked"] is True
+    block = _safety_block(render_text(relock))
+    # 85 → 20: 76,47 % (lo que dicen el motivo, la fila del freno y la billetera).
+    assert "volvió a caer 76,47 % desde su máximo (85 USD → 20 USD)" in block
+    assert "76,47 % de 70 %" in block
+    assert (
+        "la caída que bloqueó la app se midió desde el bloqueo del 12/10 11:37 (que "
+        "desbloqueaste): máximo 85,00 USD · caída 76,47 %"
+    ) in block
+    # La del mes entero (300 → 20) va aparte y dice que ya no cuenta.
+    assert "En todo el mes: máximo del mes 300,00 USD · caída 93,33 % (ya no cuenta" in block
+    lines_with_93 = [x for x in block.splitlines() if "93,33 %" in x]
+    assert all("todo el mes" in x for x in lines_with_93)
+
+
+def test_negative_balance_says_more_than_100_and_asks_to_check(tmp_path):
+    """E5: saldo calculado negativo → "más del 100 %" y el aviso de revisar los datos."""
+    db = tmp_path / "estado.db"
+    r = _state_repo(db)
+    r.add_wallet_event(kind="balance", amount_usd=0.0, ts=_local(1, 0))
+    r.add_trade(
+        symbol="BTC", side="long", pnl_usd=-50.0, opened_at=_local(5, 11), closed_at=_local(5, 12)
+    )
+    report = _run_db(db, "SOL", "--no-regime")
+    block = _safety_block(render_text(report))
+    row = next(x for x in block.splitlines() if "Billetera del mes" in x)
+    assert "saldo -50,00 USD" in row and "100,0 %" not in row
+    assert "da negativo (-50 USD)" in block
+    assert "un resultado o un retiro mal tipeado" in block
+
+
+def test_empty_wallet_reference_rows_do_not_invent_a_wallet(tmp_path):
+    """Hallazgo 14: con saldo 0 el plan de referencia dice "sin saldo" (no 300 ni un margen)."""
+    db = tmp_path / "estado.db"
+    _state_repo(db).add_wallet_event(kind="balance", amount_usd=0.0, ts=_local(1, 0))
+    report = _run_db(db, "BTC", "--no-regime")
+    plan = _plan_block(render_text(report))
+    assert "No operar: tu billetera de futuros tiene 0 USD" in plan
+    assert "sin saldo: tu billetera tiene 0,00 USD, no hay plata para poner de margen" in plan
+    assert "billetera de 300 USD" not in plan and "Margen subido" not in plan
+    margin = next(x for x in plan.splitlines() if x.strip().startswith("Margen "))
+    assert "sin saldo" in margin
+
+
+def _report_with_day(day_loss_block: dict, day_state: dict, failed: list[str]) -> dict:
+    """Un reporte mínimo para probar la línea "Límite del día" del plan."""
+    from scripts.analyze_cli import _plan_latched_day_loss, day_room_text
+
+    report = {
+        "safety": {
+            "day_state_source": "state",
+            "verdict": {"breakers": [day_loss_block]},
+            "state": {"day_loss_usd": day_state["loss_today_usd"]},
+        }
+    }
+    said = bool(set(failed) & {"daily_remaining", "daily_limits", "safety_daily_loss_block"})
+    return {
+        "latched": _plan_latched_day_loss(report),
+        "room": None if said else day_room_text(day_state, _plan_latched_day_loss(report)),
+    }
+
+
+def test_day_room_line_with_a_latched_loss():
+    """D1: la pérdida trabada se aclara; con el límite alcanzado no se dice "te quedan"."""
+    day = {
+        "daily_open_risk_usd": 20.0,
+        "loss_today_usd": 30.0,
+        "daily_remaining_usd": 50.0,
+        "max_daily_loss_usd": 100.0,
+    }
+    reduce_only = _report_with_day({"code": "daily_loss_block", "current": 60.0}, day, [])
+    assert reduce_only["latched"] == 60.0
+    assert reduce_only["room"].startswith(
+        "Límite del día: hoy perdiste 30,00 USD (antes llegaste a perder 60,00 USD: eso mantiene "
+        "trabados los frenos del día que ya saltaron, pero lo que queda del límite se cuenta "
+        "desde lo que perdés ahora)"
+    )
+    assert reduce_only["room"].endswith("te quedan 50,00 USD de 100,00 USD.")
+    blocked = _report_with_day(
+        {"code": "daily_loss_block", "current": 100.0}, day, ["safety_daily_loss_block"]
+    )
+    assert blocked["room"] is None
+
+
+def test_latched_daily_block_plan_does_not_say_there_is_room_left(tmp_path):
+    """D1: -100 y después +50 con una posición abierta: el plan no dice "te quedan 40 USD"."""
+    db = tmp_path / "estado.db"
+    r = _state_repo(db)
+    r.add_wallet_event(kind="balance", amount_usd=300.0, ts=_local(1, 9))
+    r.add_trade(
+        symbol="BTC",
+        side="long",
+        pnl_usd=-100.0,
+        opened_at=_local(12, 0, 5),
+        closed_at=_local(12, 0, 10),
+    )
+    r.add_trade(
+        symbol="SOL",
+        side="long",
+        pnl_usd=50.0,
+        opened_at=_local(12, 0, 7),
+        closed_at=_local(12, 0, 20),
+    )
+    r.add_open_position(symbol="ETH", side="long", risk_usd=10.0, opened_at=_local(11, 20))
+    report = _run_db(db, "BTC", "--no-regime")
+    failed = {x["code"] for x in report["plan"]["rules"] if not x["ok"]}
+    assert "safety_daily_loss_block" in failed
+    plan = _plan_block(render_text(report))
+    assert "llegaste a tu límite de pérdida del día" in plan
+    assert "te quedan" not in plan
+
+
+def test_unrecorded_lock_is_recorded_and_said(tmp_path):
+    """E2: un LOCKED de este mes que no está en la base se anota (y la consola lo dice)."""
+    from app.safety.lockfile import write_lock
+
+    db = _new_db(tmp_path)
+    write_lock(
+        _lock_of(db),
+        reason="La billetera del mes cayó 72 % desde su máximo.",
+        triggered_at=FIXED_NOW - timedelta(days=1),
+        report_path=None,
+        trigger_code="monthly_drawdown_lock",
+    )
+    report = _run_db(db, "BTC", "--no-regime")
+    assert report["safety"]["lock_backfill"]["action"] == "recorded"
+    assert len(_state_repo(db).list_safety_locks()) == 1
+    assert "no estaba anotado en la base: se anotó ahora" in _safety_block(render_text(report))
+    again = _run_db(db, "BTC", "--no-regime")
+    assert again["safety"]["lock_backfill"]["action"] == "already_recorded"
+    assert "se anotó ahora" not in _safety_block(render_text(again))
+
+
+def test_lock_write_error_is_explained_and_reports_do_not_pile_up(tmp_path, monkeypatch):
+    """Si no se puede escribir el LOCKED: exit 1, mensaje claro y un solo informe."""
+    import app.safety.breakers as breakers
+
+    db = tmp_path / "estado.db"
+    r = _state_repo(db)
+    r.add_wallet_event(kind="balance", amount_usd=300.0, ts=_local(1, 9))
+    for day in (5, 8):
+        r.add_trade(
+            symbol="BTC",
+            side="long",
+            pnl_usd=-110.0,
+            opened_at=_local(day, 10),
+            closed_at=_local(day, 12),
+        )
+
+    def denied(path, **_kwargs):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(breakers, "write_lock", denied)
+    for _ in range(2):
+        code, out, err = run(
+            "BTC", "--offline", "--no-regime", "--now", FIXED_NOW_ISO, "--db", str(db)
+        )
+        assert code == 1 and out == ""
+        assert f"No se pudo escribir el archivo LOCKED ({_lock_of(db)}): Permission denied." in err
+        assert "revisá los permisos de esa carpeta y el espacio en disco" in err
+        assert "No se pudieron evaluar los frenos" not in err
+    assert not _lock_of(db).exists()
+    assert len(list(_incidents_of(db).glob("*.md"))) == 1

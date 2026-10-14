@@ -30,6 +30,8 @@ Comandos
       ejemplo, después de mover el stop: 0 si quedó en la entrada o en
       ganancia, así deja de contar para el límite del día y para el tope de
       posiciones correlacionadas), ``--entry`` y ``--note`` (``""`` la borra).
+      El riesgo previsto al abrir queda anotado igual (el informe del
+      incidente lo usa para saber si moviste el stop) y la salida lo dice.
     - ``close [N]``: cierra la posición ``N`` (si hay una sola, no hace falta el
       número) y la guarda como operación: ``--pnl`` y ``--exit --closed --note``.
     - ``list``: últimas operaciones (``--limit``), posiciones abiertas,
@@ -44,34 +46,48 @@ Comandos
     - ``status``: el estado y los frenos de seguridad (si la caída del mes llegó
       al tope, escribe el informe y el archivo LOCKED, como la consola).
 
-Confirmación con ``--yes`` (``app.manual_input``): un resultado (``add``,
-``close``) más grande, en valor absoluto, que el saldo de la billetera o que
-``confirm_pnl_over_risk_multiple`` veces el riesgo por operación, y un evento
-de más de ``confirm_event_longer_than_days`` días, no se guardan sin ``--yes``
-(casi siempre son un error de tipeo): se explica y sale con 1.
+Confirmación con ``--yes`` (``app.manual_input``; casi siempre son un error de
+tipeo): no se guardan sin ``--yes`` (se explica y sale con 1, sin guardar
+nada ni crear una base nueva)
 
-Opciones de todos los comandos: ``--db RUTA`` (otra base; el LOCKED y los
-informes van en su misma carpeta), ``--offline`` (la base de prueba de los
-datos sintéticos, la misma que usa ``make cli ARGS="--offline"``), ``--profile``
-y ``--config``. Una ruta relativa es relativa a la carpeta desde donde corriste
-``make`` (el Makefile la pasa en ``ANALYZER_INVOCATION_DIR``) o, sin ``make``, a
-la carpeta actual. ``list``, ``status``, ``close``, ``update`` y ``delete`` con
-una ``--db`` que no existe salen con 1 sin crearla (¿ruta mal escrita?); los comandos que
-cargan algo la crean y lo avisan.
+- un resultado (``add``, ``close``) más grande, en valor absoluto, que el saldo
+  de la billetera o que ``confirm_pnl_over_risk_multiple`` veces el riesgo por
+  operación;
+- un riesgo abierto (``open``, ``update --risk``) más grande que el saldo o que
+  esas mismas veces el riesgo por operación (``confirm_open_risk_over_limits``);
+- un retiro más grande que el saldo calculado en su fecha
+  (``confirm_withdrawal_over_balance``);
+- un evento de más de ``confirm_event_longer_than_days`` días.
+
+Opciones de todos los comandos: ``--db RUTA`` (otra base, con su propio LOCKED
+y su carpeta de informes al lado, con el nombre de la base: ``prueba.db`` →
+``prueba.LOCKED`` y ``prueba_incidents/``; la base real usa los de
+``config.yaml``), ``--offline`` (la base de prueba de los datos sintéticos, la
+misma que usa ``make cli ARGS="--offline"``), ``--profile`` y ``--config``. Una
+ruta relativa es relativa a la carpeta desde donde corriste ``make`` (el
+Makefile la pasa en ``ANALYZER_INVOCATION_DIR``) o, sin ``make``, a la carpeta
+actual. ``list``, ``status``, ``close``, ``update`` y ``delete`` con una
+``--db`` que no existe salen con 1 sin crearla (¿ruta mal escrita?); los
+comandos que cargan algo la crean y lo avisan, solo si salen bien (si fallan,
+la base nueva se borra).
 
 Fechas y horas: en la zona del usuario (``app.user_timezone``), se guardan en
 UTC. Se aceptan ``"2026-10-13 14:30"``, ``"13/10 14:30"``, ``"14:30"`` (hoy),
 ``"ayer 22:00"``, ``"mañana 11:00"``, ``"ahora"`` y fechas ISO con zona
 (``2026-10-13T17:30:00Z``). Montos con coma o punto decimal (``-32,5``). Una
-fecha sin año es, para aperturas, cierres y movimientos, la pasada más reciente
-(el 1/1, ``"31/12 23:00"`` es de ayer) y, para eventos, la más cercana. Una hora
-hasta ``MAX_CLOCK_SKEW`` (5 min) adelante del reloj se guarda como ahora (si no,
-los frenos la ignorarían hasta esa hora); más adelante, es un error.
+fecha sin año es, para aperturas, cierres y movimientos, la de este año; si esa
+cae a más de medio año en el futuro, la del año anterior (el 1/1, ``"31/12
+23:00"`` es de ayer); si cae menos adelante, es un error ("está en el futuro",
+con el año). Para eventos, la más cercana. Un 29/02 sin año cuando esos años no
+son bisiestos pide el año. Una hora hasta ``MAX_CLOCK_SKEW`` (5 min) adelante
+del reloj se guarda como ahora (si no, los frenos la ignorarían hasta esa hora);
+más adelante, es un error.
 
 Después de cargar algo muestra en una línea cómo quedaron los frenos (sin
 escribir el LOCKED: así podés terminar de cargar, por ejemplo, un depósito que
-faltaba; el bloqueo lo escriben ``status`` y el análisis). Si ya hiciste las
-operaciones permitidas del día, también lo avisa.
+faltaba; el bloqueo lo escriben ``status`` y el análisis). Con las operaciones
+permitidas del día ya hechas, el estado es ROJO hasta las 00:00 (freno
+``max_trades_today``), igual que en la consola de análisis.
 
 Sale con 0 si salió bien; 1 si no existe lo que se pidió, la base no existe o no
 se puede usar, o falta confirmar con ``--yes``; y 2 si los argumentos no son
@@ -81,7 +97,9 @@ válidos (fecha futura, monto inválido...).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
+import io
 import re
 import sys
 from collections.abc import Callable, Sequence
@@ -96,7 +114,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import DEFAULT_CONFIG_PATH, AppSettings, load_settings
 from app.risk.profiles import EffectiveProfile, get_profile
-from app.safety.breakers import MONTHLY_DRAWDOWN_LOCK
+from app.safety.breakers import MONTHLY_DRAWDOWN_LOCK, LockWriteError
 from app.safety.incident import analysis_test_marks, fmt_analysis_marks, timezone_label
 from app.safety.state import load_trading_state
 from app.storage import Repository
@@ -122,6 +140,7 @@ from scripts.analyze_cli import (
     evaluate_safety,
     fmt_num,
     fmt_usd,
+    lock_write_error_text,
     missing_db_message,
     parse_price,
     printable,
@@ -204,37 +223,82 @@ def _at(day: date, m: re.Match[str], zone: tzinfo, text: str) -> datetime:
 
 YearChoice = Literal["past", "nearest"]
 
+#: Una fecha sin año de este año que cae más adelante que esto se toma del año
+#: anterior (el 1/1, "31/12 23:00" es de ayer); una que cae menos adelante es un
+#: error de tipeo ("está en el futuro"), no una fecha de hace casi un año. Es
+#: una regla para leer fechas, no un umbral de riesgo.
+YEARLESS_FUTURE_WINDOW = timedelta(days=183)
+
 
 def _day_without_year(
     day: int, month: int, m: re.Match[str], tz: tzinfo, now: datetime, text: str, year: YearChoice
 ) -> datetime:
     """``"31/12 23:00"`` sin año: ¿de qué año es?
 
-    - ``"past"`` (apertura, cierre, movimientos): la fecha pasada más reciente;
-      si este año queda en el futuro (más allá de ``MAX_CLOCK_SKEW``), la del
-      año anterior. Así, el 1/1 a la 01:00, "31/12 23:00" es de hace dos horas.
+    - ``"past"`` (apertura, cierre, movimientos): la de este año si ya pasó
+      (o está dentro de ``MAX_CLOCK_SKEW``). Si cae más adelante:
+      - a más de ``YEARLESS_FUTURE_WINDOW`` (medio año), la del año anterior
+        (el caso del Año Nuevo: el 1/1 a la 01:00, "31/12 23:00" es de hace dos
+        horas);
+      - si no, la de este año, que está en el futuro: quien llama
+        (``Context.past``) la rechaza con el año a la vista ("14/10" escrito
+        el 13/10 casi siempre es un error de tipeo, no algo de hace un año).
     - ``"nearest"`` (eventos): la más cercana a ``now`` entre el año anterior,
       este y el siguiente. Así, el 28/12, "05/01 10:00" es del año que viene.
+
+    Un 29/02 sin año cuando ninguno de esos años es bisiesto: ``ValueError``
+    ("no existe en estos años: poné el año").
     """
     this_year = now.astimezone(tz).year
-    candidates: list[datetime] = []
+    by_year: dict[int, datetime] = {}
     for y in (this_year - 1, this_year, this_year + 1):
         try:
-            candidates.append(_at(date(y, month, day), m, tz, text))
+            by_year[y] = _at(date(y, month, day), m, tz, text)
         except ValueError:
             continue  # 29/02 de un año no bisiesto, o una hora que no existe
-    if not candidates:
+    if not by_year:
         try:
             date(2000, month, day)  # 2000 fue bisiesto: si acá tampoco existe, la fecha no existe
         except ValueError:
             raise ValueError(f"La fecha {text!r} no existe.") from None
-        return _at(date(2000, month, day), m, tz, text)  # lanza el error de la hora
+        _at(date(2000, month, day), m, tz, text)  # si la hora no existe, lanza ese error
+        example = (
+            _next_year_with(day, month, this_year - 1, back=True)
+            if year == "past"
+            else _next_year_with(day, month, this_year)
+        )
+        raise ValueError(
+            f"La fecha {day:02d}/{month:02d} no existe en estos años: poné el año (ej. "
+            f'"{day:02d}/{month:02d}/{example} {int(m.group("h")):02d}:{m.group("m")}").'
+        )
     if year == "past":
-        past = [c for c in candidates if c <= now + MAX_CLOCK_SKEW]
-        if past:
-            return max(past)
-        raise ValueError(f"La fecha {text!r} no existe en el último año: poné el año.")
-    return min(candidates, key=lambda c: abs(c - now))
+        current = by_year.get(this_year)
+        if current is not None and (
+            current <= now + MAX_CLOCK_SKEW or current - now <= YEARLESS_FUTURE_WINDOW
+        ):
+            return current  # ya pasó, o está en el futuro y ``Context.past`` lo dice
+        previous = by_year.get(this_year - 1)
+        if previous is not None:
+            return previous
+        raise ValueError(
+            f"La fecha {day:02d}/{month:02d} no existe en estos años: poné el año (ej. "
+            f'"{day:02d}/{month:02d}/{_next_year_with(day, month, this_year - 1, back=True)} '
+            f'{int(m.group("h")):02d}:{m.group("m")}").'
+        )
+    return min(by_year.values(), key=lambda c: abs(c - now))
+
+
+def _next_year_with(day: int, month: int, start: int, *, back: bool = False) -> int:
+    """El año más cercano a ``start`` (para adelante o, con ``back``, para atrás) con esa fecha."""
+    step = -1 if back else 1
+    year = start
+    for _ in range(8):  # un 29/02 aparece cada 4 años (8 por los siglos no bisiestos)
+        try:
+            date(year, month, day)
+            return year
+        except ValueError:
+            year += step
+    return start
 
 
 def parse_user_datetime(
@@ -522,46 +586,24 @@ _PENDING_LOCK_HINT = (
 )
 
 
-def _trades_limit_text(trades_today: int, max_trades: int | None) -> str | None:
-    """``"ya hiciste 3 de 3 operaciones permitidas hoy: ..."`` si se llegó al máximo del día."""
-    if max_trades is None or trades_today < max_trades:
-        return None
-    if max_trades == 0:
-        return "tu perfil no permite operaciones (máximo 0 por día): no va a haber planes"
-    return (
-        f"ya hiciste {trades_today} de {max_trades} operaciones permitidas hoy: no va a haber "
-        "planes hasta mañana"
-    )
-
-
 def safety_view(sc: SafetyContext) -> dict[str, Any]:
     """El dict de los frenos (``safety_to_dict``) listo para mostrar desde esta consola.
 
-    - La caída del mes ya viene recortada a 100 % en los textos de
-      ``safety.breakers`` y en la sección de la consola (más solo pasa con el
-      saldo calculado negativo, que ya tiene su aviso).
-    - Si la caída del mes llegó al tope pero todavía no hay LOCKED (cargar no
-      lo escribe), el titular dice que el bloqueo está pendiente en vez de
-      mandar a borrar un LOCKED que no existe.
-    - Si ya se hicieron las operaciones permitidas del día, el titular lo
-      avisa (el plan va a decir No operar aunque ningún freno haya saltado).
+    Es el mismo de la consola de análisis, salvo un caso: si la caída del mes
+    llegó al tope pero todavía no hay LOCKED (cargar no lo escribe), el
+    titular dice que el bloqueo está pendiente en vez de mandar a borrar un
+    LOCKED que no existe. El máximo de operaciones del día ya es un freno más
+    (``max_trades_today``), con el mismo titular en las dos consolas.
     """
     data = copy.deepcopy(safety_to_dict(sc))
     v = sc.verdict
     verdict = data.setdefault("verdict", {})
-    headline = v.headline
     if v.needs_lock and not v.locked:
         monthly = v.breaker(MONTHLY_DRAWDOWN_LOCK)
         others = len([c for c in v.block_codes if c != MONTHLY_DRAWDOWN_LOCK])
         tail = "" if others == 0 else f" (y {others} {'freno' if others == 1 else 'frenos'} más)"
         headline = f"No se generan planes: {monthly.summary}{tail}; {_PENDING_LOCK}."
-    limit = _trades_limit_text(sc.state.trades_today, sc.state.profile.max_trades_per_day)
-    if limit is not None:
-        if v.status == "verde":
-            headline = f"Ningún freno activo, pero ojo: {limit}."
-        else:
-            headline = f"{headline} Ojo: {limit}."
-    data["headline"] = verdict["headline"] = headline
+        data["headline"] = verdict["headline"] = headline
     return data
 
 
@@ -582,6 +624,9 @@ def _safety_lines(ctx: Context) -> None:
     )
     if sc.verdict.needs_lock and not sc.verdict.locked:
         ctx.print(_PENDING_LOCK_HINT, "alert")
+    backfill = sc.backfill
+    if backfill is not None and backfill.recorded and backfill.message:
+        ctx.print(f"  {backfill.message}", "yellow")
 
 
 # --- confirmaciones ---------------------------------------------------------------------
@@ -589,6 +634,39 @@ def _safety_lines(ctx: Context) -> None:
 
 class NeedsConfirmationError(Exception):
     """Un dato fuera de lo normal que hay que confirmar con ``--yes`` (sale con código 1)."""
+
+
+_RETYPE = "Si está bien, cargalo de nuevo agregando --yes. No se guardó nada."
+
+
+def _wallet_at(ctx: Context, moment: datetime) -> Any:
+    """La billetera calculada en ``moment`` (saldo anotado o supuesto y lo cargado hasta ahí)."""
+    return load_trading_state(ctx.repo, ctx.settings, ctx.profile, moment).wallet
+
+
+def _balance_text(wallet: Any) -> str:
+    """``"200,00 USD"`` o ``"200,00 USD, supuesto: nunca lo anotaste"`` (va entre paréntesis)."""
+    assumed = ", supuesto: nunca lo anotaste" if wallet.assumed else ""
+    return f"{fmt_usd(wallet.current_balance_usd)}{assumed}"
+
+
+def _over_limit_reasons(ctx: Context, amount: float, wallet: Any) -> list[str]:
+    """Por qué ``amount`` parece un error de tipeo (``[]`` si no).
+
+    Más grande que el saldo de la billetera o que
+    ``app.manual_input.confirm_pnl_over_risk_multiple`` veces el riesgo por
+    operación del perfil.
+    """
+    multiple = ctx.settings.app.manual_input.confirm_pnl_over_risk_multiple
+    risk_cap = multiple * ctx.profile.risk_per_trade_usd
+    size = round(abs(amount), 2)
+    reasons: list[str] = []
+    if size > round(wallet.current_balance_usd, 2):
+        reasons.append(f"que el saldo de tu billetera ({_balance_text(wallet)})")
+    if size > round(risk_cap, 2):
+        times = fmt_num(multiple, 0 if float(multiple).is_integer() else 1)
+        reasons.append(f"que {times} veces tu riesgo por operación ({fmt_usd(risk_cap)})")
+    return reasons
 
 
 def _check_pnl(ctx: Context, pnl: float, confirmed: bool) -> None:
@@ -600,26 +678,59 @@ def _check_pnl(ctx: Context, pnl: float, confirmed: bool) -> None:
     """
     if confirmed:
         return
-    multiple = ctx.settings.app.manual_input.confirm_pnl_over_risk_multiple
-    risk_cap = multiple * ctx.profile.risk_per_trade_usd
-    wallet = load_trading_state(ctx.repo, ctx.settings, ctx.profile, ctx.now).wallet
-    size = abs(pnl)
-    reasons: list[str] = []
-    if size > wallet.current_balance_usd:
-        assumed = " (supuesto: nunca lo anotaste)" if wallet.assumed else ""
-        reasons.append(
-            f"que el saldo de tu billetera ({fmt_usd(wallet.current_balance_usd)}{assumed})"
-        )
-    if size > risk_cap:
-        times = fmt_num(multiple, 0 if float(multiple).is_integer() else 1)
-        reasons.append(f"que {times} veces tu riesgo por operación ({fmt_usd(risk_cap)})")
+    reasons = _over_limit_reasons(ctx, pnl, _wallet_at(ctx, ctx.now))
     if reasons:
         raise NeedsConfirmationError(
             f"Ojo: el resultado {_signed_usd(pnl)} es más grande {' y '.join(reasons)}. "
             "¿No será un error de tipeo (una coma o un cero de más)? Un resultado así puede "
-            "disparar los frenos o bloquear la app. Si está bien, cargalo de nuevo agregando "
-            "--yes. No se guardó nada."
+            f"disparar los frenos o bloquear la app. {_RETYPE}"
         )
+
+
+def _check_open_risk(ctx: Context, risk: float, confirmed: bool) -> None:
+    """Pide ``--yes`` si el riesgo de una posición abierta parece un error de tipeo (E9).
+
+    ``open`` y ``update --risk``: un riesgo más grande que el saldo actual de
+    la billetera o que ``confirm_pnl_over_risk_multiple`` veces el riesgo por
+    operación (``app.manual_input.confirm_open_risk_over_limits``).
+    """
+    if confirmed or not ctx.settings.app.manual_input.confirm_open_risk_over_limits:
+        return
+    reasons = _over_limit_reasons(ctx, risk, _wallet_at(ctx, ctx.now))
+    if not reasons:
+        return
+    day = (
+        " Un riesgo así cuenta entero en lo que te queda del límite de pérdida del día y puede "
+        'dejar todos los planes en "No operar" hasta que lo corrijas.'
+        if ctx.settings.trade_plan.daily_cap_includes_open_risk
+        else ""
+    )
+    raise NeedsConfirmationError(
+        f"Ojo: el riesgo de {fmt_usd(risk)} (lo que perdés si toca el stop) es más grande "
+        f"{' y '.join(reasons)}. ¿No será un error de tipeo (una coma o un cero de más)?{day} "
+        f"{_RETYPE}"
+    )
+
+
+def _check_withdrawal(ctx: Context, amount: float, moment: datetime, confirmed: bool) -> None:
+    """Pide ``--yes`` si el retiro es más grande que el saldo calculado en su fecha (E9).
+
+    ``app.manual_input.confirm_withdrawal_over_balance``. Casi siempre es un
+    error de tipeo: dejaría el saldo en negativo y los números de la caída del
+    mes dejarían de tener sentido.
+    """
+    if confirmed or not ctx.settings.app.manual_input.confirm_withdrawal_over_balance:
+        return
+    wallet = _wallet_at(ctx, moment)
+    if round(amount, 2) <= round(wallet.current_balance_usd, 2):
+        return
+    raise NeedsConfirmationError(
+        f"Ojo: el retiro de {fmt_usd(amount)} es más grande que el saldo de tu billetera el "
+        f"{ctx.fmt_dt(moment)} ({_balance_text(wallet)}). ¿No será un error de tipeo "
+        "(un cero de más)? Un retiro así deja el saldo en negativo y desarma las cuentas del "
+        "freno de la caída del mes. Si el saldo que ves en Nexo es otro, anotalo primero con "
+        f'make trade ARGS="balance --amount ...". {_RETYPE}'
+    )
 
 
 def _check_event_length(ctx: Context, start: datetime, until: datetime, confirmed: bool) -> None:
@@ -689,6 +800,7 @@ def _print_trade_saved(ctx: Context, trade: StoredTrade, title: str) -> None:
 def cmd_open(args: argparse.Namespace, ctx: Context) -> int:
     opened = ctx.past(args.opened, "La hora de apertura", ctx.now)
     analysis_id, link = _resolve_analysis(ctx, args.symbol, opened, args.analysis)
+    _check_open_risk(ctx, args.risk, args.yes)
     pos = ctx.repo.add_open_position(
         symbol=args.symbol,
         side=args.side,
@@ -730,6 +842,8 @@ def cmd_update(args: argparse.Namespace, ctx: Context) -> int:
             "No hay nada para cambiar: poné --risk (lo que perdés ahora si toca el stop; 0 si "
             "lo moviste a la entrada o a ganancia), --entry o --note."
         )
+    if args.risk is not None:
+        _check_open_risk(ctx, args.risk, args.yes)
     updated = ctx.repo.update_position(
         args.id, risk_usd=args.risk, entry_price=args.entry, note=args.note
     )
@@ -744,10 +858,33 @@ def cmd_update(args: argparse.Namespace, ctx: Context) -> int:
         f"Posición #{updated.id} ({updated.symbol} {updated.side}) actualizada: "
         f"{'; '.join(changes)}."
     )
+    if args.risk is not None:
+        ctx.print(f"  {_planned_risk_note(updated)}")
     if args.risk is not None and round(updated.risk_usd, 2) <= 0:
         ctx.print(f"  {_ZERO_RISK_NOTE}")
     _safety_lines(ctx)
     return EXIT_OK
+
+
+def _planned_risk_note(position: Any) -> str:
+    """Qué pasa con el riesgo previsto al abrir cuando cambia el riesgo (``update --risk``).
+
+    El previsto no cambia: el informe de un incidente lo usa para saber si se
+    movió el stop a la entrada o si se agrandó.
+    """
+    planned = position.planned_risk_usd
+    if planned is None:
+        return "No hay un riesgo previsto anotado para esta posición."
+    text = (
+        f"El riesgo previsto al abrir ({fmt_usd(planned)}) queda anotado igual: el informe de "
+        "un incidente lo usa para saber si moviste el stop."
+    )
+    if round(position.risk_usd, 2) > round(planned, 2):
+        text += (
+            " Ojo: ahora arriesgás más que lo previsto (agrandaste el stop); si fue un error al "
+            "abrir, borrá la posición y cargala de nuevo."
+        )
+    return text
 
 
 def _price_text(position: Any) -> str:
@@ -793,10 +930,13 @@ def cmd_close(args: argparse.Namespace, ctx: Context) -> int:
 
 def cmd_wallet(args: argparse.Namespace, ctx: Context) -> int:
     kind = {"deposit": "deposit", "withdraw": "withdrawal", "balance": "balance"}[args.command]
+    ts = ctx.past(args.date, "La fecha del movimiento", ctx.now)
+    if kind == "withdrawal":
+        _check_withdrawal(ctx, args.amount, ts, bool(getattr(args, "yes", False)))
     event = ctx.repo.add_wallet_event(
         kind=kind,
         amount_usd=args.amount,
-        ts=ctx.past(args.date, "La fecha del movimiento", ctx.now),
+        ts=ts,
         notes=args.note,
     )
     if kind == "balance":
@@ -849,7 +989,7 @@ def cmd_list(args: argparse.Namespace, ctx: Context) -> int:
                 t.symbol,
                 t.side,
                 Cell(_signed_usd(t.pnl_usd), _signed_color(t.pnl_usd)),
-                DASH if t.risk_usd is None else fmt_usd(t.risk_usd),
+                _risk_cell(t.risk_usd, t.planned_risk_usd),
                 DASH if t.analysis_id is None else f"#{t.analysis_id}",
                 _truncate(printable(t.notes or ""), 30),
             ]
@@ -882,7 +1022,7 @@ def cmd_list(args: argparse.Namespace, ctx: Context) -> int:
                 ctx.fmt_dt(p.opened_at),
                 p.symbol,
                 p.side,
-                fmt_usd(p.risk_usd),
+                _risk_cell(p.risk_usd, p.planned_risk_usd),
                 _price_text(p),
                 DASH if p.analysis_id is None else f"#{p.analysis_id}",
                 _truncate(printable(p.notes or ""), 30),
@@ -953,6 +1093,16 @@ def cmd_list(args: argparse.Namespace, ctx: Context) -> int:
     )
     print("\n".join(lines), file=ctx.out)
     return EXIT_OK
+
+
+def _risk_cell(risk: float | None, planned: float | None) -> str:
+    """``"40,00 USD"`` o, si el stop se movió, ``"0,00 USD (previsto 40,00 USD)"``."""
+    if risk is None:
+        return DASH
+    text = fmt_usd(risk)
+    if planned is not None and round(planned, 2) != round(risk, 2):
+        text += f" (previsto {fmt_usd(planned)})"
+    return text
 
 
 def _describe_for_delete(ctx: Context, kind: str, record_id: int) -> str:
@@ -1032,7 +1182,7 @@ def _common_options(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=sup,
         metavar="RUTA",
-        help="otra base (el LOCKED y los informes van en su misma carpeta)",
+        help="otra base (con su propio LOCKED y sus informes al lado, con el nombre de la base)",
     )
     parser.add_argument(
         "--offline",
@@ -1047,6 +1197,7 @@ def _common_options(parser: argparse.ArgumentParser) -> None:
 
 
 _YES_HELP_PNL = "confirmar un resultado muy grande (más que tu saldo o que varias veces tu riesgo)"
+_YES_HELP_RISK = "confirmar un riesgo muy grande (más que tu saldo o que varias veces tu riesgo)"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1102,6 +1253,7 @@ def build_parser() -> argparse.ArgumentParser:
     op.add_argument("--opened", metavar="FECHA", help="cuándo abriste (por defecto, ahora)")
     op.add_argument("--note", help="nota")
     op.add_argument("--analysis", metavar="N|auto|none", help="análisis que seguiste")
+    op.add_argument("--yes", action="store_true", help=_YES_HELP_RISK)
 
     up = command("update", "cambia una posición abierta (por ejemplo, después de mover el stop)")
     up.add_argument("id", type=_positive_int, metavar="N", help="número de la posición")
@@ -1113,6 +1265,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     up.add_argument("--entry", type=positive_amount, metavar="PRECIO", help="precio de entrada")
     up.add_argument("--note", help='nota nueva ("" la borra)')
+    up.add_argument("--yes", action="store_true", help=_YES_HELP_RISK)
 
     close = command("close", "cierra una posición abierta y la guarda como operación")
     close.add_argument(
@@ -1141,6 +1294,12 @@ def build_parser() -> argparse.ArgumentParser:
         w.add_argument("--amount", type=amount_type, required=True, metavar="USD", help="monto")
         w.add_argument("--date", metavar="FECHA", help="cuándo (por defecto, ahora)")
         w.add_argument("--note", help="nota")
+        if name == "withdraw":
+            w.add_argument(
+                "--yes",
+                action="store_true",
+                help="confirmar un retiro más grande que tu saldo (¿un cero de más?)",
+            )
 
     ev = command("event", "marca un evento de alta volatilidad (bloquea los planes)")
     ev.add_argument("--note", required=True, help='qué evento es, ej. "CPI de EE. UU."')
@@ -1230,11 +1389,21 @@ def main(
     if is_new and db is not None and args.command in _NEEDS_EXISTING_DB:
         print(missing_db_message(paths.database), file=err)
         return EXIT_DATA
+    # Una base nueva se crea para poder validar el comando, pero solo queda si
+    # el comando salió bien (si falta --yes o una fecha está mal, se borra: una
+    # --db mal escrita no deja una base vacía que muestre todo en VERDE).
+    new_dirs = _missing_parents(paths.database) if is_new else []
     try:
         repo = Repository.open(paths.database, clock=now_fn)
     except (OSError, ValueError, RuntimeError, SQLAlchemyError) as exc:
         print(f"No se pudo abrir la base ({display_path(paths.database)}): {exc}", file=err)
+        if is_new:
+            _remove_new_db(paths.database, new_dirs)
         return EXIT_DATA
+    style = Style(enabled=bool(getattr(out, "isatty", lambda: False)()))
+    # Con una base nueva, la salida espera a saber si el comando salió bien
+    # (el aviso "Base nueva" va primero, y solo si la base queda).
+    buffer = io.StringIO() if is_new else None
     ctx = Context(
         settings=settings,
         profile=profile,
@@ -1242,26 +1411,86 @@ def main(
         paths=paths,
         tz=_tz(settings),
         now=now_fn(),
-        out=out,
+        out=out if buffer is None else buffer,
         err=err,
-        style=Style(enabled=bool(getattr(out, "isatty", lambda: False)())),
+        style=style,
         ask=ask or input,
     )
-    if is_new:
-        ctx.print(f"Base nueva: se creó {display_path(paths.database)}.", "dim")
+    code = EXIT_DATA
     try:
-        return _HANDLERS[args.command](args, ctx)
+        code = _HANDLERS[args.command](args, ctx)
     except (NotFoundError, NeedsConfirmationError) as exc:
         print(str(exc), file=err)
-        return EXIT_DATA
+        code = EXIT_DATA
     except ValueError as exc:
         print(f"Dato inválido: {exc}", file=err)
-        return EXIT_USAGE
+        code = EXIT_USAGE
+    except LockWriteError as exc:
+        # El problema es el archivo LOCKED (permisos, disco), no la base.
+        print(lock_write_error_text(exc), file=err)
+        code = EXIT_DATA
     except (OSError, SQLAlchemyError) as exc:
         print(f"No se pudo usar la base ({display_path(paths.database)}): {exc}", file=err)
-        return EXIT_DATA
+        code = EXIT_DATA
     finally:
+        # Si el comando falló, la base nueva se borra solo si de verdad quedó vacía.
+        remove = buffer is not None and code != EXIT_OK and _db_is_empty(repo)
         repo.engine.dispose()
+        if buffer is not None:
+            if remove:
+                _remove_new_db(paths.database, new_dirs)
+            elif paths.database.exists():
+                created = f"Base nueva: se creó {display_path(paths.database)}."
+                buffer.seek(0)
+                rest = buffer.read()
+                buffer = io.StringIO()
+                buffer.write(style.paint(created, "dim") + "\n" + rest)
+            # La salida ya no puede cambiar lo guardado: si la terminal se cerró
+            # (por ejemplo, con "| head"), no se hace nada más.
+            with contextlib.suppress(BrokenPipeError):
+                out.write(buffer.getvalue())
+    return code
+
+
+def _db_is_empty(repo: Repository) -> bool:
+    """``True`` si la base no tiene nada cargado (``False`` ante cualquier duda: no se borra)."""
+    try:
+        return not (
+            repo.list_trades()
+            or repo.list_open_positions()
+            or repo.list_wallet_events()
+            or repo.list_volatility_events()
+            or repo.list_safety_locks()
+            or repo.list_analyses(limit=1)
+        )
+    except Exception:  # si no se puede leer, mejor dejarla
+        return False
+
+
+def _missing_parents(path: Path) -> list[Path]:
+    """Las carpetas de ``path`` que todavía no existen (la base nueva las crea)."""
+    missing: list[Path] = []
+    folder = path.parent
+    while not folder.exists() and folder != folder.parent:
+        missing.append(folder)
+        folder = folder.parent
+    return missing
+
+
+def _remove_new_db(path: Path, new_dirs: Sequence[Path]) -> None:
+    """Borra una base recién creada por un comando que falló (y las carpetas que creó).
+
+    Solo se llama si la base no existía antes de este comando y quedó vacía
+    (``_db_is_empty``). Las carpetas se borran solo si quedaron vacías.
+    """
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        with contextlib.suppress(OSError):
+            Path(f"{path}{suffix}").unlink(missing_ok=True)
+    for folder in new_dirs:  # de la más profunda a la más alta
+        try:
+            folder.rmdir()
+        except OSError:
+            break
 
 
 if __name__ == "__main__":

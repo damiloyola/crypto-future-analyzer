@@ -173,13 +173,20 @@ def live_extra_sources(
     client: httpx.AsyncClient,
     cache: TTLCache,
     secrets: Secrets | None,
+    clock: Callable[[], datetime] | None = None,
 ) -> ExtraSources:
-    """Fear & Greed (alternative.me), CoinGecko y noticias reales."""
+    """Fear & Greed (alternative.me), CoinGecko y noticias reales.
+
+    ``clock``: la hora para el corte de antigüedad de las noticias (por
+    defecto, la actual); los tests pasan un reloj fijo.
+    """
     token = secrets.cryptopanic_api_key if secrets is not None else None
     return ExtraSources(
         fear_greed=lambda: get_fear_greed(client, cache, settings),
         global_market=lambda: get_global_market(client, cache, settings),
-        news=lambda: get_headlines(symbol, client, cache, settings, token),
+        news=lambda: get_headlines(
+            symbol, client, cache, settings, token, now=None if clock is None else clock()
+        ),
     )
 
 
@@ -637,7 +644,9 @@ async def build_snapshot(
     if extras is None:
         if client is None or cache is None:
             raise ValueError("Sin extras hacen falta client y cache para las fuentes reales")
-        extras = live_extra_sources(symbol.strip().upper(), settings, client, cache, secrets)
+        extras = live_extra_sources(
+            symbol.strip().upper(), settings, client, cache, secrets, clock=clock
+        )
     return await _assemble(
         symbol,
         settings,

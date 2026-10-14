@@ -52,6 +52,16 @@ def repo(db: Path, now: datetime = NOW) -> Repository:
     return Repository.open(db, clock=lambda: now)
 
 
+def lock_of(db: Path) -> Path:
+    """El LOCKED de una base de ``--db``: con el nombre de la base (``estado.LOCKED``)."""
+    return db.parent / f"{db.stem}.LOCKED"
+
+
+def incidents_of(db: Path) -> Path:
+    """La carpeta de informes de una base de ``--db`` (``estado_incidents/``)."""
+    return db.parent / f"{db.stem}_incidents"
+
+
 def create(db: Path) -> Path:
     """Crea la base vacía (``list``, ``status``, ``close`` y ``delete`` no la crean)."""
     repo(db).engine.dispose()
@@ -480,10 +490,24 @@ def test_status_green(db):
 
 
 def test_three_losses_start_the_cooldown(db):
+    # Abiertas ayer: así no llegan también al máximo de operaciones de hoy (otro freno).
+    opened = ("--opened", "13/10 20:00")
     for hour in ("12:00", "13:00"):
-        run(db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-10", "--closed", hour)
+        run(
+            db,
+            "add",
+            "--symbol",
+            "BTC",
+            "--side",
+            "long",
+            "--pnl",
+            "-10",
+            "--closed",
+            hour,
+            *opened,
+        )
     code, out, _ = run(
-        db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-10", "--closed", "14:00"
+        db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-10", "--closed", "14:00", *opened
     )
     assert code == 0
     assert (
@@ -521,7 +545,7 @@ def test_drawdown_lock_is_written_by_status_once(db):
         "2026-10-08 12:00",
     )
     assert code == 0
-    lock = db.parent / "LOCKED"
+    lock = lock_of(db)
     # Hallazgo 13: el bloqueo está pendiente; no manda a borrar un LOCKED que no existe.
     assert (
         "Frenos de seguridad: ROJO · No se generan planes: la billetera del mes cayó 73,33 % desde "
@@ -533,15 +557,16 @@ def test_drawdown_lock_is_written_by_status_once(db):
     assert not lock.exists()  # cargar no escribe el LOCKED
     code, out, _ = run(db, "status")
     assert code == 0 and lock.exists()
-    reports = list((db.parent / "incidents").glob("*.md"))
+    reports = list(incidents_of(db).glob("*.md"))
     assert len(reports) == 1
     assert "APP BLOQUEADA: no se arma ningún plan" in out
     assert "Recién se bloqueó la app" in out
     first = lock.read_text(encoding="utf-8")
     code, out, _ = run(db, "status", now=NOW + timedelta(hours=1))
     assert lock.read_text(encoding="utf-8") == first
-    assert len(list((db.parent / "incidents").glob("*.md"))) == 1
+    assert len(list(incidents_of(db).glob("*.md"))) == 1
     assert "Recién se bloqueó" not in out and "APP BLOQUEADA" in out
+    assert not (db.parent / "LOCKED").exists()  # nunca el nombre de la base real
 
 
 # --- opciones generales --------------------------------------------------------------------
@@ -850,7 +875,7 @@ def test_makefiles_pass_the_invocation_dir_and_personal_files_are_ignored():
     for script in ("analyze_cli $(SYMBOL)", "trades $(ARGS)", "trades list", "trades status"):
         assert f"$(FROM_DIR) .venv/bin/python -m scripts.{script}" in text, script
     ignored = (root / ".gitignore").read_text(encoding="utf-8").splitlines()
-    for pattern in ("*.db", "LOCKED", "incidents/"):
+    for pattern in ("*.db", "LOCKED", "incidents/", "*.LOCKED", "*_incidents/"):
         assert pattern in ignored
 
 
@@ -864,14 +889,15 @@ def test_reaching_the_trades_of_the_day_is_warned(db):
     _, out, _ = run(
         db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "5", "--closed", "12:00"
     )
+    # Tercera ronda (E4): el máximo de operaciones del día es un freno (estado ROJO).
     assert (
-        "Frenos de seguridad: VERDE · Ningún freno activo, pero ojo: ya hiciste 3 de 3 "
-        "operaciones permitidas hoy: no va a haber planes hasta mañana."
+        "Frenos de seguridad: ROJO · No se generan planes: ya hiciste 3 de 3 operaciones "
+        "permitidas hoy, hasta que termine el día (a las 00:00)."
     ) in out
     _, out, _ = run(db, "status")
     assert (
-        "Estado: VERDE · Ningún freno activo, pero ojo: ya hiciste 3 de 3 operaciones permitidas "
-        "hoy: no va a haber planes hasta mañana."
+        "Estado: ROJO · No se generan planes: ya hiciste 3 de 3 operaciones permitidas hoy, "
+        "hasta que termine el día (a las 00:00)."
     ) in out
 
 
@@ -882,15 +908,22 @@ def test_trades_warning_is_added_to_other_headlines(db):
     _, out, _ = run(
         db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "5", "--closed", "12:00"
     )
-    assert "Frenos de seguridad: ROJO · No se generan planes: hay un evento" in out
-    assert "Ojo: ya hiciste 3 de 3 operaciones permitidas hoy" in out
+    assert (
+        "Frenos de seguridad: ROJO · No se generan planes: ya hiciste 3 de 3 operaciones "
+        "permitidas hoy, hasta que termine el día (a las 00:00) (y 1 freno más)."
+    ) in out
 
 
-def test_trades_limit_text():
-    assert trades._trades_limit_text(2, 3) is None
-    assert trades._trades_limit_text(5, None) is None
-    assert "ya hiciste 4 de 3 operaciones permitidas hoy" in trades._trades_limit_text(4, 3)
-    assert "tu perfil no permite operaciones" in trades._trades_limit_text(0, 0)
+def test_trades_limit_is_not_repeated_after_the_headline(db):
+    """E4: el máximo de operaciones ya es un freno; no se agrega aparte "Ojo: ya hiciste..."."""
+    for hour in ("10:00", "11:00", "12:00"):
+        _, out, _ = run(
+            db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "5", "--closed", hour
+        )
+    assert out.count("ya hiciste 3 de 3 operaciones permitidas hoy") == 1
+    assert "Ojo: ya hiciste" not in out and "no va a haber planes hasta mañana" not in out
+    _, out, _ = run(db, "status")
+    assert "Ningún freno activo" not in out and "Ojo: ya hiciste" not in out
 
 
 # --- revisión del Hito 5: confirmación con --yes (D7) y caída recortada ---------------------
@@ -973,10 +1006,14 @@ def test_drawdown_shown_is_clamped_at_100_percent(db):
         "--yes",
     )
     assert code == 0
-    assert "la billetera del mes cayó 100 % desde su máximo" in out and "133" not in out
+    # Tercera ronda (E5): con el saldo calculado negativo, "más del 100 %" y revisar los datos.
+    assert "la billetera del mes cayó más del 100 % desde su máximo" in out and "133" not in out
     code, out, _ = run(db, "status")
-    assert "caída 100,0 %" in out and "100 % de 70 %" in out
-    assert "Tu billetera cayó 100 % desde su máximo del mes (300 USD → -100 USD)" in out
+    # E5: la fila de la billetera dice lo mismo que el freno (nada de "100,0 %").
+    assert "caída más del 100 %" in out and "más del 100 % de 70 %" in out
+    assert "100,0 %" not in out
+    assert "Tu billetera cayó más del 100 % desde su máximo del mes (300 USD → -100 USD)" in out
+    assert "un resultado o un retiro mal tipeado" in out
     assert "133" not in out
 
 
@@ -1082,3 +1119,340 @@ def test_auto_link_with_only_test_analyses_links_nothing(db):
         f"No había un análisis real de BTC en las 24 h antes de abrir: el #{test.id} es de prueba "
         "(datos sintéticos y números de prueba) y no se liga solo" in out
     )
+
+
+# --- tercera ronda del Hito 5: confirmaciones (E9), stop movido, fechas y bases nuevas ------
+
+
+def _config_with(tmp_path: Path, **manual: object) -> Path:
+    """``config.yaml`` real con ``app.manual_input`` cambiado (para apagar confirmaciones)."""
+    data = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    data["app"]["manual_input"].update(manual)
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+    return config
+
+
+def test_a_withdrawal_bigger_than_the_balance_needs_yes(db):
+    """E9: retirar 1000 con saldo 200 pide --yes y no guarda nada; con --yes se guarda."""
+    run(db, "balance", "--amount", "200", "--date", "2026-10-01 09:00")
+    code, out, err = run(db, "withdraw", "--amount", "1000")
+    assert code == 1 and out == ""
+    assert (
+        "Ojo: el retiro de 1.000,00 USD es más grande que el saldo de tu billetera el 14/10 "
+        "15:00 (200,00 USD). ¿No será un error de tipeo (un cero de más)?"
+    ) in err
+    assert "agregando --yes. No se guardó nada." in err
+    assert [e.kind for e in repo(db).list_wallet_events()] == ["balance"]
+    code, out, err = run(db, "withdraw", "--amount", "1000", "--yes")
+    assert code == 0, err
+    assert "Retiro #2 guardado: -1.000,00 USD" in out
+    # Lo que se puede retirar no pide nada.
+    code, _, err = run(db, "deposit", "--amount", "900")
+    assert code == 0, err
+    code, _, err = run(db, "withdraw", "--amount", "50")
+    assert code == 0, err
+
+
+def test_the_withdrawal_check_uses_the_balance_at_its_date(db):
+    run(db, "balance", "--amount", "300", "--date", "2026-10-01 09:00")
+    run(db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-100", "--closed", "05/10 10:00")
+    # El 04/10 el saldo era 300: retirar 250 entra.
+    code, _, err = run(db, "withdraw", "--amount", "250", "--date", "04/10 10:00")
+    assert code == 0, err
+    code, _, err = run(db, "withdraw", "--amount", "250", "--date", "06/10 10:00")
+    assert code == 1 and "el 06/10 10:00 (-50,00 USD)" in err
+
+
+def test_withdrawal_confirmation_can_be_turned_off(tmp_path, db):
+    config = _config_with(tmp_path, confirm_withdrawal_over_balance=False)
+    run(db, "balance", "--amount", "200", "--date", "2026-10-01 09:00")
+    code, _, err = run(db, "withdraw", "--amount", "1000", "--config", str(config))
+    assert code == 0, err
+
+
+def test_open_and_update_with_a_huge_risk_need_yes(db):
+    """E9: un riesgo abierto mayor que el saldo o que 3 × el riesgo por operación pide --yes."""
+    cap, _ = _limits()
+    run(db, "balance", "--amount", "1000", "--date", "2026-10-01 09:00")
+    code, out, err = run(db, "open", "--symbol", "BTC", "--side", "long", "--risk", "500")
+    assert code == 1 and out == ""
+    assert (
+        "Ojo: el riesgo de 500,00 USD (lo que perdés si toca el stop) es más grande que 3 veces "
+        f"tu riesgo por operación ({fmt_usd_text(cap)})."
+    ) in err
+    assert 'puede dejar todos los planes en "No operar"' in err and "--yes" in err
+    assert repo(db).list_open_positions() == []
+    code, out, err = run(db, "open", "--symbol", "BTC", "--side", "long", "--risk", "500", "--yes")
+    assert code == 0, err
+    code, _, err = run(db, "open", "--symbol", "ETH", "--side", "long", "--risk", "40")
+    assert code == 0, err
+    code, out, err = run(db, "update", "2", "--risk", "400")
+    assert code == 1 and "el riesgo de 400,00 USD" in err
+    assert repo(db).get_open_position(2).risk_usd == 40.0
+    code, out, err = run(db, "update", "2", "--risk", "400", "--yes")
+    assert code == 0, err
+    assert repo(db).get_open_position(2).risk_usd == 400.0
+
+
+def test_open_risk_bigger_than_the_balance_needs_yes(db):
+    run(db, "balance", "--amount", "100", "--date", "2026-10-01 09:00")
+    code, _, err = run(db, "open", "--symbol", "BTC", "--side", "long", "--risk", "120")
+    assert code == 1 and "más grande que el saldo de tu billetera (100,00 USD)" in err
+
+
+def test_open_risk_confirmation_can_be_turned_off(tmp_path, db):
+    config = _config_with(tmp_path, confirm_open_risk_over_limits=False)
+    code, _, err = run(
+        db, "open", "--symbol", "BTC", "--side", "long", "--risk", "500", "--config", str(config)
+    )
+    assert code == 0, err
+
+
+def fmt_usd_text(value: float) -> str:
+    """``150.0`` → ``"150,00 USD"`` (como lo escribe la consola)."""
+    return f"{value:,.2f} USD".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("withdraw", "--amount", "1000"),
+        ("open", "--symbol", "BTC", "--side", "long", "--risk", "500"),
+        ("add", "--symbol", "BTC", "--side", "long", "--pnl", "-325"),
+        ("add", "--symbol", "BTC", "--side", "long", "--pnl", "-5", "--closed", "25:00"),
+        ("add", "--symbol", "BTC", "--side", "long", "--pnl", "-5", "--closed", "15/10 10:00"),
+        ("event", "--note", "CPI", "--until", "2026-12-01 10:00"),
+    ],
+)
+def test_a_failed_command_does_not_leave_a_new_db(tmp_path, argv):
+    """Sin --yes (o con un dato mal), no se guarda nada y no queda una base nueva."""
+    db = tmp_path / "nueva" / "typo.db"
+    code, out, err = run(db, *argv)
+    assert code in (1, 2) and err
+    assert "Base nueva" not in out
+    assert not db.exists() and not db.parent.exists()
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_new_db_is_announced_first_when_the_command_works(tmp_path):
+    db = tmp_path / "nueva" / "estado.db"
+    code, out, err = run(db, "balance", "--amount", "300")
+    assert code == 0, err
+    assert out.splitlines()[0] == f"Base nueva: se creó {db}."
+    assert "Saldo anotado #1 guardado" in out
+
+
+def test_update_keeps_the_planned_risk_and_says_so(db):
+    """`update N --risk 0` no pisa el riesgo previsto al abrir (el informe lo usa)."""
+    run(db, "open", "--symbol", "BTC", "--side", "long", "--risk", "40", "--opened", "10:00")
+    code, out, err = run(db, "update", "1", "--risk", "0")
+    assert code == 0, err
+    assert "riesgo 40,00 USD → 0,00 USD" in out
+    assert (
+        "El riesgo previsto al abrir (40,00 USD) queda anotado igual: el informe de un "
+        "incidente lo usa para saber si moviste el stop."
+    ) in out
+    position = repo(db).get_open_position(1)
+    assert position.risk_usd == 0.0 and position.planned_risk_usd == 40.0
+    _, out, _ = run(db, "list")
+    assert "0,00 USD (previsto 40,00 USD)" in out
+    code, out, err = run(db, "update", "1", "--risk", "60")
+    assert code == 0, err
+    assert "Ojo: ahora arriesgás más que lo previsto (agrandaste el stop)" in out
+    run(db, "close", "1", "--pnl", "-12")
+    [trade] = repo(db).list_trades()
+    assert trade.planned_risk_usd == 40.0
+    _, out, _ = run(db, "list")
+    assert "60,00 USD (previsto 40,00 USD)" in out
+
+
+def test_feb_29_without_year_asks_for_the_year(db):
+    """2025, 2026 y 2027 no son bisiestos: "29/02 10:00" no es del año 2000."""
+    with pytest.raises(ValueError, match="La fecha 29/02 no existe en estos años: poné el año"):
+        parse_user_datetime("29/02 10:00", BA, NOW, year="past")
+    with pytest.raises(ValueError, match=r'\(ej\. "29/02/2028 10:00"\)'):
+        parse_user_datetime("29/02 10:00", BA, NOW)
+    code, out, err = run(
+        db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-5", "--closed", "29/02 10:00"
+    )
+    assert code == 2 and "La fecha 29/02 no existe en estos años: poné el año" in err
+    assert not db.exists()
+    # Con un año bisiesto cerca, es el más reciente.
+    march_2025 = datetime(2025, 3, 10, 12, 0, tzinfo=BA)
+    assert parse_user_datetime("29/02 10:00", BA, march_2025, year="past") == datetime(
+        2024, 2, 29, 10, 0, tzinfo=BA
+    )
+
+
+@pytest.mark.parametrize(
+    ("now", "text", "expected"),
+    [
+        # Más de medio año adelante: es del año anterior (Año Nuevo).
+        (datetime(2027, 1, 1, 1, 0, tzinfo=BA), "31/12 23:00", datetime(2026, 12, 31, 23, 0)),
+        (datetime(2027, 2, 10, 12, 0, tzinfo=BA), "15/12 10:00", datetime(2026, 12, 15, 10, 0)),
+        (datetime(2027, 3, 1, 12, 0, tzinfo=BA), "30/09 10:00", datetime(2026, 9, 30, 10, 0)),
+        # Ya pasó este año.
+        (NOW, "13/10 14:30", datetime(2026, 10, 13, 14, 30)),
+    ],
+)
+def test_a_yearless_date_far_ahead_is_last_year(now, text, expected):
+    assert parse_user_datetime(text, BA, now, year="past") == expected.replace(tzinfo=BA)
+
+
+@pytest.mark.parametrize("text", ["15/10 10:00", "13/11 10:00", "31/12 23:00"])
+def test_a_yearless_date_a_few_days_ahead_is_rejected(db, text):
+    """Un "15/10" escrito el 14/10 es un error de tipeo, no algo de hace un año."""
+    code, out, err = run(
+        db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-60", "--closed", text
+    )
+    assert code == 2 and out == ""
+    assert f"La hora de cierre ({text[:5]}/2026 {text[6:]}) está en el futuro" in err
+    code, _, err = run(db, "balance", "--amount", "250", "--date", text)
+    assert code == 2 and f"({text[:5]}/2026 {text[6:]}) está en el futuro" in err
+    assert not db.exists()
+
+
+def test_status_explains_a_lock_write_error_without_piling_up_reports(db, monkeypatch):
+    """Si no se puede escribir el LOCKED: no es "la base", y no se acumulan informes."""
+    import app.safety.breakers as breakers
+
+    run(db, "balance", "--amount", "300", "--date", "2026-10-01 09:00")
+    for closed in ("2026-10-05 12:00", "2026-10-08 12:00"):
+        run(db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-110", "--closed", closed)
+
+    def denied(path, **_kwargs):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(breakers, "write_lock", denied)
+    for minutes in (0, 1, 2):
+        code, out, err = run(db, "status", now=NOW + timedelta(minutes=minutes))
+        assert code == 1 and out == ""
+        assert f"No se pudo escribir el archivo LOCKED ({lock_of(db)}): Permission denied." in err
+        assert "La app no arma planes hasta que se pueda escribir" in err
+        assert "No se pudo usar la base" not in err
+    assert not lock_of(db).exists()
+    assert len(list(incidents_of(db).glob("*.md"))) == 1
+
+
+def test_a_test_db_in_data_does_not_share_the_real_lock(tmp_path):
+    """Una --db de prueba al lado de la base real tiene su propio LOCKED (y al revés)."""
+    data_dir = tmp_path / "data"
+    config_data = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    config_data["app"].update(
+        {
+            "database_file": str(data_dir / "analyzer.db"),
+            "lock_file": str(data_dir / "LOCKED"),
+            "incident_dir": str(data_dir / "incidents"),
+        }
+    )
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump(config_data, allow_unicode=True), encoding="utf-8")
+
+    def go(*argv: str, db: Path | None = None):
+        out, err = io.StringIO(), io.StringIO()
+        extra = ["--config", str(config)] + ([] if db is None else ["--db", str(db)])
+        code = main([*argv, *extra], out=out, err=err, clock=lambda: NOW)
+        return code, out.getvalue(), err.getvalue()
+
+    go("balance", "--amount", "300", "--date", "2026-10-01 09:00")  # base real
+    test_db = data_dir / "prueba.db"
+    go("balance", "--amount", "300", "--date", "2026-10-01 09:00", db=test_db)
+    for closed in ("2026-10-05 12:00", "2026-10-08 12:00"):
+        go(
+            "add",
+            "--symbol",
+            "BTC",
+            "--side",
+            "long",
+            "--pnl",
+            "-110",
+            "--closed",
+            closed,
+            db=test_db,
+        )
+    code, out, _ = go("status", db=test_db)
+    assert code == 0 and "Recién se bloqueó la app" in out
+    assert (data_dir / "prueba.LOCKED").exists() and list(
+        (data_dir / "prueba_incidents").glob("*.md")
+    )
+    assert not (data_dir / "LOCKED").exists() and not (data_dir / "incidents").exists()
+    code, out, _ = go("status")  # la real sigue en verde
+    assert code == 0 and "Estado: VERDE" in out and "APP BLOQUEADA" not in out
+    # Y al revés: con la real bloqueada, la de prueba no lo está.
+    (data_dir / "prueba.LOCKED").unlink()
+    (data_dir / "LOCKED").write_text("bloqueo a mano", encoding="utf-8")
+    code, out, _ = go("status", db=test_db)
+    assert "Bloqueo total (archivo LOCKED)         no existe" in out
+    # La base real elegida con --db usa el LOCKED real.
+    code, out, _ = go("status", db=data_dir / "analyzer.db")
+    assert "APP BLOQUEADA" in out
+
+
+def test_backfilled_lock_is_said_after_loading(db):
+    """E2: cargar algo con un LOCKED de este mes sin anotar lo anota y lo dice."""
+    from app.safety.lockfile import write_lock
+
+    run(db, "balance", "--amount", "300", "--date", "2026-10-01 09:00")
+    write_lock(
+        lock_of(db),
+        reason="La billetera del mes cayó 72 % desde su máximo.",
+        triggered_at=NOW - timedelta(days=1),
+        report_path=None,
+        trigger_code="monthly_drawdown_lock",
+    )
+    code, out, err = run(db, "deposit", "--amount", "10")
+    assert code == 0, err
+    assert "no estaba anotado en la base: se anotó ahora con su fecha" in out
+    assert len(repo(db).list_safety_locks()) == 1
+    _, out, _ = run(db, "deposit", "--amount", "10")
+    assert "se anotó ahora" not in out
+
+
+def test_negative_balance_row_warns_to_check_the_data(db):
+    """E5: saldo anotado 0 y una pérdida: "más del 100 %"/aviso de revisar en la billetera."""
+    run(db, "balance", "--amount", "0", "--date", "2026-10-01 00:00")
+    run(
+        db,
+        "add",
+        "--symbol",
+        "BTC",
+        "--side",
+        "long",
+        "--pnl",
+        "-50",
+        "--closed",
+        "05/10 10:00",
+        "--yes",
+    )
+    _, out, _ = run(db, "status")
+    assert "saldo -50,00 USD" in out
+    assert "Ojo: el saldo calculado de tu billetera da negativo (-50 USD)" in out
+    assert "100,0 %" not in out
+
+
+def test_a_new_db_with_something_saved_is_never_removed(tmp_path, monkeypatch):
+    """Si el comando falla después de guardar, la base nueva queda (con lo guardado)."""
+    from sqlalchemy.exc import OperationalError
+
+    def broken(_ctx):
+        raise OperationalError("SELECT 1", {}, Exception("disco"))
+
+    monkeypatch.setattr(trades, "_safety_lines", broken)
+    db = tmp_path / "nueva" / "estado.db"
+    code, out, err = run(db, "balance", "--amount", "300")
+    assert code == 1 and "No se pudo usar la base" in err
+    assert db.exists() and len(repo(db).list_wallet_events()) == 1
+    assert out.splitlines()[0] == f"Base nueva: se creó {db}."
+
+
+def test_a_confirmed_oversized_withdrawal_says_the_monthly_brake_is_off(db):
+    """Con --yes el retiro entra; la billetera no dice "pasa el 100 %" junto a "caída 0 %"."""
+    run(db, "balance", "--amount", "300", "--date", "2026-10-01 09:00")
+    run(db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-100", "--closed", "05/10 10:00")
+    code, _, err = run(db, "withdraw", "--amount", "1000", "--date", "06/10 10:00", "--yes")
+    assert code == 0, err
+    _, out, _ = run(db, "status")
+    assert "saldo -800,00 USD" in out
+    assert "no se puede medir bien y el freno del mes no salta hasta que lo corrijas" in out
+    assert "pasa el 100 %" not in out

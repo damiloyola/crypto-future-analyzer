@@ -14,7 +14,9 @@ Qué hay acá
     - ``write_lock(path, *, reason, triggered_at, report_path)``: crea el
       archivo de forma atómica. **Nunca pisa un lock existente**: si ya hay
       uno, no lo toca (se conserva el primer incidente, sin agregarle nada) y
-      devuelve el que está. ``LockWriteResult.created`` dice si lo creó.
+      devuelve el que está. ``LockWriteResult.created`` dice si lo creó. Si
+      no se puede escribir (permisos, disco lleno), lanza ``LockWriteError``
+      (es un ``OSError``) con un mensaje claro para el usuario.
     - ``read_lock(path) -> LockInfo``: lee el lock. Tolera un archivo editado a
       mano, roto o ilegible: si existe, **sigue bloqueado** aunque no se
       entienda lo que dice (``readable=False``).
@@ -26,11 +28,14 @@ Qué hay acá
 Formato del archivo
     La primera línea es para la app: ``LOCKED `` seguido de un JSON de una
     línea con ``version``, ``reason``, ``triggered_at`` (ISO, UTC),
-    ``report_path`` y ``trigger_code``. Después viene el texto para el usuario,
-    en castellano: por qué se bloqueó, cuándo (en su zona horaria), dónde está
-    el informe y cómo desbloquear ("revisá el informe y borrá este archivo a
-    mano"). Al leer, la app busca la primera línea que empiece con ``LOCKED {``
-    (tolera renglones agregados arriba).
+    ``report_path``, ``trigger_code`` y, si se pasaron, los números del
+    disparo (``drawdown_pct``, ``peak_usd``, ``balance_usd`` y
+    ``measured_since``: desde cuándo se midió la caída, si fue desde un
+    bloqueo anterior). Un LOCKED viejo sin números se lee igual. Después viene
+    el texto para el usuario, en castellano: por qué se bloqueó, cuándo (en su
+    zona horaria), dónde está el informe y cómo desbloquear ("revisá el
+    informe y borrá este archivo a mano"). Al leer, la app busca la primera
+    línea que empiece con ``LOCKED {`` (tolera renglones agregados arriba).
 
 Decisiones
     - **Primero el informe, después el lock**: quien llama escribe el informe y
@@ -48,6 +53,7 @@ Decisiones
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
@@ -75,6 +81,17 @@ def _iso(dt: datetime | None) -> str | None:
     return None if dt is None else dt.isoformat()
 
 
+def _finite(value: Any) -> float | None:
+    """Número finito o ``None`` (no lanza nunca)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
 def _clean_text(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -89,6 +106,8 @@ class LockInfo:
     - ``exists``: hay algo en ``path`` (la app está bloqueada).
     - ``reason``, ``triggered_at``, ``report_path``, ``trigger_code``: lo que
       dice el encabezado (``None`` si falta o no se pudo leer).
+    - ``drawdown_pct``, ``peak_usd``, ``balance_usd``, ``measured_since``: los
+      números del disparo, si el LOCKED los tiene (los de versiones viejas no).
     - ``readable``: ``False`` si el archivo existe pero no tiene un encabezado
       válido (editado a mano, roto, sin permiso de lectura...). Sigue
       bloqueado igual.
@@ -101,6 +120,10 @@ class LockInfo:
     report_path: str | None = None
     trigger_code: str | None = None
     readable: bool = True
+    drawdown_pct: float | None = None
+    peak_usd: float | None = None
+    balance_usd: float | None = None
+    measured_since: datetime | None = None
 
     @property
     def locked(self) -> bool:
@@ -144,9 +167,51 @@ class LockInfo:
                 "report_path": self.report_path,
                 "trigger_code": self.trigger_code,
                 "readable": self.readable,
+                "drawdown_pct": self.drawdown_pct,
+                "peak_usd": self.peak_usd,
+                "balance_usd": self.balance_usd,
+                "measured_since": _iso(self.measured_since),
                 "message": self.describe(tz),
             }
         )
+
+
+class LockWriteError(OSError):
+    """No se pudo escribir el archivo LOCKED (permisos, disco lleno, carpeta rara...).
+
+    Es un ``OSError``, así que un manejo genérico de errores de disco lo
+    atrapa igual; las consolas lo atrapan aparte para decir qué pasa. Trae
+    ``path`` (dónde se quiso escribir), ``report_path`` (el informe del
+    incidente, si quedó escrito) y ``reason`` (el error original, en texto).
+    El mensaje (``str(error)``) ya está listo para mostrar.
+    """
+
+    def __init__(
+        self,
+        path: Path | str,
+        reason: BaseException | str,
+        *,
+        report_path: Path | str | None = None,
+    ) -> None:
+        self.path = str(path)
+        # De un OSError alcanza con su explicación ("Permission denied"): la
+        # ruta ya va en el mensaje.
+        detail = getattr(reason, "strerror", None) if isinstance(reason, OSError) else None
+        self.reason = str(detail or reason).strip() or type(reason).__name__
+        self.report_path = None if report_path is None else str(report_path)
+        report = (
+            f" El informe del incidente sí quedó guardado: {self.report_path}."
+            if self.report_path
+            else ""
+        )
+        super().__init__(
+            f"No se pudo escribir el archivo LOCKED ({self.path}): {self.reason}. La app no arma "
+            "planes hasta que se pueda escribir: revisá los permisos de esa carpeta y el espacio "
+            f"en disco, y volvé a correr la app.{report}"
+        )
+
+    def __str__(self) -> str:
+        return str(self.args[0]) if self.args else "No se pudo escribir el archivo LOCKED."
 
 
 @dataclass(frozen=True)
@@ -171,8 +236,16 @@ def build_lock_text(
     report_path: Path | str | None,
     trigger_code: str | None = None,
     tz: str | tzinfo | None = None,
+    drawdown_pct: float | None = None,
+    peak_usd: float | None = None,
+    balance_usd: float | None = None,
+    measured_since: datetime | None = None,
 ) -> str:
-    """Contenido del archivo LOCKED: encabezado para la app + texto para el usuario."""
+    """Contenido del archivo LOCKED: encabezado para la app + texto para el usuario.
+
+    Los números del disparo (opcionales) van solo en el encabezado: sirven
+    para anotar el bloqueo en la base si no quedó anotado.
+    """
     if not isinstance(triggered_at, datetime):
         raise TypeError(
             f"triggered_at tiene que ser una fecha (datetime), llegó {type(triggered_at).__name__}"
@@ -188,6 +261,14 @@ def build_lock_text(
         "report_path": report,
         "trigger_code": _clean_text(trigger_code),
     }
+    numbers = {"drawdown_pct": drawdown_pct, "peak_usd": peak_usd, "balance_usd": balance_usd}
+    for key, value in numbers.items():
+        v = _finite(value)
+        if v is not None:
+            header[key] = round(v, 6)
+    since = to_utc(measured_since)
+    if since is not None:
+        header["measured_since"] = since.isoformat()
     rule = "=" * 64
     why_lines = "\n".join(f"  {line.strip()}" for line in why.splitlines() if line.strip())
     report_lines = (
@@ -229,11 +310,13 @@ def build_lock_text(
 
 
 def parse_lock_header(text: str) -> dict[str, Any] | None:
-    """Datos del encabezado (``reason``, ``triggered_at``, ``report_path``, ``trigger_code``).
+    """Datos del encabezado (``reason``, ``triggered_at``, ``report_path``, ``trigger_code``...).
 
     Busca la primera línea que empiece con ``LOCKED {`` y lee el JSON. Cada
-    campo con un tipo inválido queda en ``None``; ``triggered_at`` vuelve como
-    fecha en UTC. ``None`` si no hay un encabezado válido.
+    campo con un tipo inválido queda en ``None``; ``triggered_at`` y
+    ``measured_since`` vuelven como fecha en UTC; los números del disparo,
+    como ``float`` (``None`` si faltan: un LOCKED viejo). ``None`` si no hay
+    un encabezado válido.
     """
     for raw in text.splitlines():
         line = raw.lstrip("﻿").strip()
@@ -250,8 +333,21 @@ def parse_lock_header(text: str) -> dict[str, Any] | None:
             "triggered_at": to_utc(data.get("triggered_at")),
             "report_path": _clean_text(data.get("report_path")),
             "trigger_code": _clean_text(data.get("trigger_code")),
+            "drawdown_pct": _header_number(data.get("drawdown_pct")),
+            "peak_usd": _header_number(data.get("peak_usd")),
+            "balance_usd": _header_number(data.get("balance_usd")),
+            "measured_since": to_utc(data.get("measured_since"))
+            if isinstance(data.get("measured_since"), str)
+            else None,
         }
     return None
+
+
+def _header_number(value: Any) -> float | None:
+    """Número del encabezado (un texto o un booleano no cuentan)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return _finite(value)
 
 
 # --- disco ----------------------------------------------------------------------
@@ -296,6 +392,10 @@ def write_lock(
     report_path: Path | str | None,
     trigger_code: str | None = None,
     tz: str | tzinfo | None = None,
+    drawdown_pct: float | None = None,
+    peak_usd: float | None = None,
+    balance_usd: float | None = None,
+    measured_since: datetime | None = None,
 ) -> LockWriteResult:
     """Crea el archivo LOCKED (atómico, sin pisar nunca uno existente).
 
@@ -307,10 +407,14 @@ def write_lock(
     - ``tz``: zona horaria del usuario para la hora que se muestra en el texto
       (la de ``app.user_timezone``).
 
+    - ``drawdown_pct`` / ``peak_usd`` / ``balance_usd`` / ``measured_since``:
+      los números del disparo (opcionales, van en el encabezado).
+
     Si ya hay un lock, **no lo toca**: se conserva el primer incidente (sin
     agregarle nada) y se devuelve ``created=False`` con el lock que está.
-    Crea la carpeta si hace falta. Un error de disco (``OSError``) se propaga:
-    quien llama tiene que enterarse de que el bloqueo no quedó escrito.
+    Crea la carpeta si hace falta. Un error de disco se propaga como
+    ``LockWriteError`` (un ``OSError`` con un mensaje claro): quien llama
+    tiene que enterarse de que el bloqueo no quedó escrito.
     """
     text = build_lock_text(
         reason=reason,
@@ -318,8 +422,17 @@ def write_lock(
         report_path=report_path,
         trigger_code=trigger_code,
         tz=tz,
+        drawdown_pct=drawdown_pct,
+        peak_usd=peak_usd,
+        balance_usd=balance_usd,
+        measured_since=measured_since,
     )
-    created = create_new_file(path, text)
+    try:
+        created = create_new_file(path, text)
+    except LockWriteError:
+        raise
+    except OSError as exc:
+        raise LockWriteError(path, exc, report_path=report_path) from exc
     return LockWriteResult(created=created, lock=read_lock(path))
 
 
@@ -329,6 +442,7 @@ __all__ = [
     "LOCK_HEADER_PREFIX",
     "UNLOCK_INSTRUCTION",
     "LockInfo",
+    "LockWriteError",
     "LockWriteResult",
     "build_lock_text",
     "is_locked",

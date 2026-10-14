@@ -26,6 +26,7 @@ from app.safety.incident import (
     OBS_NO_ANALYSIS_CONTEXT,
     OBS_TOO_MANY_TRADES,
     OBS_TRADED_ON_NO_TRADE,
+    OBS_WIDENED_STOP,
     IncidentPosition,
     IncidentProfile,
     IncidentTrade,
@@ -33,9 +34,11 @@ from app.safety.incident import (
     IncidentWalletEvent,
     build_incident_report,
     create_new_file,
+    drawdown_over_100,
     find_observations,
     fmt_date,
     fmt_datetime,
+    fmt_drawdown_pct,
     fmt_long_datetime,
     fmt_month,
     fmt_plan_status,
@@ -45,6 +48,7 @@ from app.safety.incident import (
     incident_file_name,
     losing_streaks,
     md_cell,
+    negative_balance_warning,
     normalize_plan_status,
     resolve_timezone,
     sorted_trades,
@@ -405,9 +409,50 @@ def test_detects_losses_bigger_than_risk() -> None:
 
 
 def test_detects_missing_risk() -> None:
+    """Riesgo 0 no "falta": es el stop en la entrada (revisión 6)."""
     trades = [trade(risk_usd=None), trade(risk_usd=0, closed_at=at(1)), trade(closed_at=at(2))]
     o = obs(find_observations(trades), OBS_MISSING_RISK)
-    assert [i.split()[0] for i in o.items] == ["#1", "#2"]
+    assert [i.split()[0] for i in o.items] == ["#1"]
+    at_entry = IncidentTrade.from_value(trades[1])
+    assert not at_entry.missing_risk
+    assert at_entry.risk_text() == "0 USD (stop en la entrada)"
+    assert "sin riesgo anotado" not in at_entry.flags()
+
+
+def test_a_moved_stop_keeps_the_planned_risk() -> None:
+    """Revisión 6: el riesgo previsto es el de la apertura aunque después se movió el stop."""
+    widened = trade(pnl_usd=-80, risk_usd=80, initial_risk_usd=50, closed_at=at(1))
+    to_entry = trade(symbol="ETH", pnl_usd=-20, risk_usd=0, initial_risk_usd=50, closed_at=at(2))
+    observations = find_observations([widened, to_entry], tz=BA)
+    found = codes(observations)
+    assert OBS_MISSING_RISK not in found
+    loss = obs(observations, OBS_LOSS_ABOVE_RISK)
+    assert loss.items == (
+        "#1 BTC long, 05/10/2026 13:00: perdiste 80 USD con un riesgo previsto de 50 USD "
+        "(1,6 veces lo previsto)",
+    )
+    wide = obs(observations, OBS_WIDENED_STOP)
+    assert wide.items == (
+        "#1 BTC long, 05/10/2026 13:00: el riesgo previsto era 50 USD y lo agrandaste a "
+        "80 USD (-80 USD)",
+    )
+    assert "Revisé por qué agrandé el stop" in (wide.checklist_item or "")
+    first, second = (IncidentTrade.from_value(t) for t in (widened, to_entry))
+    assert first.flags() == ("perdió más que el riesgo previsto", "agrandaste el stop")
+    assert first.risk_text() == "50 USD (lo agrandaste a 80 USD)"
+    assert first.planned_risk_usd == 50 and first.widened_stop_usd == 30
+    assert second.flags() == ("moviste el stop a la entrada",)
+    assert second.risk_text() == "50 USD (moviste el stop a la entrada)"
+    assert second.loss_beyond_risk_usd is None
+    text = report(trades=[widened, to_entry])
+    assert "| 50 USD (lo agrandaste a 80 USD) |" in text
+    assert "| 50 USD (moviste el stop a la entrada) |" in text
+    assert "### Agrandaste el stop" in text
+    assert "sin riesgo anotado" not in text
+    d = first.to_dict()
+    assert (d["initial_risk_usd"], d["planned_risk_usd"], d["risk_usd"]) == (50, 50, 80)
+    pos = IncidentPosition.from_value({"symbol": "sol", "risk_usd": 0, "initial_risk_usd": 40})
+    assert pos.risk_text() == "0 USD (previsto 40 USD)"
 
 
 def test_detects_losing_streak() -> None:
@@ -850,11 +895,78 @@ def test_test_analyses_are_marked_and_do_not_feed_the_plan_observations() -> Non
     assert "(datos sintéticos)" not in report(trades=[trade()])
 
 
-def test_drawdown_above_100_percent_is_shown_as_100() -> None:
+def test_drawdown_above_100_percent_says_more_than_100_and_asks_to_check_the_data() -> None:
+    """Fix 7 / E5: con el saldo negativo se dice "más del 100 %" y se pide revisar los datos."""
     trig = {**TRIGGER, "current_balance_usd": -1500.0, "drawdown_pct": 250.0}
     text = report(trigger=trig)
-    assert "cayó **100 %** desde ese máximo" in text and "250" not in text.split("## Datos")[0]
+    assert "cayó **más del 100 %** desde ese máximo" in text
+    assert "250" not in text.split("## Datos")[0]
+    assert "Ojo: el saldo calculado de tu billetera da negativo (-1.500 USD)" in text
+    assert "puede haber un resultado o un retiro mal tipeado" in text
     assert (
-        "- Caída desde el máximo: 100 % (la cuenta dio 250 % porque el saldo calculado quedó "
-        "negativo: revisá lo cargado)"
+        "- Caída desde el máximo: más del 100 % (la cuenta dio 250 % porque el saldo calculado "
+        "quedó negativo: revisá lo cargado)"
     ) in text
+    assert "Ojo" not in report()
+
+
+def test_drawdown_helpers() -> None:
+    assert fmt_drawdown_pct(71.666) == "71,67 %"
+    assert fmt_drawdown_pct(69.996, 70) == "69,996 %"
+    assert fmt_drawdown_pct(100.0) == "100 %"
+    assert fmt_drawdown_pct(233.3, 70) == "más del 100 %"
+    assert fmt_drawdown_pct(None) == "—"
+    assert drawdown_over_100(100.0000001) is False and drawdown_over_100(100.01) is True
+    assert negative_balance_warning(0) is None and negative_balance_warning(None) is None
+    assert negative_balance_warning(-0.004) is None  # a centavos es 0
+    warning = negative_balance_warning(-50)
+    assert warning is not None and "(-50 USD)" in warning and "mal tipeado" in warning
+    assert "pasa el 100 %" in warning
+    assert "pasa el 100 %" in negative_balance_warning(-50, 133.3)
+    # Un retiro más grande que el saldo dejó el máximo en 0: la caída medida es 0 %.
+    zero = negative_balance_warning(-800, 0.0)
+    assert "pasa el 100 %" not in zero
+    assert "no se puede medir bien y el freno del mes no salta" in zero
+
+
+def test_month_totals_are_labelled_when_measured_since_an_unlock() -> None:
+    """Revisión 6: con la caída medida desde un desbloqueo, los totales son de todo el mes."""
+    trig = {**TRIGGER, "measured_since": WHEN - timedelta(days=2)}
+    trades = [trade(pnl_usd=-100), trade(pnl_usd=-50, closed_at=at(1))]
+    text = report(trigger=trig, trades=trades)
+    assert "- Operaciones en todo el mes: **2**" in text
+    assert "- Resultado neto en todo el mes: **-150 USD**" in text
+    assert "- Operaciones: **2**" in report(trades=trades)
+
+
+def test_the_fingerprint_ignores_the_time_but_not_the_data(tmp_path: Path) -> None:
+    """Fix 7: el mismo disparo con los mismos datos reusa el informe (no se apilan)."""
+    trades = [trade(pnl_usd=-100)]
+    first = incident.incident_fingerprint(
+        triggered_at=WHEN, trigger=TRIGGER, trades=trades, tz=BA, lock_path="data/LOCKED"
+    )
+    later = incident.incident_fingerprint(
+        triggered_at=WHEN + timedelta(minutes=5),
+        trigger=TRIGGER,
+        trades=trades,
+        tz=BA,
+        lock_path="data/LOCKED",
+    )
+    other = incident.incident_fingerprint(
+        triggered_at=WHEN,
+        trigger=TRIGGER,
+        trades=[*trades, trade(pnl_usd=-1, closed_at=at(2))],
+        tz=BA,
+        lock_path="data/LOCKED",
+    )
+    assert first == later and first != other
+    text = report(trades=trades)
+    assert incident.report_fingerprint(text) == first
+    assert text.rstrip().endswith(f"<!-- huella del informe: {first} -->")
+    path = write_incident_report(
+        tmp_path, triggered_at=WHEN, trigger=TRIGGER, trades=trades, tz=BA, lock_path="data/LOCKED"
+    )
+    assert incident.find_identical_report(tmp_path, first) == path
+    assert incident.find_identical_report(tmp_path, other) is None
+    assert incident.find_identical_report(tmp_path / "no-existe", first) is None
+    assert incident.report_fingerprint("# informe viejo sin huella") is None

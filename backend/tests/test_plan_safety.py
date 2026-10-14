@@ -63,12 +63,14 @@ def local(day: int, hour: int, minute: int = 0) -> datetime:
     return datetime(2026, 10, day, hour, minute, tzinfo=BA)
 
 
-def trade(closed: datetime, pnl: float, *, symbol: str = "BTC") -> dict:
+def trade(
+    closed: datetime, pnl: float, *, symbol: str = "BTC", opened: datetime | None = None
+) -> dict:
     return {
         "id": next(_ids),
         "symbol": symbol,
         "side": "long",
-        "opened_at": closed - timedelta(minutes=30),
+        "opened_at": closed - timedelta(minutes=30) if opened is None else opened,
         "closed_at": closed,
         "pnl_usd": pnl,
     }
@@ -227,7 +229,8 @@ def test_regime_and_safety_floor_message_names_both(settings, profile):
 
 
 def test_losing_streak_vetoes_first_with_until(settings, profile):
-    trades = [trade(local(14, h), -10.0) for h in (12, 13, 14)]
+    # Abiertas ayer: no llegan al máximo de operaciones de hoy.
+    trades = [trade(local(14, h), -10.0, opened=local(13, 20)) for h in (12, 13, 14)]
     state, verdict = state_and_verdict(settings, profile, trades=trades)
     assert verdict.blocked and verdict.block_codes == ("losing_streak",)
     plan = plan_with(settings, profile, state=state, verdict=verdict)
@@ -240,6 +243,23 @@ def test_losing_streak_vetoes_first_with_until(settings, profile):
     assert plan.headline.startswith("No operar: perdiste 3 operaciones seguidas")
     assert all(r.code != SAFETY_RULE for r in plan.rules)  # sin el resumen "verde"
     assert plan.to_dict()["safety"]["block_codes"] == ["losing_streak"]
+
+
+def test_max_trades_is_not_repeated_when_the_day_rule_already_says_it(settings, profile):
+    """Tercera ronda (E4): el freno pone el estado en rojo; el plan lo dice una sola vez."""
+    trades = [trade(local(14, h), 5.0) for h in (9, 10, 11)]
+    state, verdict = state_and_verdict(settings, profile, trades=trades)
+    assert verdict.status == "rojo" and verdict.block_codes == ("max_trades_today",)
+    plan = plan_with(settings, profile, state=state, verdict=verdict)
+    assert plan.status == STATUS_NO_TRADE
+    assert failing(plan) == [DAILY_LIMITS]
+    assert plan.to_dict()["safety"]["block_codes"] == ["max_trades_today"]
+    # Con las operaciones del día puestas a mano en 0 (para probar), el freno sí aparece.
+    override = plan_with(settings, profile, state=state, verdict=verdict, trades_today=0)
+    assert failing(override)[0] == "safety_max_trades_today"
+    assert override.rules[0].message.startswith(
+        "No operar: ya hiciste 3 de 3 operaciones permitidas hoy"
+    )
 
 
 def test_daily_block_is_not_repeated_when_the_day_rule_already_says_it(settings, profile):
@@ -447,9 +467,21 @@ def test_hedge_on_the_same_coin_warns_but_adds_no_risk(settings, profile):
     assert plan.status == STATUS_LONG and plan.adjusted_risk_usd == pytest.approx(50.0)
     assert (
         "Ya tenés una posición en short (venta) en BTC (riesgo 30 USD): este plan va al revés y "
-        "funciona como cobertura, así que no suma riesgo. Ojo: si el precio va y viene fuerte, "
-        "pueden saltar los dos stops y perdés en las dos."
+        "funciona como cobertura. No suma al tope de posiciones correlacionadas (1,5 × tu "
+        "riesgo), pero su riesgo sí cuenta en lo que te queda del límite del día, porque pueden "
+        "saltar los dos stops: si el precio va y viene fuerte, perdés en las dos."
     ) in plan.warnings
+    assert all("no suma riesgo" not in w for w in plan.warnings)
+    tp = settings.trade_plan.model_copy(update={"daily_cap_includes_open_risk": False})
+    off = settings.model_copy(update={"trade_plan": tp})
+    plain = plan_with(off, profile, correlation=exposure("long", hedges=(hedge,)))
+    assert any(
+        w.endswith(
+            "No suma al tope de posiciones correlacionadas (1,5 × tu riesgo). Ojo: si el precio "
+            "va y viene fuerte, pueden saltar los dos stops y perdés en las dos."
+        )
+        for w in plain.warnings
+    )
     assert plan.to_dict()["correlation"]["hedges"][0]["symbol"] == "BTC"
 
 

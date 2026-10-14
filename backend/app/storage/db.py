@@ -28,6 +28,11 @@ Historial del esquema (``PRAGMA user_version``)
        escribió la app, para medir de nuevo la caída del mes después de que el
        usuario borra el LOCKED). También aditivo: ``MIGRATIONS[2]`` crea la
        tabla. Una base de la versión 1 pasa por 1 → 2 → 3.
+    4. Hito 5, tercera ronda: agrega la columna ``initial_risk_usd`` (el
+       riesgo previsto al abrir) a ``open_positions`` y ``manual_trades``, así
+       mover el stop con ``update_position`` no pisa el riesgo previsto. Aditivo:
+       ``MIGRATIONS[3]`` agrega la columna (vacía en las filas viejas, que
+       siguen usando ``risk_usd`` como previsto). 1 → 2 → 3 → 4.
 
 Una base de una versión **más nueva** que la app (por ejemplo, abierta con un
 checkout viejo) se rechaza: la app vieja no sabe qué tablas o columnas espera.
@@ -56,7 +61,7 @@ IN_MEMORY = ":memory:"
 
 #: Versión del esquema. Se guarda en ``PRAGMA user_version`` al crear la base.
 #: Ver el historial en el docstring del módulo.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def default_db_path(settings: AppSettings) -> Path:
@@ -131,8 +136,32 @@ def _migrate_2_to_3(engine: Engine) -> None:
     table.create(engine, checkfirst=True)
 
 
+def _columns(engine: Engine, table: str) -> set[str]:
+    with engine.connect() as conn:
+        rows = conn.exec_driver_sql(f'PRAGMA table_info("{table}")').all()
+    return {str(r[1]) for r in rows}
+
+
+def _migrate_3_to_4(engine: Engine) -> None:
+    """Versión 3 → 4: agrega ``initial_risk_usd`` a posiciones y operaciones (aditivo).
+
+    Las filas que ya estaban quedan con la columna vacía (``NULL``): para
+    ellas el riesgo previsto es el ``risk_usd`` guardado, como antes. Si la
+    columna ya existe (una migración cortada a la mitad), no hace nada.
+    """
+    for model in (_models.OpenPosition, _models.ManualTrade):
+        table = model.__tablename__
+        if "initial_risk_usd" not in _columns(engine, table):
+            with engine.begin() as conn:
+                conn.exec_driver_sql(f'ALTER TABLE "{table}" ADD COLUMN initial_risk_usd FLOAT')
+
+
 #: Migraciones: ``MIGRATIONS[n]`` lleva una base de la versión ``n`` a la ``n + 1``.
-MIGRATIONS: dict[int, Callable[[Engine], None]] = {1: _migrate_1_to_2, 2: _migrate_2_to_3}
+MIGRATIONS: dict[int, Callable[[Engine], None]] = {
+    1: _migrate_1_to_2,
+    2: _migrate_2_to_3,
+    3: _migrate_3_to_4,
+}
 
 
 def _set_user_version(engine: Engine, version: int) -> None:
@@ -145,7 +174,7 @@ def init_db(engine: Engine) -> None:
 
     - Base nueva (versión 0): crea todo y guarda ``SCHEMA_VERSION``. Si tiene
       solo tablas de la app (una creación que se cortó a la mitad), la completa.
-    - Base de una versión anterior (la 1 o la 2): aplica las migraciones
+    - Base de una versión anterior (de la 1 a la 3): aplica las migraciones
       de ``MIGRATIONS`` en orden (todas aditivas) y marca ``SCHEMA_VERSION``.
     - Base con la misma versión: crea solo las tablas que falten (no toca datos).
     - Base de una versión más nueva que la app, o un archivo SQLite con tablas

@@ -561,7 +561,16 @@ def test_exposure_skips_opposite_side_and_only_the_same_coin_is_a_hedge():
     assert all(not e.counted for e in exp.skipped)
     assert exp.skipped[1].explanation == (
         "ETH está en short (venta), al revés del plan en la misma moneda: funciona como "
-        "cobertura y no suma riesgo."
+        "cobertura. No suma al tope de posiciones correlacionadas, pero su riesgo sí cuenta en "
+        "lo que te queda del límite del día, porque pueden saltar los dos stops."
+    )
+    with_cap = correlated_exposure(
+        "ETH", "long", positions, MATRIX, 0.8, limit_multiple=1.5, hedge_counts_in_day=False
+    )
+    assert with_cap.skipped[1].explanation == (
+        "ETH está en short (venta), al revés del plan en la misma moneda: funciona como "
+        "cobertura. No suma al tope de posiciones correlacionadas (1,5 × tu riesgo). Ojo: "
+        "pueden saltar los dos stops."
     )
     assert "cobertura" not in exp.skipped[0].explanation
     assert exp.existing_risk_usd == 0.0

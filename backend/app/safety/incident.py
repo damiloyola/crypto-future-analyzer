@@ -32,7 +32,10 @@ Observaciones (cada una con su ``code``, en el orden en que salen)
     - ``against_regime``: long con el mercado bajista o en crash; short con el
       mercado alcista o en euforia (neutral nunca es "en contra").
     - ``loss_above_risk``: se perdió más que el riesgo previsto (redondeado a
-      centavos; el riesgo ya incluye comisiones).
+      centavos; el riesgo ya incluye comisiones). El previsto es el de la
+      apertura (``initial_risk_usd``) aunque después se haya movido el stop.
+    - ``widened_stop``: el stop se agrandó después de abrir (el riesgo con el
+      que cerró es mayor que el previsto).
     - ``losing_streak``: rachas de ``losing_streak`` pérdidas seguidas o más
       (el mismo número que el breaker de enfriamiento).
     - ``too_many_trades``: días con más operaciones que el máximo del perfil
@@ -41,7 +44,8 @@ Observaciones (cada una con su ``code``, en el orden en que salen)
       del perfil (necesita el perfil; llegar justo al límite no cuenta).
     - ``deposit_after_loss``: depósitos hechos el mismo día, después de una
       pérdida.
-    - ``missing_risk``: operaciones sin el riesgo previsto anotado.
+    - ``missing_risk``: operaciones sin el riesgo previsto anotado (un riesgo
+      0 no falta: es el stop en la entrada).
     - ``no_analysis_context``: operaciones sin análisis de la app asociado (no
       se sabe qué decían el régimen, el score ni el plan).
 
@@ -77,6 +81,13 @@ Qué hay acá (todo puro salvo ``write_incident_report`` y ``create_new_file``)
     - ``shown_drawdown_pct(pct)``: la caída que se muestra, recortada a
       ``MAX_SHOWN_DRAWDOWN_PCT`` (más de 100 % solo pasa si el saldo calculado
       dio negativo).
+    - ``fmt_drawdown_pct(pct, threshold_pct)`` / ``drawdown_over_100(pct)`` /
+      ``negative_balance_warning(balance)``: cómo se escribe una caída en todos
+      lados (frenos, LOCKED, informe y consolas): ``"71,67 %"`` o, con el saldo
+      calculado negativo, ``"más del 100 %"`` con el aviso de revisar los datos.
+    - ``incident_fingerprint(...)`` / ``find_identical_report(folder, huella)``:
+      la "huella" de un informe (todo menos la hora) para no escribir dos
+      veces el mismo informe si el LOCKED no se pudo escribir.
 
 Decisiones
     - **Tolerante con los datos**: el informe se escribe en el peor momento y
@@ -90,6 +101,10 @@ Decisiones
     - **Nunca pisa**: el nombre lleva fecha y hora UTC del disparo; si ya
       existe, se agrega ``_2``, ``_3``... La creación es exclusiva (si dos
       procesos escriben a la vez, cada uno queda con su archivo).
+    - **Huella**: la última línea del informe es un comentario de markdown con
+      la huella de sus datos (no se ve al leerlo renderizado). Si el mismo
+      disparo se repite con los mismos datos (por ejemplo, porque el LOCKED no
+      se pudo escribir), se reusa el informe que ya está.
     - **Racha de pérdidas**: operaciones seguidas con resultado < 0 (a
       centavos). Un resultado 0 o positivo la corta.
     - **Pérdida del día**: neta (ganancias menos pérdidas cerradas ese día en la
@@ -101,6 +116,8 @@ Decisiones
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import math
 import os
 import re
@@ -133,6 +150,7 @@ OBS_TRADED_ON_NO_TRADE = "traded_on_no_trade"
 OBS_AGAINST_PLAN = "against_plan"
 OBS_AGAINST_REGIME = "against_regime"
 OBS_LOSS_ABOVE_RISK = "loss_above_risk"
+OBS_WIDENED_STOP = "widened_stop"
 OBS_MISSING_RISK = "missing_risk"
 OBS_LOSING_STREAK = "losing_streak"
 OBS_NO_ANALYSIS_CONTEXT = "no_analysis_context"
@@ -149,6 +167,13 @@ ANALYSIS_MARK_TEST_NUMBERS = "números de prueba"
 # saldo calculado da negativo (casi siempre un dato mal cargado, que ya tiene
 # su aviso). Es dibujo, no regla: el freno compara el número sin recortar.
 MAX_SHOWN_DRAWDOWN_PCT = 100.0
+
+#: Cómo se escribe una caída de más de 100 % (saldo calculado negativo).
+OVER_100_DRAWDOWN_TEXT = "más del 100 %"
+
+#: Marca de la huella al final del informe (comentario de markdown).
+FINGERPRINT_PREFIX = "<!-- huella del informe: "
+FINGERPRINT_SUFFIX = " -->"
 
 FILE_PREFIX = "incidente_"
 FILE_SUFFIX = ".md"
@@ -410,6 +435,63 @@ def shown_drawdown_pct(value_pct: float) -> float:
     return min(float(value_pct), MAX_SHOWN_DRAWDOWN_PCT)
 
 
+def drawdown_over_100(value_pct: Any) -> bool:
+    """``True`` si la caída pasa el 100 % (solo pasa con el saldo calculado negativo)."""
+    v = _finite(value_pct)
+    return v is not None and round(v, 6) > MAX_SHOWN_DRAWDOWN_PCT
+
+
+def fmt_drawdown_pct(value_pct: Any, threshold_pct: Any = None, decimals: int = 2) -> str:
+    """La caída como se muestra en todos lados: ``"71,67 %"`` o ``"más del 100 %"``.
+
+    - Más de 100 % (el saldo calculado dio negativo) → ``"más del 100 %"``:
+      el número exacto no dice nada útil y casi siempre es un dato mal
+      cargado (ver ``negative_balance_warning``).
+    - Con ``threshold_pct`` (el tope), un valor pegado al tope no se redondea
+      al tope (``fmt_percent_beside``: ``69,996 %`` y no ``70 %``).
+    - Sin número → ``"—"``.
+    """
+    v = _finite(value_pct)
+    if v is None:
+        return DASH
+    if drawdown_over_100(v):
+        return OVER_100_DRAWDOWN_TEXT
+    top = _finite(threshold_pct)
+    if top is not None:
+        return fmt_percent_beside(v, top)
+    return fmt_percent(v, decimals)
+
+
+def negative_balance_warning(balance_usd: Any, drawdown_pct: Any = None) -> str | None:
+    """El aviso de revisar los datos cuando el saldo calculado da negativo (``None`` si no).
+
+    Va en todos los lugares donde se muestra la caída: con el saldo negativo
+    la caída "pasa el 100 %", y eso casi siempre es un resultado o un retiro
+    mal tipeado.
+
+    ``drawdown_pct``: la caída que se midió. Si se pasa y no llega al 100 %
+    (un retiro más grande que el saldo dejó el máximo del mes en 0), el aviso
+    no dice "pasa el 100 %" sino que la caída no se puede medir bien y que el
+    freno del mes no salta.
+    """
+    v = _finite(balance_usd)
+    if v is None or round(v, 2) >= 0:
+        return None
+    pct = _finite(drawdown_pct)
+    if pct is not None and not drawdown_over_100(pct):
+        why = (
+            "así que la caída del mes no se puede medir bien y el freno del mes no salta hasta "
+            "que lo corrijas"
+        )
+    else:
+        why = "así que la caída pasa el 100 %"
+    return (
+        f"Ojo: el saldo calculado de tu billetera da negativo ({fmt_pnl(v)}), {why}. Revisá lo "
+        "que cargaste: puede haber un resultado o un retiro mal tipeado (con make trade "
+        'ARGS="list" ves todo y con delete borrás lo que esté mal).'
+    )
+
+
 def analysis_test_marks(inputs: Any) -> tuple[str, ...]:
     """Por qué un análisis guardado no es "real" (``()`` si lo es).
 
@@ -511,8 +593,11 @@ class IncidentTrade:
     """Una operación cerrada, con el contexto del análisis si lo hubo.
 
     ``pnl_usd`` es el resultado neto (negativo = pérdida). ``risk_usd`` es lo
-    que se iba a perder si tocaba el stop. ``plan_status`` viene normalizado
-    (``"LONG"``, ``"SHORT"``, ``"NO_OPERAR"``) y ``side`` en minúsculas.
+    que se iba a perder si tocaba el stop **con el que cerró** (si se movió el
+    stop, el último) e ``initial_risk_usd`` el previsto al abrir (``None`` si
+    no se anotó aparte: entonces el previsto es ``risk_usd``). ``plan_status``
+    viene normalizado (``"LONG"``, ``"SHORT"``, ``"NO_OPERAR"``) y ``side`` en
+    minúsculas.
     """
 
     symbol: str
@@ -529,6 +614,7 @@ class IncidentTrade:
     notes: str | None = None
     analysis_id: int | None = None
     analysis_marks: tuple[str, ...] = ()
+    initial_risk_usd: float | None = None
 
     @classmethod
     def from_value(cls, value: Any) -> IncidentTrade:
@@ -553,6 +639,7 @@ class IncidentTrade:
             analysis_marks=tuple(
                 str(m) for m in (_field(value, "analysis_marks") or ()) if _text(m) is not None
             ),
+            initial_risk_usd=_finite(_field(value, "initial_risk_usd")),
         )
 
     @property
@@ -597,18 +684,64 @@ class IncidentTrade:
         )
 
     @property
+    def planned_risk_usd(self) -> float | None:
+        """El riesgo previsto al abrir (``initial_risk_usd`` o, si no está, ``risk_usd``)."""
+        return self.risk_usd if self.initial_risk_usd is None else self.initial_risk_usd
+
+    @property
     def missing_risk(self) -> bool:
-        """No tiene el riesgo previsto anotado (o no es positivo)."""
-        return self.risk_usd is None or self.risk_usd <= 0
+        """No tiene el riesgo previsto anotado (0 no falta: es el stop en la entrada)."""
+        planned = self.planned_risk_usd
+        return planned is None or planned < 0
+
+    @property
+    def stop_moved_to_entry(self) -> bool:
+        """Abrió con riesgo y cerró con el stop en la entrada (riesgo 0) o en ganancia."""
+        planned = self.planned_risk_usd
+        return (
+            self.initial_risk_usd is not None
+            and self.risk_usd is not None
+            and planned is not None
+            and round(planned, 2) > 0
+            and round(self.risk_usd, 2) <= 0
+        )
+
+    @property
+    def widened_stop_usd(self) -> float | None:
+        """Cuánto se agrandó el riesgo después de abrir (``None`` si no se agrandó)."""
+        if self.initial_risk_usd is None or self.risk_usd is None:
+            return None
+        extra = round(self.risk_usd - self.initial_risk_usd, 2)
+        return extra if extra > 0 else None
 
     @property
     def loss_beyond_risk_usd(self) -> float | None:
         """Cuánto se perdió de más sobre el riesgo previsto; ``None`` si no pasó (o no se sabe)."""
         if not self.is_loss or self.missing_risk:
             return None
-        assert self.pnl_usd is not None and self.risk_usd is not None
-        extra = round(-self.pnl_usd - self.risk_usd, 2)
+        planned = self.planned_risk_usd
+        assert self.pnl_usd is not None and planned is not None
+        extra = round(-self.pnl_usd - planned, 2)
         return extra if extra > 0 else None
+
+    def risk_text(self) -> str:
+        """Lo que va en la columna "Riesgo previsto" de la tabla.
+
+        ``"50 USD"``, ``"50 USD (lo agrandaste a 80 USD)"``, ``"40 USD (moviste el stop a la
+        entrada)"``, ``"0 USD (stop en la entrada)"`` o ``"—"`` si no se anotó.
+        """
+        if self.missing_risk:
+            return DASH
+        planned = self.planned_risk_usd
+        assert planned is not None
+        text = fmt_usd(planned)
+        if self.widened_stop_usd is not None and self.risk_usd is not None:
+            return f"{text} (lo agrandaste a {fmt_usd(self.risk_usd)})"
+        if self.stop_moved_to_entry:
+            return f"{text} (moviste el stop a la entrada)"
+        if round(planned, 2) == 0:
+            return f"{text} (stop en la entrada)"
+        return text
 
     def flags(self) -> tuple[str, ...]:
         """Avisos cortos de esta operación, para la columna "Avisos" de la tabla."""
@@ -621,6 +754,10 @@ class IncidentTrade:
             out.append("contra el régimen")
         if self.loss_beyond_risk_usd is not None:
             out.append("perdió más que el riesgo previsto")
+        if self.widened_stop_usd is not None:
+            out.append("agrandaste el stop")
+        if self.stop_moved_to_entry:
+            out.append("moviste el stop a la entrada")
         if self.missing_risk:
             out.append("sin riesgo anotado")
         if not self.has_context:
@@ -637,6 +774,8 @@ class IncidentTrade:
                 "closed_at": _iso(self.closed_at),
                 "pnl_usd": self.pnl_usd,
                 "risk_usd": self.risk_usd,
+                "initial_risk_usd": self.initial_risk_usd,
+                "planned_risk_usd": self.planned_risk_usd,
                 "regime_category": self.regime_category,
                 "regime_name": self.regime_name,
                 "regime_confidence": self.regime_confidence,
@@ -694,6 +833,7 @@ class IncidentPosition:
     risk_usd: float | None
     entry_price: float | None = None
     notes: str | None = None
+    initial_risk_usd: float | None = None
 
     @classmethod
     def from_value(cls, value: Any) -> IncidentPosition:
@@ -707,7 +847,19 @@ class IncidentPosition:
             risk_usd=_finite(_field(value, "risk_usd")),
             entry_price=_finite(_field(value, "entry_price")),
             notes=_text(_field(value, "notes")),
+            initial_risk_usd=_finite(_field(value, "initial_risk_usd")),
         )
+
+    def risk_text(self) -> str:
+        """``"30 USD"`` o, si se movió el stop, ``"0 USD (previsto 40 USD)"``."""
+        if self.risk_usd is None:
+            return DASH
+        text = fmt_usd(self.risk_usd)
+        if self.initial_risk_usd is not None and round(self.initial_risk_usd, 2) != round(
+            self.risk_usd, 2
+        ):
+            text += f" (previsto {fmt_usd(self.initial_risk_usd)})"
+        return text
 
     def to_dict(self) -> dict[str, Any]:
         """Dict listo para JSON."""
@@ -717,6 +869,7 @@ class IncidentPosition:
                 "side": self.side,
                 "opened_at": _iso(self.opened_at),
                 "risk_usd": self.risk_usd,
+                "initial_risk_usd": self.initial_risk_usd,
                 "entry_price": self.entry_price,
                 "notes": self.notes,
             }
@@ -1024,12 +1177,17 @@ def find_observations(
         extra = round(sum(t.loss_beyond_risk_usd or 0.0 for _, t in sel), 2)
         detail_lines = []
         for n, t in sel:
-            assert t.pnl_usd is not None and t.risk_usd is not None
-            times = fmt_num(-t.pnl_usd / t.risk_usd, 1)
+            planned = t.planned_risk_usd
+            assert t.pnl_usd is not None and planned is not None
+            times = (
+                f"{fmt_num(-t.pnl_usd / planned, 1)} veces lo previsto"
+                if planned > 0
+                else "con el stop en la entrada"
+            )
             detail_lines.append(
                 f"#{n} {t.symbol} {t.side or '?'}, {fmt_datetime(t.closed_at, tz)}: perdiste "
-                f"{fmt_usd(-t.pnl_usd)} con un riesgo previsto de {fmt_usd(t.risk_usd)} "
-                f"({times} veces lo previsto)"
+                f"{fmt_usd(-t.pnl_usd)} con un riesgo previsto de {fmt_usd(planned)} "
+                f"({times})"
             )
         out.append(
             Observation(
@@ -1045,6 +1203,35 @@ def find_observations(
                 checklist_item=(
                     "Revisé por qué algunas pérdidas pasaron el riesgo previsto (¿moví o saqué "
                     "el stop?)."
+                ),
+            )
+        )
+
+    # 4 bis) Stop agrandado después de abrir.
+    sel = [(n, t) for n, t in numbered if t.widened_stop_usd is not None]
+    if sel:
+        widened_lines = []
+        for n, t in sel:
+            assert t.initial_risk_usd is not None and t.risk_usd is not None
+            widened_lines.append(
+                f"#{n} {t.symbol} {t.side or '?'}, {fmt_datetime(t.closed_at, tz)}: el riesgo "
+                f"previsto era {fmt_usd(t.initial_risk_usd)} y lo agrandaste a "
+                f"{fmt_usd(t.risk_usd)} ({fmt_pnl(t.pnl_usd)})"
+            )
+        out.append(
+            Observation(
+                code=OBS_WIDENED_STOP,
+                title="Agrandaste el stop",
+                detail=(
+                    f"En {_plural(len(sel), 'operación', 'operaciones')} moviste el stop más "
+                    "lejos después de abrir: el riesgo quedó más grande que el previsto. Agrandar "
+                    "el stop para no aceptar una pérdida es una de las formas más comunes de "
+                    "perder de más."
+                ),
+                items=tuple(widened_lines),
+                checklist_item=(
+                    "Revisé por qué agrandé el stop en vez de aceptar la pérdida que tenía "
+                    "prevista."
                 ),
             )
         )
@@ -1227,9 +1414,10 @@ def _summary_lines(
 ) -> list[str]:
     out: list[str] = []
     peak, balance, dd = trigger.wallet_peak_usd, trigger.current_balance_usd, trigger.drawdown_pct
-    if dd is not None:
-        dd = shown_drawdown_pct(dd)
     since = to_utc(trigger.measured_since)
+    # Con la caída medida desde un desbloqueo, los totales de operaciones son
+    # de todo el mes (no solo desde el desbloqueo): se aclara.
+    month_label = "" if since is None else " en todo el mes"
     who = (
         "La billetera del mes"
         if since is None
@@ -1241,17 +1429,20 @@ def _summary_lines(
             f"- {who} llegó a un máximo de **{fmt_usd(peak)}** y ahora tiene **{fmt_usd(balance)}**"
         )
         if dd is not None:
+            dd_txt = fmt_drawdown_pct(dd, trigger.threshold_pct)
             if trigger.threshold_pct is not None:
-                dd_txt = fmt_percent_beside(dd, trigger.threshold_pct)
                 line += (
                     f": cayó **{dd_txt}** desde ese máximo (el tope es "
                     f"{fmt_percent(trigger.threshold_pct)})"
                 )
             else:
-                line += f": cayó **{fmt_percent(dd)}** desde ese máximo"
+                line += f": cayó **{dd_txt}** desde ese máximo"
         out.append(line + ".")
     elif dd is not None:
-        out.append(f"- {who} cayó **{fmt_percent(dd)}** desde su máximo.")
+        out.append(f"- {who} cayó **{fmt_drawdown_pct(dd)}** desde su máximo.")
+    warning = negative_balance_warning(balance, dd)
+    if warning is not None:
+        out.append(f"- **{warning}**")
 
     if summary.count == 0:
         out.append("- No hay operaciones cargadas en el período.")
@@ -1264,9 +1455,11 @@ def _summary_lines(
         ]
         if summary.breakeven:
             parts.append(f"{summary.breakeven} sin ganancia ni pérdida")
-        out.append(f"- Operaciones: **{summary.count}**: {', '.join(parts)}{rate_txt}.")
         out.append(
-            f"- Resultado neto: **{fmt_pnl(summary.net_pnl_usd)}** (ganado "
+            f"- Operaciones{month_label}: **{summary.count}**: {', '.join(parts)}{rate_txt}."
+        )
+        out.append(
+            f"- Resultado neto{month_label}: **{fmt_pnl(summary.net_pnl_usd)}** (ganado "
             f"{fmt_pnl(summary.gross_profit_usd)}, perdido {fmt_pnl(summary.gross_loss_usd)})."
         )
         worst = summary.worst_trade
@@ -1290,7 +1483,8 @@ def _summary_lines(
             parts.append(
                 f"retiraste {fmt_usd(total)} ({_plural(len(withdrawals), 'vez', 'veces')})"
             )
-        out.append(f"- En el período {' y '.join(parts)}.")
+        period = "En el período" if since is None else "En todo el mes"
+        out.append(f"- {period} {' y '.join(parts)}.")
 
     if positions:
         known = [p.risk_usd for p in positions if p.risk_usd is not None]
@@ -1435,7 +1629,7 @@ def build_incident_report(
         )
         md.append("|---|---|---|---|---|---|---|---|---|---|")
         for n, t in numbered:
-            risk_txt = DASH if t.missing_risk else fmt_usd(t.risk_usd)
+            risk_txt = t.risk_text()
             score_txt = DASH if t.score_total is None else fmt_score(t.score_total)
             flags = "; ".join(t.flags()) or DASH
             md.append(
@@ -1460,7 +1654,8 @@ def build_incident_report(
         md.append(
             "Cómo leer la tabla: **Long** = ganás si el precio sube; **Short** = ganás si baja. "
             "**Fecha** es la hora de cierre. **Riesgo previsto** es lo que ibas a perder si "
-            "tocaba el stop. **Score** es el puntaje de la app en ese momento (positivo = a "
+            "tocaba el stop que pusiste al abrir (si después lo moviste, se aclara). **Score** "
+            "es el puntaje de la app en ese momento (positivo = a "
             "favor de subir, negativo = a favor de bajar). El porcentaje del régimen es qué "
             "tan seguro estaba el detector."
         )
@@ -1513,7 +1708,7 @@ def build_incident_report(
         md.append("|---|---|---|---|---|---|")
         for p in positions:
             entry = DASH if p.entry_price is None else fmt_price(p.entry_price)
-            risk = DASH if p.risk_usd is None else fmt_usd(p.risk_usd)
+            risk = p.risk_text()
             md.append(
                 f"| {md_cell(p.symbol)} | {md_cell(fmt_side(p.side))} | "
                 f"{md_cell(fmt_datetime(p.opened_at, tz))} | {md_cell(entry)} | "
@@ -1556,14 +1751,20 @@ def build_incident_report(
     md.append(f"- Disparador: `{trig.code}`")
     md.append(f"- Hora del disparo (UTC): {when.isoformat()}")
     if trig.drawdown_pct is not None:
-        shown = shown_drawdown_pct(trig.drawdown_pct)
-        line = f"- Caída desde el máximo: {fmt_num(shown, 4)} %"
-        if shown < trig.drawdown_pct:
-            line += (
-                f" (la cuenta dio {fmt_num(trig.drawdown_pct, 2)} % porque el saldo calculado "
-                "quedó negativo: revisá lo cargado)"
+        if drawdown_over_100(trig.drawdown_pct):
+            line = (
+                f"- Caída desde el máximo: {OVER_100_DRAWDOWN_TEXT} (la cuenta dio "
+                f"{fmt_num(trig.drawdown_pct, 2)} % porque el saldo calculado quedó negativo: "
+                "revisá lo cargado)"
             )
+        else:
+            line = f"- Caída desde el máximo: {fmt_num(trig.drawdown_pct, 4)} %"
         md.append(line)
+    if trig.measured_since is not None:
+        md.append(
+            "- Caída medida desde el bloqueo anterior (desbloqueado a mano): "
+            f"{trig.measured_since.isoformat()}"
+        )
     if trig.threshold_pct is not None:
         md.append(f"- Tope de caída: {fmt_num(trig.threshold_pct, 4)} %")
     if settings_info:
@@ -1573,7 +1774,92 @@ def build_incident_report(
         for key, value in settings_info.items():
             md.append(f"- {_one_line(str(key))}: {_fmt_value(value)}")
     md.append("")
+    fingerprint = incident_fingerprint(
+        triggered_at=when,
+        trigger=trig,
+        trades=items,
+        wallet_events=events,
+        open_positions=positions,
+        profile=prof,
+        settings_info=settings_info,
+        losing_streak=losing_streak,
+        lock_path=lock_path,
+        tz=tz,
+    )
+    md.append(f"{FINGERPRINT_PREFIX}{fingerprint}{FINGERPRINT_SUFFIX}")
+    md.append("")
     return "\n".join(md)
+
+
+def incident_fingerprint(
+    *,
+    triggered_at: datetime,
+    trigger: Any,
+    trades: Iterable[Any] = (),
+    wallet_events: Iterable[Any] = (),
+    open_positions: Iterable[Any] = (),
+    profile: Any | None = None,
+    settings_info: Mapping[str, Any] | None = None,
+    losing_streak: int = DEFAULT_LOSING_STREAK,
+    lock_path: Path | str | None = None,
+    tz: str | tzinfo | None = None,
+) -> str:
+    """La huella de un informe: todo lo que dice, menos la hora exacta del disparo (puro).
+
+    Dos disparos del mismo mes con los mismos datos (operaciones, movimientos,
+    posiciones, números de la caída, configuración) dan la misma huella: el
+    segundo puede reusar el informe del primero (``find_identical_report``).
+    Los argumentos son los de ``build_incident_report``.
+    """
+    when = _require_datetime(triggered_at, "triggered_at")
+    local = when.astimezone(resolve_timezone(tz))
+    data = {
+        "month": f"{local:%Y-%m}",
+        "tz": timezone_label(tz),
+        "trigger": IncidentTrigger.from_value(trigger).to_dict(),
+        "trades": [t.to_dict() for t in sorted_trades(trades)],
+        "wallet_events": sorted(
+            (IncidentWalletEvent.from_value(e).to_dict() for e in wallet_events),
+            key=lambda e: json.dumps(e, sort_keys=True),
+        ),
+        "open_positions": [IncidentPosition.from_value(p).to_dict() for p in open_positions],
+        "profile": IncidentProfile.from_value(profile).to_dict(),
+        "settings": {str(k): _fmt_value(v) for k, v in (settings_info or {}).items()},
+        "losing_streak": int(losing_streak),
+        "lock_path": None if lock_path is None else str(lock_path),
+    }
+    text = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+
+
+def report_fingerprint(text: str) -> str | None:
+    """La huella escrita en un informe (``None`` si no tiene: uno de una versión vieja)."""
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith(FINGERPRINT_PREFIX) and line.endswith(FINGERPRINT_SUFFIX):
+            return line[len(FINGERPRINT_PREFIX) : -len(FINGERPRINT_SUFFIX)].strip() or None
+    return None
+
+
+def find_identical_report(incident_dir: Path | str, fingerprint: str) -> Path | None:
+    """Un informe de ``incident_dir`` con esa huella (el más nuevo), o ``None``.
+
+    Lee los ``incidente_*.md`` de la carpeta (son pocos y chicos). Nunca lanza:
+    si la carpeta no existe o un archivo no se puede leer, sigue de largo.
+    """
+    folder = Path(incident_dir)
+    try:
+        candidates = sorted(folder.glob(f"{FILE_PREFIX}*{FILE_SUFFIX}"), reverse=True)
+    except OSError:
+        return None
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if report_fingerprint(text) == fingerprint:
+            return path
+    return None
 
 
 # --- escritura ------------------------------------------------------------------
@@ -1702,6 +1988,8 @@ __all__ = [
     "OBS_NO_ANALYSIS_CONTEXT",
     "OBS_TOO_MANY_TRADES",
     "OBS_TRADED_ON_NO_TRADE",
+    "OBS_WIDENED_STOP",
+    "OVER_100_DRAWDOWN_TEXT",
     "IncidentPosition",
     "IncidentProfile",
     "IncidentTrade",
@@ -1712,10 +2000,13 @@ __all__ = [
     "analysis_test_marks",
     "build_incident_report",
     "create_new_file",
+    "drawdown_over_100",
+    "find_identical_report",
     "find_observations",
     "fmt_analysis_marks",
     "fmt_date",
     "fmt_datetime",
+    "fmt_drawdown_pct",
     "fmt_long_datetime",
     "fmt_month",
     "fmt_plan_status",
@@ -1723,10 +2014,13 @@ __all__ = [
     "fmt_regime",
     "fmt_side",
     "incident_file_name",
+    "incident_fingerprint",
     "losing_streaks",
     "md_cell",
+    "negative_balance_warning",
     "normalize_plan_status",
     "normalize_side",
+    "report_fingerprint",
     "resolve_timezone",
     "shown_drawdown_pct",
     "sorted_trades",

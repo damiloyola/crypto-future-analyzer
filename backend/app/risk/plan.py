@@ -190,9 +190,10 @@ objetos por "duck typing".
     común) no se describe como "se mueve junto con": el texto dice que no hay
     datos y que se cuenta por las dudas.
   - una posición abierta en la **misma moneda y dirección contraria** es
-    cobertura: no suma riesgo, pero el plan avisa que pueden saltar los dos
-    stops (decisión del usuario). Otra moneda en dirección contraria no suma
-    riesgo y no se llama cobertura.
+    cobertura: no suma al tope de posiciones correlacionadas, pero su riesgo sí
+    cuenta en lo que queda del límite del día (``daily_cap_includes_open_risk``)
+    y el plan avisa que pueden saltar los dos stops (decisión del usuario).
+    Otra moneda en dirección contraria no suma al tope y no se llama cobertura.
 
 Si varios pasos dejan el riesgo debajo del mínimo operable, el motivo que se
 muestra es el del último (régimen → frenos → límite del día → correlación): es
@@ -417,7 +418,8 @@ class CorrelationExposure:
     - ``counted``: misma dirección y moneda muy correlacionada (o la misma, o
       sin dato de correlación): su riesgo se suma al del plan nuevo.
     - ``hedges``: la **misma moneda** en dirección contraria: cobertura, no
-      suma riesgo, pero el plan avisa que pueden saltar los dos stops.
+      suma al tope de posiciones correlacionadas (sí al límite del día), y el
+      plan avisa que pueden saltar los dos stops.
 
     ``from_exposure`` la arma desde ``safety.correlation.Exposure``.
     """
@@ -2114,18 +2116,39 @@ def _correlation_rule(
     )
 
 
-def _hedge_warning(exposure: CorrelationExposure, symbol: str) -> str | None:
-    """Aviso de cobertura: misma moneda en dirección contraria (decisión del usuario)."""
+def _hedge_warning(
+    exposure: CorrelationExposure,
+    symbol: str,
+    *,
+    limit_multiple: float,
+    counts_in_day: bool,
+) -> str | None:
+    """Aviso de cobertura: misma moneda en dirección contraria (decisión del usuario).
+
+    Dice el alcance: no suma al tope de posiciones correlacionadas
+    (``limit_multiple`` × el riesgo), pero con ``counts_in_day``
+    (``trade_plan.daily_cap_includes_open_risk``) su riesgo sí sale de lo que
+    queda del límite del día, porque pueden saltar los dos stops.
+    """
     if not exposure.hedges:
         return None
     opposite = "short (venta)" if exposure.side == "long" else "long (compra)"
     risk = sum(p.counted_risk_usd for p in exposure.hedges)
     many = len(exposure.hedges) > 1
     what = "posiciones" if many else "una posición"
-    return (
+    head = (
         f"Ya tenés {what} en {opposite} en {symbol} (riesgo {fmt_usd(risk)}): este plan va al "
-        "revés y funciona como cobertura, así que no suma riesgo. Ojo: si el precio va y viene "
-        "fuerte, pueden saltar los dos stops y perdés en las dos."
+        "revés y funciona como cobertura. No suma al tope de posiciones correlacionadas "
+        f"({fmt_multiplier(limit_multiple)} × tu riesgo)"
+    )
+    if counts_in_day:
+        return (
+            f"{head}, pero su riesgo sí cuenta en lo que te queda del límite del día, porque "
+            "pueden saltar los dos stops: si el precio va y viene fuerte, perdés en las dos."
+        )
+    return (
+        f"{head}. Ojo: si el precio va y viene fuerte, pueden saltar los dos stops y perdés en "
+        "las dos."
     )
 
 
@@ -2563,6 +2586,10 @@ def _build(
     if safety is not None:
         safety_mult = _safety_multiplier(safety)
         skip = {"daily_loss_block"} if loss_limit_reached else set()
+        if inputs.trades_today >= int(profile.max_trades_per_day):
+            # El máximo de operaciones ya lo dice la regla de límites del día
+            # (el freno igual pone el estado en rojo).
+            skip.add("max_trades_today")
         safety_rules = _safety_rules(
             safety,
             skip_codes=frozenset(skip),
@@ -2696,7 +2723,12 @@ def _build(
                     full=full,
                 )
             )
-        hedge = _hedge_warning(exposure, inputs.symbol)
+        hedge = _hedge_warning(
+            exposure,
+            inputs.symbol,
+            limit_multiple=float(corr_cfg.max_combined_risk_multiplier),
+            counts_in_day=bool(tp_cfg.daily_cap_includes_open_risk),
+        )
         if hedge is not None:
             warnings.append(hedge)
         corr_summary = _correlation_summary(

@@ -154,8 +154,8 @@ def test_init_db_refuses_a_database_from_another_schema_version(tmp_path: Path):
         open_db(db_file)
 
 
-def test_schema_version_3_and_every_old_version_has_a_migration():
-    assert SCHEMA_VERSION == 3
+def test_schema_version_4_and_every_old_version_has_a_migration():
+    assert SCHEMA_VERSION == 4
     assert sorted(MIGRATIONS) == list(range(1, SCHEMA_VERSION))
 
 
@@ -199,9 +199,21 @@ _V2_EXTRA_DDL = (
 )
 
 
+_V3_EXTRA_DDL = (
+    "CREATE TABLE safety_locks (id INTEGER NOT NULL, triggered_at DATETIME NOT NULL, "
+    "trigger_code VARCHAR(40) NOT NULL, drawdown_pct FLOAT, peak_usd FLOAT, balance_usd FLOAT, "
+    "report_path TEXT, lock_path TEXT, created_at DATETIME NOT NULL, PRIMARY KEY (id))",
+    "CREATE INDEX ix_safety_locks_triggered_at ON safety_locks (triggered_at)",
+)
+
+
 def _make_old_database(db_file: Path, version: int) -> None:
-    """Base de la versión ``version`` (1 o 2) con una operación, una posición y un saldo."""
-    ddl = _V1_DDL if version == 1 else _V1_DDL + _V2_EXTRA_DDL
+    """Base de la versión ``version`` (1, 2 o 3) con una operación, una posición y un saldo."""
+    ddl = {
+        1: _V1_DDL,
+        2: _V1_DDL + _V2_EXTRA_DDL,
+        3: _V1_DDL + _V2_EXTRA_DDL + _V3_EXTRA_DDL,
+    }[version]
     with sqlite3.connect(db_file) as conn:
         for statement in ddl:
             conn.execute(statement)
@@ -218,7 +230,7 @@ def _make_old_database(db_file: Path, version: int) -> None:
             "INSERT INTO wallet_events (ts, kind, amount_usd) "
             "VALUES ('2026-10-01 12:00:00', 'balance', 300.0)"
         )
-        if version == 2:
+        if version >= 2:
             conn.execute(
                 "INSERT INTO high_volatility_events (created_at, starts_at, until, note) "
                 "VALUES ('2026-10-13 14:00:00', '2026-10-13 14:00:00', '2026-10-13 16:00:00', "
@@ -246,8 +258,8 @@ def test_a_v1_database_is_migrated_without_losing_data(tmp_path: Path, clock: Fa
     _make_old_database(db_file, 1)
     assert {"high_volatility_events", "safety_locks"}.isdisjoint(_tables(db_file))
 
-    repo = Repository.open(db_file, clock=clock)  # 1 → 2 → 3
-    assert raw_rows(db_file, "PRAGMA user_version") == [(3,)]
+    repo = Repository.open(db_file, clock=clock)  # 1 → 2 → 3 → 4
+    assert raw_rows(db_file, "PRAGMA user_version") == [(4,)]
     assert {"high_volatility_events", "safety_locks"} <= _tables(db_file)
     _check_old_data_survived(repo)
     event = repo.add_volatility_event("CPI", until=NOW + timedelta(hours=1))
@@ -266,7 +278,7 @@ def test_a_v2_database_is_migrated_without_losing_data(tmp_path: Path, clock: Fa
     assert "safety_locks" not in _tables(db_file)
 
     repo = Repository.open(db_file, clock=clock)
-    assert raw_rows(db_file, "PRAGMA user_version") == [(3,)]
+    assert raw_rows(db_file, "PRAGMA user_version") == [(4,)]
     assert "safety_locks" in _tables(db_file)
     indexes = {r[0] for r in raw_rows(db_file, "SELECT name FROM sqlite_master WHERE type='index'")}
     assert "ix_safety_locks_triggered_at" in indexes
@@ -279,7 +291,45 @@ def test_a_v2_database_is_migrated_without_losing_data(tmp_path: Path, clock: Fa
     assert Repository.open(db_file, clock=clock).list_safety_locks() == [lock]
 
 
-@pytest.mark.parametrize("version", [1, 2])
+def _columns(db_file: Path, table: str) -> set[str]:
+    return {r[1] for r in raw_rows(db_file, f"PRAGMA table_info({table})")}
+
+
+def test_a_v3_database_gets_the_planned_risk_column_without_losing_data(
+    tmp_path: Path, clock: FakeClock
+):
+    """Esquema 4 (revisión 6): ``initial_risk_usd`` se agrega sin tocar lo que había."""
+    db_file = tmp_path / "v3.db"
+    _make_old_database(db_file, 3)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO safety_locks (triggered_at, trigger_code, created_at) "
+            "VALUES ('2026-10-05 15:00:00', 'monthly_drawdown_lock', '2026-10-05 15:00:00')"
+        )
+    assert "initial_risk_usd" not in _columns(db_file, "open_positions")
+    assert "initial_risk_usd" not in _columns(db_file, "manual_trades")
+
+    repo = Repository.open(db_file, clock=clock)  # 3 → 4
+    assert raw_rows(db_file, "PRAGMA user_version") == [(4,)]
+    assert "initial_risk_usd" in _columns(db_file, "open_positions")
+    assert "initial_risk_usd" in _columns(db_file, "manual_trades")
+    _check_old_data_survived(repo)
+    (old_lock,) = repo.list_safety_locks()
+    assert old_lock.trigger_code == "monthly_drawdown_lock"
+    (pos,) = repo.list_open_positions()
+    assert pos.initial_risk_usd is None and pos.planned_risk_usd == 30.0  # la de antes
+    (old_trade,) = repo.list_trades()
+    assert old_trade.initial_risk_usd is None
+    # Mover el stop de una posición vieja guarda el previsto que tenía.
+    moved = repo.update_position(pos.id, risk_usd=0.0)
+    assert (moved.risk_usd, moved.initial_risk_usd, moved.planned_risk_usd) == (0.0, 30.0, 30.0)
+    trade = repo.close_position_with_result(pos.id, pnl_usd=-2.0)
+    assert (trade.risk_usd, trade.initial_risk_usd, trade.planned_risk_usd) == (0.0, 30.0, 30.0)
+    again = Repository.open(db_file, clock=clock)
+    assert len(again.list_trades()) == 2
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_an_old_database_that_already_has_the_new_tables_is_migrated(tmp_path: Path, version):
     """Migración idempotente: si las tablas ya existen (corte a mitad), no falla."""
     db_file = tmp_path / f"v{version}b.db"
@@ -677,6 +727,49 @@ def test_update_position_changes_risk_entry_and_note(repo: Repository):
     cleared = repo.update_position(pos.id, note="   ")
     assert cleared.notes is None and cleared.risk_usd == 12.5
     assert (cleared.symbol, cleared.side, cleared.created_at) == ("ETH", "short", pos.created_at)
+
+
+def test_moving_the_stop_keeps_the_planned_risk_and_the_trade_inherits_both(repo: Repository):
+    """Revisión 6: ``update_position`` ya no pisa el riesgo previsto (esquema 4)."""
+    from app.safety.incident import IncidentTrade, build_incident_report
+
+    btc = repo.add_open_position(symbol="BTC", side="long", risk_usd=50.0, opened_at=ago(hours=3))
+    assert (btc.risk_usd, btc.initial_risk_usd, btc.planned_risk_usd) == (50.0, 50.0, 50.0)
+    wider = repo.update_position(btc.id, risk_usd=80.0)  # agrandó el stop
+    assert (wider.risk_usd, wider.initial_risk_usd) == (80.0, 50.0)
+    assert wider.to_dict()["planned_risk_usd"] == 50.0
+    t_btc = repo.close_position_with_result(btc.id, pnl_usd=-80.0, closed_at=ago(hours=2))
+    assert (t_btc.risk_usd, t_btc.initial_risk_usd, t_btc.planned_risk_usd) == (80.0, 50.0, 50.0)
+
+    eth = repo.add_open_position(symbol="ETH", side="short", risk_usd=50.0, opened_at=ago(hours=3))
+    repo.update_position(eth.id, risk_usd=0.0)  # stop a la entrada
+    t_eth = repo.close_position_with_result(eth.id, pnl_usd=-20.0, closed_at=ago(hours=1))
+    assert (t_eth.risk_usd, t_eth.initial_risk_usd) == (0.0, 50.0)
+
+    first, second = (IncidentTrade.from_value(t) for t in repo.list_trades())
+    assert "agrandaste el stop" in first.flags()
+    assert first.loss_beyond_risk_usd == 30.0  # 80 perdidos contra 50 previstos
+    assert "moviste el stop a la entrada" in second.flags()
+    assert "sin riesgo anotado" not in second.flags()
+    text = build_incident_report(
+        triggered_at=NOW, trigger={"code": "x", "description": "y"}, trades=repo.list_trades()
+    )
+    assert "Operaciones sin riesgo anotado" not in text
+    assert "### Agrandaste el stop" in text
+
+    # Corregir el previsto a propósito (se tipeó mal al abrir).
+    sol = repo.add_open_position(symbol="SOL", side="long", risk_usd=400.0)
+    fixed = repo.update_position(sol.id, risk_usd=40.0, initial_risk_usd=40.0)
+    assert (fixed.risk_usd, fixed.initial_risk_usd) == (40.0, 40.0)
+    with pytest.raises(ValueError, match="El riesgo previsto no puede ser negativo"):
+        repo.update_position(sol.id, initial_risk_usd=-1)
+
+    # Una operación cargada directo: el previsto es el mismo riesgo (o el que se pase).
+    direct = add_trade(repo, risk_usd=25.0)
+    assert direct.initial_risk_usd == 25.0
+    moved = add_trade(repo, risk_usd=0.0, initial_risk_usd=30.0)
+    assert (moved.risk_usd, moved.initial_risk_usd, moved.planned_risk_usd) == (0.0, 30.0, 30.0)
+    assert add_trade(repo, risk_usd=None).initial_risk_usd is None
 
 
 @pytest.mark.parametrize(

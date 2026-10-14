@@ -8,13 +8,16 @@ data/*
 !data/.gitkeep
 # Bases SQLite, archivo LOCKED e informes de incidentes en cualquier carpeta
 # (por ejemplo, una --db de prueba en backend/ o en la raíz): son datos
-# personales y nunca se suben.
+# personales y nunca se suben. Una --db de prueba tiene su propio LOCKED y su
+# carpeta de informes con el nombre de la base (prueba.LOCKED, prueba_incidents/).
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
 LOCKED
 incidents/
+*.LOCKED
+*_incidents/
 
 # Python
 __pycache__/

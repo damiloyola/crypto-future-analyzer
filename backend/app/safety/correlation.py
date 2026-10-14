@@ -50,8 +50,10 @@ Decisiones
       que sale como 0,7999999999 por cuentas en punto flotante también cuente.
     - **La misma moneda** tiene correlación 1, siempre (aunque no esté en la
       matriz).
-    - **Dirección contraria no suma riesgo**. Solo la **misma moneda** en
-      dirección contraria se llama cobertura (``REASON_HEDGE``); otra moneda al
+    - **Dirección contraria no suma al tope de posiciones correlacionadas**
+      (sí cuenta en el límite del día del plan: pueden saltar los dos stops).
+      Solo la **misma moneda** en dirección contraria se llama cobertura
+      (``REASON_HEDGE``, texto en ``hedge_explanation``); otra moneda al
       revés del plan (``REASON_OPPOSITE_SIDE``) se explica según su correlación
       ("se mueve parecido", "no se mueve junto" o "no hay datos"), sin decir que
       cubre nada. Solo se miran correlaciones positivas (en cripto las
@@ -814,6 +816,9 @@ def _entry(
     new_side: Side,
     matrix: CorrelationMatrix | None,
     threshold: float,
+    *,
+    limit_multiple: float | None = None,
+    hedge_counts_in_day: bool = True,
 ) -> ExposureEntry:
     symbol = _norm_symbol(position.symbol)
     side = _norm_side(position.side)
@@ -840,8 +845,9 @@ def _entry(
             return make(
                 False,
                 REASON_HEDGE,
-                f"{symbol} está en {_SIDE_WORD[side]}, al revés del plan en la misma moneda: "
-                "funciona como cobertura y no suma riesgo.",
+                hedge_explanation(
+                    symbol, side, limit_multiple=limit_multiple, counts_in_day=hedge_counts_in_day
+                ),
             )
         if corr is None:
             relation = f" (no hay datos para saber si se mueve junto con {new_symbol})"
@@ -884,12 +890,43 @@ def _entry(
     )
 
 
+def hedge_explanation(
+    symbol: str,
+    side: str,
+    *,
+    limit_multiple: float | None = None,
+    counts_in_day: bool = True,
+) -> str:
+    """Qué significa una posición en la misma moneda y dirección contraria (cobertura).
+
+    No suma al tope de posiciones correlacionadas, pero (con
+    ``trade_plan.daily_cap_includes_open_risk``, ``counts_in_day``) su riesgo
+    sí cuenta en lo que queda del límite del día: pueden saltar los dos stops.
+    ``limit_multiple`` (``correlation.max_combined_risk_multiplier``) agrega
+    el tope al texto ("1,5 × tu riesgo").
+    """
+    cap = "" if limit_multiple is None else f" ({fmt_num(limit_multiple, 2)} × tu riesgo)"
+    head = (
+        f"{symbol} está en {_SIDE_WORD[side]}, al revés del plan en la misma moneda: funciona "
+        f"como cobertura. No suma al tope de posiciones correlacionadas{cap}"
+    )
+    if counts_in_day:
+        return (
+            f"{head}, pero su riesgo sí cuenta en lo que te queda del límite del día, porque "
+            "pueden saltar los dos stops."
+        )
+    return f"{head}. Ojo: pueden saltar los dos stops."
+
+
 def correlated_exposure(
     new_symbol: str,
     new_side: str,
     open_positions: Iterable[OpenPositionLike],
     matrix: CorrelationMatrix | None,
     threshold: float,
+    *,
+    limit_multiple: float | None = None,
+    hedge_counts_in_day: bool = True,
 ) -> Exposure:
     """Qué posiciones abiertas suman su riesgo al de un plan nuevo.
 
@@ -905,6 +942,10 @@ def correlated_exposure(
     también se saltean, con su motivo.
 
     ``threshold`` va de 0 (excluido) a 1, como ``correlation.high_threshold``.
+    ``limit_multiple`` / ``hedge_counts_in_day``: solo para el texto de una
+    cobertura (``hedge_explanation``; pasar
+    ``correlation.max_combined_risk_multiplier`` y
+    ``trade_plan.daily_cap_includes_open_risk``).
     ``ValueError`` si un lado no es long/short, un símbolo está vacío o un
     riesgo no es un número finito. Un riesgo negativo cuenta como 0.
     """
@@ -916,7 +957,15 @@ def correlated_exposure(
     counted: list[ExposureEntry] = []
     skipped: list[ExposureEntry] = []
     for position in open_positions:
-        entry = _entry(position, symbol, side, matrix, threshold)
+        entry = _entry(
+            position,
+            symbol,
+            side,
+            matrix,
+            threshold,
+            limit_multiple=limit_multiple,
+            hedge_counts_in_day=hedge_counts_in_day,
+        )
         (counted if entry.counted else skipped).append(entry)
     return Exposure(
         new_symbol=symbol,

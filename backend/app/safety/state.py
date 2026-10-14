@@ -57,10 +57,11 @@ Reglas de cálculo (todos los números de ``config.yaml``)
     - **Racha de pérdidas**: operaciones seguidas con resultado negativo (a
       centavos, como el informe del incidente), en orden de cierre; una ganada o
       un empate la cortan. Cuando llega a ``losing_streak.consecutive_losses``
-      empieza una pausa de ``cooldown_hours`` desde el cierre de esa pérdida. Si
-      se pierde otra vez durante la pausa (la racha sigue), la pausa se estira
-      ``cooldown_hours`` desde esa pérdida (``extend_cooldown_on_loss``,
-      decisión del usuario; con ``false`` termina a la hora prevista). Con
+      empieza una pausa de ``cooldown_hours`` desde el cierre de esa pérdida.
+      Cualquier pérdida que cierre durante la pausa (aunque en el medio haya
+      una ganada) la estira ``cooldown_hours`` desde esa pérdida
+      (``extend_cooldown_on_loss``, decisión del usuario; con ``false``
+      termina a la hora prevista). Con
       ``reset_after_cooldown`` (decisión del usuario),
       terminada la pausa la cuenta vuelve a cero: las pérdidas cerradas antes del
       fin de la pausa ya no cuentan.
@@ -86,12 +87,28 @@ Reglas de cálculo (todos los números de ``config.yaml``)
       que se retiró; ``"none"`` no lo toca (el retiro cuenta como caída). Un
       saldo anotado más bajo que el calculado cuenta como caída. La caída es
       ``(máximo - saldo actual) / máximo`` en %.
+    - **Depósito después de un retiro** (``deposit_refills_withdrawals``,
+      decisión del usuario): un depósito primero "devuelve" lo retirado en el
+      mes que todavía no se volvió a depositar, sin cambiar el % de caída (la
+      regla inversa al retiro proporcional; si el retiro dejó la billetera en
+      0, se recuerda el % de ese momento). Solo lo que pase de eso sube el
+      máximo en lo mismo (``deposit_raises_peak``). Retirar X y depositar X
+      deja el % igual que antes. Al revés (depositar y después retirar) se
+      aplican las reglas en orden: el depósito sube el máximo y el retiro lo
+      baja en proporción. Ejemplo: máximo 300 y saldo 100 (66,67 %), depositar
+      90 → máximo 390, saldo 190 (51,28 %); retirar 90 → 51,28 %.
+    - **Saldo anotado el día 1 a las 00:00**: es el saldo de arranque del mes
+      (aunque sea más bajo que el calculado), no una caída del mes nuevo.
     - **Caída después de desbloquear** (``restart_after_unlock``, decisión del
       usuario): si en el mes hay un bloqueo total anotado en la base, también
       se mide la caída desde el saldo justo después del último bloqueo (la
       pérdida que lo disparó incluida), como si empezara un mes nuevo
       (``WalletState.restart``). Los frenos la usan cuando el usuario ya borró
-      el LOCKED. Los bloqueos de meses anteriores no cuentan.
+      el LOCKED. Los bloqueos de meses anteriores no cuentan. Lo retirado en
+      el mes antes del bloqueo y no devuelto todavía se puede devolver sin
+      cambiar el %. Una pérdida cargada tarde que cerró antes del bloqueo
+      entra en el saldo de arranque: es parte de ese incidente, no una caída
+      nueva. ``WalletState.restarts`` trae la medida desde cada bloqueo del mes.
     - Lo que pasó después de ``now`` no cuenta (por ejemplo, con un reloj de
       prueba).
 
@@ -243,6 +260,9 @@ class TradeRecord:
 
     ``pnl_usd`` es el resultado neto (negativo = pérdida). Tiene los mismos
     nombres de campo que ``StoredTrade``, así ``safety.incident`` la lee igual.
+    ``risk_usd`` es el riesgo con el stop del final (si se movió) e
+    ``initial_risk_usd`` el previsto al abrir (``None`` = no se sabe aparte:
+    vale ``risk_usd``); ``planned_risk_usd`` da el previsto.
     """
 
     id: int | None
@@ -262,11 +282,17 @@ class TradeRecord:
     score_total: float | None = None
     plan_status: str | None = None
     profile_name: str | None = None
+    initial_risk_usd: float | None = None
 
     @property
     def is_loss(self) -> bool:
         """Resultado negativo a centavos (un empate o -0,004 USD no es pérdida)."""
         return round(self.pnl_usd, 2) < 0
+
+    @property
+    def planned_risk_usd(self) -> float | None:
+        """El riesgo previsto al abrir (``initial_risk_usd`` o, si no está, ``risk_usd``)."""
+        return self.risk_usd if self.initial_risk_usd is None else self.initial_risk_usd
 
     @classmethod
     def from_value(cls, value: Any) -> TradeRecord:
@@ -295,6 +321,9 @@ class TradeRecord:
             score_total=_opt_number(_field(value, "score_total"), f"{label}: el score"),
             plan_status=_opt_text(_field(value, "plan_status")),
             profile_name=_opt_text(_field(value, "profile_name")),
+            initial_risk_usd=_opt_number(
+                _field(value, "initial_risk_usd"), f"{label}: el riesgo previsto"
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -308,6 +337,8 @@ class TradeRecord:
                 "pnl_usd": self.pnl_usd,
                 "is_loss": self.is_loss,
                 "risk_usd": self.risk_usd,
+                "initial_risk_usd": self.initial_risk_usd,
+                "planned_risk_usd": self.planned_risk_usd,
                 "entry_price": self.entry_price,
                 "exit_price": self.exit_price,
                 "notes": self.notes,
@@ -324,7 +355,13 @@ class TradeRecord:
 
 @dataclass(frozen=True)
 class PositionRecord:
-    """Posición abierta (copia de ``StoredPosition``). ``risk_usd``: lo que se pierde en el stop."""
+    """Posición abierta (copia de ``StoredPosition``).
+
+    ``risk_usd``: lo que se pierde hoy si toca el stop (es lo que suman el
+    límite del día y la correlación). ``initial_risk_usd``: el riesgo previsto
+    al abrirla (``None`` si no se sabe aparte, por ejemplo una posición de antes
+    del esquema 4); ``planned_risk_usd`` da el previsto.
+    """
 
     id: int | None
     symbol: str
@@ -334,6 +371,12 @@ class PositionRecord:
     entry_price: float | None = None
     notes: str | None = None
     analysis_id: int | None = None
+    initial_risk_usd: float | None = None
+
+    @property
+    def planned_risk_usd(self) -> float:
+        """El riesgo previsto al abrir (``initial_risk_usd`` o, si no está, ``risk_usd``)."""
+        return self.risk_usd if self.initial_risk_usd is None else self.initial_risk_usd
 
     @classmethod
     def from_value(cls, value: Any) -> PositionRecord:
@@ -351,6 +394,9 @@ class PositionRecord:
             entry_price=_opt_number(_field(value, "entry_price"), f"{label}: la entrada"),
             notes=_opt_text(_field(value, "notes")),
             analysis_id=_opt_int(_field(value, "analysis_id")),
+            initial_risk_usd=_opt_number(
+                _field(value, "initial_risk_usd"), f"{label}: el riesgo previsto"
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -361,6 +407,8 @@ class PositionRecord:
                 "side": self.side,
                 "opened_at": _iso(self.opened_at),
                 "risk_usd": self.risk_usd,
+                "initial_risk_usd": self.initial_risk_usd,
+                "planned_risk_usd": self.planned_risk_usd,
                 "entry_price": self.entry_price,
                 "notes": self.notes,
                 "analysis_id": self.analysis_id,
@@ -795,6 +843,12 @@ class LosingStreakState:
     - ``cooldown_started_at`` / ``cooldown_until``: la última pausa (aunque ya
       haya terminado; ``None`` si nunca hubo una).
     - ``extend_cooldown_on_loss``: si una pérdida durante la pausa la estira.
+    - ``cooldown_trigger_ids``: las pérdidas seguidas que **empezaron** la
+      última pausa (la última cerró en ``cooldown_started_at``).
+    - ``cooldown_extended_at`` / ``cooldown_extended_by_id``: la última
+      pérdida que estiró esa pausa (``None`` si no se estiró).
+    - ``losses_during_cooldown``: cuántas pérdidas cerraron durante esa pausa
+      (se estire o no).
     """
 
     as_of: datetime
@@ -807,6 +861,10 @@ class LosingStreakState:
     cooldown_started_at: datetime | None
     cooldown_until: datetime | None
     extend_cooldown_on_loss: bool = True
+    cooldown_trigger_ids: tuple[int | None, ...] = ()
+    cooldown_extended_at: datetime | None = None
+    cooldown_extended_by_id: int | None = None
+    losses_during_cooldown: int = 0
 
     def cooldown_active(self, now: datetime | None = None) -> bool:
         """``True`` si la pausa está corriendo en ``now`` (por defecto, ``as_of``)."""
@@ -846,6 +904,10 @@ class LosingStreakState:
                 "cooldown_started_at": _iso(self.cooldown_started_at),
                 "cooldown_until": _iso(self.cooldown_until),
                 "cooldown_active": self.cooldown_active(),
+                "cooldown_trigger_ids": list(self.cooldown_trigger_ids),
+                "cooldown_extended_at": _iso(self.cooldown_extended_at),
+                "cooldown_extended_by_id": self.cooldown_extended_by_id,
+                "losses_during_cooldown": self.losses_during_cooldown,
             }
         )
 
@@ -868,9 +930,10 @@ def losing_streak_state(
 
     Recorre todas las operaciones cerradas hasta ``now`` en orden de cierre:
     el estado de hoy depende de cuándo empezaron y terminaron las pausas
-    anteriores. Con ``extend_cooldown_on_loss``, una pérdida durante la pausa
-    la estira ``cooldown_hours`` desde esa pérdida; sin eso, la pausa termina a
-    la hora prevista (la pérdida igual suma a la racha).
+    anteriores. Con ``extend_cooldown_on_loss``, **cualquier** pérdida que
+    cierre durante la pausa (``inicio <= cierre < fin``, aunque antes haya una
+    ganada) la estira ``cooldown_hours`` desde esa pérdida; sin eso, la pausa
+    termina a la hora prevista (la pérdida igual suma a la racha).
     """
     moment = _aware_utc(now, "La hora actual")
     required = int(consecutive_losses)
@@ -886,6 +949,10 @@ def losing_streak_state(
     last_loss_at: datetime | None = None
     cd_start: datetime | None = None
     cd_until: datetime | None = None
+    trigger_ids: tuple[int | None, ...] = ()
+    extended_at: datetime | None = None
+    extended_by: int | None = None
+    during = 0
     pending_reset = False
     for trade in _sorted_by_close(trades):
         if trade.closed_at > moment:
@@ -899,13 +966,21 @@ def losing_streak_state(
         count += 1
         ids.append(trade.id)
         last_loss_at = trade.closed_at
-        if count >= required:
-            running = cd_start is not None and cd_until is not None and trade.closed_at < cd_until
-            if not running:
-                cd_start = trade.closed_at
+        running = (
+            cd_start is not None and cd_until is not None and cd_start <= trade.closed_at < cd_until
+        )
+        if running:
+            # Perdió durante la pausa (aunque antes haya ganado una): la pausa
+            # se estira desde esta pérdida, si así lo quiere el usuario.
+            during += 1
+            if extend_cooldown_on_loss:
                 cd_until = trade.closed_at + pause
-            elif extend_cooldown_on_loss:
-                cd_until = trade.closed_at + pause
+                extended_at, extended_by = trade.closed_at, trade.id
+        elif count >= required:
+            cd_start = trade.closed_at
+            cd_until = trade.closed_at + pause
+            trigger_ids = tuple(ids)
+            extended_at, extended_by, during = None, None, 0
             pending_reset = reset_after_cooldown
     if pending_reset and cd_until is not None and moment >= cd_until:
         count, ids = 0, []
@@ -920,6 +995,10 @@ def losing_streak_state(
         cooldown_started_at=cd_start,
         cooldown_until=cd_until,
         extend_cooldown_on_loss=extend_cooldown_on_loss,
+        cooldown_trigger_ids=trigger_ids,
+        cooldown_extended_at=extended_at,
+        cooldown_extended_by_id=extended_by,
+        losses_during_cooldown=during,
     )
 
 
@@ -980,6 +1059,12 @@ class DrawdownRestart:
     deposits_usd: float = 0.0
     withdrawals_usd: float = 0.0
     trading_pnl_usd: float = 0.0
+    withdrawn_open_usd: float = 0.0
+
+    @property
+    def negative_balance(self) -> bool:
+        """El saldo calculado da negativo (casi siempre un dato mal cargado)."""
+        return self.current_balance_usd < 0
 
     def to_dict(self) -> dict[str, Any]:
         return json_safe(
@@ -995,6 +1080,8 @@ class DrawdownRestart:
                 "deposits_usd": self.deposits_usd,
                 "withdrawals_usd": self.withdrawals_usd,
                 "trading_pnl_usd": self.trading_pnl_usd,
+                "withdrawn_open_usd": self.withdrawn_open_usd,
+                "negative_balance": self.negative_balance,
             }
         )
 
@@ -1013,6 +1100,15 @@ class WalletState:
     - ``points``: historia del mes, empezando por el saldo del primer instante.
     - ``restart``: la caída medida de nuevo desde el último bloqueo total del
       mes (``None`` si no hubo o si ``restart_after_unlock`` está apagado).
+    - ``restarts``: la misma medida desde **cada** bloqueo del mes, en orden
+      (el último es ``restart``). Sirve para mostrar, mientras existe el
+      LOCKED de un segundo bloqueo, la caída que lo disparó (medida desde el
+      bloqueo anterior).
+    - ``month_withdrawn_open_usd``: lo retirado este mes que todavía no se
+      volvió a depositar (con ``deposit_refills_withdrawals``, el próximo
+      depósito hasta ese monto no cambia el % de caída).
+    - ``negative_balance``: el saldo calculado da negativo ahora (la caída
+      pasa el 100 %; casi siempre es un dato mal cargado).
     """
 
     assumed: bool
@@ -1035,6 +1131,20 @@ class WalletState:
     withdrawal_peak: WithdrawalPeak = "proportional"
     deposit_raises_peak: bool = True
     restart: DrawdownRestart | None = None
+    restarts: tuple[DrawdownRestart, ...] = ()
+    deposit_refills_withdrawals: bool = False
+    month_withdrawn_open_usd: float = 0.0
+
+    @property
+    def negative_balance(self) -> bool:
+        """El saldo calculado da negativo (casi siempre un dato mal cargado)."""
+        return self.current_balance_usd < 0
+
+    def restart_before(self, moment: datetime) -> DrawdownRestart | None:
+        """La medida desde el último bloqueo del mes **anterior** a ``moment`` (o ``None``)."""
+        when = _aware_utc(moment, "La hora")
+        earlier = [r for r in self.restarts if r.locked_at < when]
+        return earlier[-1] if earlier else None
 
     def to_dict(self) -> dict[str, Any]:
         return json_safe(
@@ -1058,7 +1168,11 @@ class WalletState:
                 "warnings": list(self.warnings),
                 "withdrawal_peak": self.withdrawal_peak,
                 "deposit_raises_peak": self.deposit_raises_peak,
+                "deposit_refills_withdrawals": self.deposit_refills_withdrawals,
+                "month_withdrawn_open_usd": self.month_withdrawn_open_usd,
+                "negative_balance": self.negative_balance,
                 "restart": self.restart,
+                "restarts": list(self.restarts),
             }
         )
 
@@ -1088,7 +1202,11 @@ class _Point:
 
 @dataclass
 class _PeakWalk:
-    """Resultado de recorrer la billetera desde un saldo inicial (uso interno)."""
+    """Resultado de recorrer la billetera desde un saldo inicial (uso interno).
+
+    ``withdrawn_open``: lo retirado que todavía no se volvió a depositar
+    (``deposit_refills_withdrawals``).
+    """
 
     peak: float
     peak_at: datetime
@@ -1096,6 +1214,7 @@ class _PeakWalk:
     withdrawals: float = 0.0
     trading: float = 0.0
     lowest: float = 0.0
+    withdrawn_open: float = 0.0
     history: list[WalletPoint] | None = None
 
 
@@ -1109,33 +1228,67 @@ def _walk_peak(
     withdrawal_peak: WithdrawalPeak,
     deposit_raises_peak: bool,
     keep_history: bool,
+    deposit_refills_withdrawals: bool = False,
+    start_withdrawn: float = 0.0,
 ) -> _PeakWalk:
-    """Recorre los puntos ``indices`` (en orden) moviendo el máximo con las reglas del usuario."""
+    """Recorre los puntos ``indices`` (en orden) moviendo el máximo con las reglas del usuario.
+
+    Con ``deposit_refills_withdrawals``, un depósito primero "devuelve" lo
+    retirado que todavía no se volvió a depositar (``start_withdrawn`` es lo
+    que ya venía retirado de antes) con la regla inversa a la del retiro:
+    ``"proportional"`` → el % de caída no cambia; ``"subtract"`` → el máximo
+    sube lo mismo; ``"none"`` → el máximo no se toca. Solo lo que pase de eso
+    sigue ``deposit_raises_peak``. Si un retiro proporcional dejó la billetera
+    en 0 (o menos), se recuerda la relación máximo/saldo de antes del retiro
+    para devolverla con el depósito: así retirar todo y volver a depositarlo
+    deja el % igual.
+    """
     walk = _PeakWalk(
         peak=start_balance,
         peak_at=start_ts,
         lowest=start_balance,
+        withdrawn_open=max(0.0, start_withdrawn),
         history=[] if keep_history else None,
     )
+    # Máximo / saldo de antes del retiro que vació la billetera (``None`` si no
+    # hay uno pendiente de devolver).
+    empty_ratio: float | None = None
     for i in indices:
         p = points[i]
         bal = after[i]
         if p.kind == POINT_WITHDRAWAL:
             walk.withdrawals -= p.amount  # p.amount es negativo
+            walk.withdrawn_open -= p.amount
             if withdrawal_peak == "subtract":
                 walk.peak += p.amount
             elif withdrawal_peak == "proportional":
                 before = bal - p.amount
                 if before > 0:
                     # El máximo baja en la misma proporción que el saldo: el %
-                    # de caída no cambia. Sacar todo (o más) lo deja en 0.
+                    # de caída no cambia. Sacar todo (o más) lo deja en 0, pero
+                    # se recuerda la proporción para cuando vuelva la plata.
+                    ratio = walk.peak / before
                     walk.peak *= max(0.0, bal) / before
+                    empty_ratio = ratio if bal <= 0 else None
         elif p.kind == POINT_DEPOSIT:
             walk.deposits += p.amount
-            if deposit_raises_peak:
-                walk.peak += p.amount
+            refill = min(p.amount, walk.withdrawn_open) if deposit_refills_withdrawals else 0.0
+            excess = p.amount - refill
+            if refill > 0:
+                walk.withdrawn_open -= refill
+                walk.peak = _refill_peak(
+                    walk.peak,
+                    bal - p.amount,
+                    refill,
+                    withdrawal_peak=withdrawal_peak,
+                    empty_ratio=empty_ratio,
+                )
+            if excess > 0 and deposit_raises_peak:
+                walk.peak += excess
         elif p.kind == POINT_TRADE:
             walk.trading += p.amount
+        if bal > 0:
+            empty_ratio = None  # la billetera ya no está vacía: manda el saldo de ahora
         if bal > walk.peak:
             walk.peak, walk.peak_at = bal, p.ts
         walk.lowest = min(walk.lowest, bal)
@@ -1152,6 +1305,36 @@ def _walk_peak(
                 )
             )
     return walk
+
+
+def _refill_peak(
+    peak: float,
+    before: float,
+    refill: float,
+    *,
+    withdrawal_peak: WithdrawalPeak,
+    empty_ratio: float | None,
+) -> float:
+    """El máximo después de devolver ``refill`` USD retirados (la regla inversa a la del retiro).
+
+    ``before`` es el saldo justo antes del depósito. Con ``"proportional"`` el
+    % de caída queda igual: el máximo pasa a ``máximo / saldo × (saldo +
+    devuelto)``; si el saldo era 0 o menos porque un retiro vació la
+    billetera, usa la proporción recordada (``empty_ratio``). Si no hay forma
+    de mantener el % (saldo en 0 o menos por pérdidas), el máximo sube lo
+    devuelto, como cualquier depósito.
+    """
+    if withdrawal_peak == "none":
+        return peak
+    if withdrawal_peak == "subtract":
+        return peak + refill
+    ratio = peak / before if before > 0 and peak > 0 else empty_ratio
+    if ratio is None:
+        return peak + refill
+    after = before + refill
+    if after <= 0:
+        return peak  # sigue en 0 o menos: no hay % que mantener todavía
+    return max(peak, ratio * after)
 
 
 def _drawdown(peak: float, current: float) -> tuple[float, float, float, float]:
@@ -1174,6 +1357,8 @@ def wallet_state(
     deposit_raises_peak: bool = True,
     restart_at: datetime | None = None,
     restart_lock_id: int | None = None,
+    deposit_refills_withdrawals: bool = False,
+    restart_locks: Iterable[tuple[datetime, int | None]] = (),
 ) -> WalletState:
     """Saldo, máximo del mes y caída (ver las reglas en el docstring del módulo).
 
@@ -1185,6 +1370,13 @@ def wallet_state(
       cae entre el inicio del mes y ``now``), ``WalletState.restart`` trae la
       caída medida de nuevo desde el saldo de ese momento. ``restart_lock_id``
       es el número de ese bloqueo en la base (solo para mostrar).
+    - ``restart_locks``: ``(hora, número)`` de todos los bloqueos del mes;
+      ``WalletState.restarts`` trae la medida desde cada uno (``restart_at``
+      se suma a la lista).
+    - ``deposit_refills_withdrawals``: un depósito primero devuelve lo
+      retirado en el mes sin cambiar el % (ver ``_walk_peak``).
+    - Un saldo anotado justo al empezar el mes (01/MM 00:00) es el saldo de
+      arranque del mes, no una caída dentro del mes.
     """
     moment = _aware_utc(now, "La hora actual")
     start = _aware_utc(month_start, "El inicio del mes")
@@ -1194,7 +1386,12 @@ def wallet_state(
             f"Regla de retiros desconocida: {withdrawal_peak!r} "
             f"(opciones: {', '.join(WITHDRAWAL_PEAK_RULES)})."
         )
+    lock_moments: dict[datetime, int | None] = {}
+    for when, lock_id in restart_locks:
+        lock_moments[_aware_utc(when, "La hora del bloqueo")] = lock_id
     restart_moment = _opt_aware_utc(restart_at, "La hora del bloqueo")
+    if restart_moment is not None:
+        lock_moments[restart_moment] = restart_lock_id
     events = sorted(
         (e for e in (WalletRecord.from_value(x) for x in wallet_events) if e.ts <= moment),
         key=lambda e: (e.ts, e.id if e.id is not None else 0),
@@ -1240,19 +1437,32 @@ def wallet_state(
         back -= points[i].amount
     initial = back
 
-    pre_month = [i for i, p in enumerate(points) if p.ts < start]
-    month_start_balance = after[pre_month[-1]] if pre_month else initial
+    # Lo de antes del mes, más un saldo anotado justo en el primer instante
+    # (01/MM 00:00): ese saldo es el de arranque del mes (incluye lo que pasó
+    # hasta ese momento inclusive), no una caída dentro del mes.
+    n_pre = sum(1 for p in points if p.ts < start)
+    for i in range(n_pre, len(points)):
+        if points[i].ts != start:
+            break
+        if points[i].rank == _RANK_SNAPSHOT:
+            n_pre = i + 1
+    month_start_balance = after[n_pre - 1] if n_pre else initial
     current = after[-1]
+    rules = {
+        "withdrawal_peak": withdrawal_peak,
+        "deposit_raises_peak": deposit_raises_peak,
+        "deposit_refills_withdrawals": deposit_refills_withdrawals,
+    }
+    month_indices = [i for i in range(n_pre, len(points)) if points[i].kind != POINT_ASSUMED_START]
 
     walk = _walk_peak(
         points,
         after,
-        (i for i, p in enumerate(points) if p.ts >= start and p.kind != POINT_ASSUMED_START),
+        month_indices,
         start_balance=month_start_balance,
         start_ts=start,
         keep_history=True,
-        withdrawal_peak=withdrawal_peak,
-        deposit_raises_peak=deposit_raises_peak,
+        **rules,
     )
     history = [
         WalletPoint(
@@ -1266,31 +1476,36 @@ def wallet_state(
     ]
     peak_c, current_c, drawdown, drawdown_pct = _drawdown(walk.peak, current)
 
-    restart: DrawdownRestart | None = None
-    if restart_moment is not None and start <= restart_moment <= moment:
+    def measure_since(locked_at: datetime, lock_id: int | None) -> DrawdownRestart:
         # Como un mes nuevo que empieza en el bloqueo: la base es el saldo
         # después de todo lo que pasó hasta esa hora (la pérdida del disparo
-        # incluida).
-        upto = [i for i, p in enumerate(points) if p.ts <= restart_moment]
+        # incluida). Lo retirado en el mes antes del bloqueo y no devuelto
+        # todavía se puede devolver sin cambiar el %.
+        upto = [i for i, p in enumerate(points) if p.ts <= locked_at]
         base = after[upto[-1]] if upto else initial
+        before_lock = _walk_peak(
+            points,
+            after,
+            [i for i in month_indices if points[i].ts <= locked_at],
+            start_balance=month_start_balance,
+            start_ts=start,
+            keep_history=False,
+            **rules,
+        )
         rwalk = _walk_peak(
             points,
             after,
-            (
-                i
-                for i, p in enumerate(points)
-                if p.ts > restart_moment and p.kind != POINT_ASSUMED_START
-            ),
+            [i for i in month_indices if points[i].ts > locked_at],
             start_balance=base,
-            start_ts=restart_moment,
+            start_ts=locked_at,
             keep_history=False,
-            withdrawal_peak=withdrawal_peak,
-            deposit_raises_peak=deposit_raises_peak,
+            start_withdrawn=before_lock.withdrawn_open,
+            **rules,
         )
         r_peak, r_current, r_dd, r_pct = _drawdown(rwalk.peak, current)
-        restart = DrawdownRestart(
-            lock_id=restart_lock_id,
-            locked_at=restart_moment,
+        return DrawdownRestart(
+            lock_id=lock_id,
+            locked_at=locked_at,
             start_balance_usd=_cents(base),
             peak_usd=r_peak,
             peak_at=rwalk.peak_at,
@@ -1300,7 +1515,15 @@ def wallet_state(
             deposits_usd=_cents(rwalk.deposits),
             withdrawals_usd=_cents(rwalk.withdrawals),
             trading_pnl_usd=_cents(rwalk.trading),
+            withdrawn_open_usd=_cents(rwalk.withdrawn_open),
         )
+
+    restarts = tuple(
+        measure_since(when, lock_moments[when])
+        for when in sorted(lock_moments)
+        if start <= when <= moment
+    )
+    restart = restarts[-1] if restarts else None
 
     warnings: list[str] = []
     if assumed:
@@ -1312,10 +1535,11 @@ def wallet_state(
     if walk.lowest < 0 or current < 0:
         warnings.append(
             "El saldo calculado de la billetera da negativo en algún momento del mes: "
-            "revisá los movimientos y el saldo anotados."
+            "revisá lo que cargaste (puede haber un resultado o un retiro mal tipeado) y el "
+            "saldo anotado."
         )
     last_balance = balances[-1] if balances else None
-    anchor_candidates = [e for e in balances if e.ts < start]
+    anchor_candidates = [e for e in balances if e.ts <= start]
     anchor = anchor_candidates[-1] if anchor_candidates else (balances[0] if balances else None)
     return WalletState(
         assumed=assumed,
@@ -1338,6 +1562,9 @@ def wallet_state(
         withdrawal_peak=withdrawal_peak,
         deposit_raises_peak=deposit_raises_peak,
         restart=restart,
+        restarts=restarts,
+        deposit_refills_withdrawals=deposit_refills_withdrawals,
+        month_withdrawn_open_usd=_cents(walk.withdrawn_open),
     )
 
 
@@ -1568,6 +1795,10 @@ def build_trading_state(
         deposit_raises_peak=dd_cfg.deposit_raises_peak,
         restart_at=None if restart_from is None else restart_from.triggered_at,
         restart_lock_id=None if restart_from is None else restart_from.id,
+        deposit_refills_withdrawals=dd_cfg.deposit_refills_withdrawals,
+        restart_locks=(
+            [(lk.triggered_at, lk.id) for lk in month_locks] if dd_cfg.restart_after_unlock else ()
+        ),
     )
     month_trades = tuple(t for t in all_trades if t.closed_at >= periods.month_start)
     month_events = [e for e in events if periods.month_start <= e.ts <= moment]

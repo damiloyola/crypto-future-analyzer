@@ -220,7 +220,7 @@ riesgo o bloquear todo.
 make trade ARGS="add --symbol BTC --side long --pnl -32,5"       # una operación cerrada (resultado neto, comisiones incluidas)
 make trade ARGS='add --symbol ETH --side short --pnl 18 --opened "ayer 22:00" --closed "ayer 23:40"'
 make trade ARGS="open --symbol SOL --side long --risk 40"         # una posición que dejaste abierta
-make trade ARGS="update 1 --risk 0"                               # moviste el stop a la entrada (o a ganancia)
+make trade ARGS="update 1 --risk 0"                               # moviste el stop a la entrada (el riesgo previsto queda anotado)
 make trade ARGS="close 1 --pnl -12"                               # la cerrás y queda como operación
 make trade ARGS="balance --amount 300"                            # el saldo que ves en la billetera de futuros
 make trade ARGS="deposit --amount 100"                            # también withdraw --amount 50
@@ -233,11 +233,19 @@ make safety                                                       # cómo están
 - **Fechas y horas** en tu zona (`app.user_timezone`): `"2026-10-13 14:30"`,
   `"13/10 14:30"`, `"14:30"` (hoy), `"ayer 22:00"`, `"mañana 11:00"`. Montos con
   coma o punto (`-32,5`). Sin `--closed` es ahora; sin `--opened`, la misma hora
-  del cierre. Una fecha sin año es la pasada más reciente (el 1 de enero,
-  `"31/12 23:00"` es del año pasado); en un evento, la más cercana. Si escribís
-  una hora que todavía no llegó (`"22:00"` a la 01:00), te avisa y te sugiere
-  `"ayer 22:00"`. Una hora hasta 5 minutos adelante del reloj de la compu se
-  guarda como "ahora" (así los frenos la cuentan ya) y te lo dice.
+  del cierre. Una fecha sin año es de este año. Si así queda en el futuro:
+  - a más de medio año, es del año pasado (el 1 de enero, `"31/12 23:00"` es de
+    ayer);
+  - si no, es un error de tipeo y te lo dice con el año a la vista (el 13/10,
+    `"14/10 10:00"` da "La hora de cierre (14/10/2026 10:00) está en el
+    futuro"), en vez de guardarla hace un año sin avisar.
+
+  En un evento, la más cercana. `"29/02"` sin año, cuando ni este año ni los de
+  al lado son bisiestos, pide el año ("La fecha 29/02 no existe en estos años:
+  poné el año"). Si escribís una hora que todavía no llegó (`"22:00"` a la
+  01:00), te avisa y te sugiere `"ayer 22:00"`. Una hora hasta 5 minutos
+  adelante del reloj de la compu se guarda como "ahora" (así los frenos la
+  cuentan ya) y te lo dice.
 - **Análisis ligado**: cada vez que analizás (`make cli`, con datos reales) el
   análisis se guarda con un número. Al cargar la operación, la app le adjunta
   sola el último análisis de esa moneda de las 24 h antes de abrir (régimen,
@@ -252,18 +260,27 @@ make safety                                                       # cómo están
   cerrar la posición (la hora de apertura y las operaciones del día no
   cambian). Con el stop en la entrada o en ganancia poné `--risk 0`: ya no
   cuenta para el límite del día ni para el tope de posiciones correlacionadas.
-  También `--entry` y `--note` (`--note ""` la borra). `open --risk 0` también
-  vale.
-- Después de cargar algo muestra en una línea cómo quedaron los frenos. Si ya
-  hiciste las operaciones permitidas del día (3 en el agresivo), avisa: "ya
-  hiciste 3 de 3 operaciones permitidas hoy: no va a haber planes hasta mañana".
-- **Confirmación con `--yes`** (por si es un error de tipeo; los números en
-  `app.manual_input`): un resultado más grande que tu saldo o que 3 veces tu
-  riesgo por operación (150 USD en el agresivo), y un evento de más de 7 días,
-  no se guardan sin `--yes`. Por ejemplo, `make trade ARGS="add --symbol BTC
-  --side long --pnl -325"` explica "¿No será un error de tipeo?" y no guarda
-  nada; si de verdad perdiste 325, repetilo con `--yes` al final. Lo mismo con
-  `close` y con `event`.
+  El **riesgo previsto** al abrir queda anotado igual y la salida lo dice: si
+  algo sale mal, el informe del incidente lo usa para decir "moviste el stop a
+  la entrada" o "agrandaste el stop". `make trades` muestra los dos ("0,00 USD
+  (previsto 40,00 USD)"). También `--entry` y `--note` (`--note ""` la borra).
+  `open --risk 0` también vale.
+- Después de cargar algo muestra en una línea cómo quedaron los frenos.
+- **Confirmación con `--yes`** (casi siempre es un error de tipeo; los números
+  en `app.manual_input`). No se guardan sin `--yes`:
+  - un resultado (`add`, `close`) más grande que tu saldo o que 3 veces tu
+    riesgo por operación (150 USD en el agresivo);
+  - una posición abierta (`open`, `update --risk`) con un riesgo más grande que
+    tu saldo o que esos 150 USD (un 400 en vez de 40 te dejaría en "No operar"
+    todo el día, porque el riesgo abierto cuenta en el límite del día);
+  - un retiro más grande que el saldo que tenías en esa fecha (un cero de más
+    deja el saldo en negativo y desarma las cuentas del freno del mes);
+  - un evento de más de 7 días.
+
+  Por ejemplo, `make trade ARGS="add --symbol BTC --side long --pnl -325"`
+  explica "¿No será un error de tipeo?" y no guarda nada; si de verdad perdiste
+  325, repetilo con `--yes` al final. Si el comando que falla era el primero de
+  una `--db` nueva, tampoco queda la base creada.
 
 Los frenos (todos los números en `config.yaml`, `circuit_breakers`, y en tu perfil):
 
@@ -271,6 +288,7 @@ Los frenos (todos los números en `config.yaml`, `circuit_breakers`, y en tu per
 |---|---|---|
 | Pérdida del día | perdiste el 50 % de tu límite diario (50 de 100 USD) | riesgo × 0,5 hasta las 00:00 |
 | Límite del día | perdiste el 100 % del límite diario | no hay planes hasta las 00:00 |
+| Operaciones del día | llegaste al máximo de operaciones por día de tu perfil (3 en el agresivo) | estado ROJO: no hay planes hasta las 00:00 ("ya hiciste 3 de 3 operaciones permitidas hoy") |
 | Pérdidas seguidas | 3 operaciones perdidas seguidas | pausa de 4 h; después la cuenta arranca de cero |
 | Pérdida de la semana | perdiste el 60 % de la billetera mensual (180 de 300 USD) | riesgo × 0,5 hasta el lunes |
 | Caída del mes | la billetera cayó 70 % desde su máximo del mes | **bloqueo total** (ver abajo) |
@@ -285,18 +303,28 @@ Los frenos (todos los números en `config.yaml`, `circuit_breakers`, y en tu per
   hasta las 00:00, y se muestra "Hoy llegaste a perder 60 USD (ahora vas -30
   USD)". El de la semana sigue hasta el lunes.
 - **Pausa por pérdidas seguidas**: si perdés otra vez durante la pausa, se
-  estira 4 h desde esa pérdida (`extend_cooldown_on_loss`). Ejemplo: tercera
-  pérdida a las 14:00, pausa hasta las 18:00; otra pérdida a las 16:00 (una
-  posición que tenías abierta), pausa hasta las 20:00.
+  estira 4 h desde esa pérdida (`extend_cooldown_on_loss`), aunque en el medio
+  hayas ganado alguna. Ejemplo: tercera pérdida a las 14:00, pausa hasta las
+  18:00; otra pérdida a las 16:00 (una posición que tenías abierta), pausa
+  hasta las 20:00. El mensaje dice qué racha empezó la pausa y qué pérdida la
+  estiró.
 - **Retiros y depósitos en la caída del mes**:
   - Un **retiro** baja el máximo en la misma proporción que el saldo, así
     sacar plata no cambia el % de caída. Ejemplo: arrancaste el mes con 300,
     perdiste 100 (saldo 200, caída 33 %) y retirás 100: el saldo queda en 100,
     el máximo baja a 150 y la caída sigue en 33 %.
-  - Un **depósito** sube el máximo en lo mismo que depositaste: la pérdida de
-    antes sigue contando y depositar no esquiva el bloqueo. Ejemplo: arrancaste
-    con 300, perdiste 150 y depositás 200: saldo 350, máximo 500, caída 30 %
-    (los 150 perdidos siguen ahí).
+  - Un **depósito** primero "devuelve" lo que retiraste en el mes, sin cambiar
+    el % de caída (`deposit_refills_withdrawals`): retirar y volver a depositar
+    no borra la caída. Ejemplo: máximo 300 y saldo 100 (66,67 % abajo); retirás
+    100 y después depositás 100: sigue en 66,67 %. Lo que pase de lo retirado
+    sube el máximo en lo mismo que depositaste: la pérdida de antes sigue
+    contando y depositar no esquiva el bloqueo. Ejemplo: máximo 300, saldo 100,
+    sin retiros, y depositás 200: saldo 300, máximo 500, caída 40 %.
+  - Si en el mes primero depositás y después retirás, se aplican las dos
+    reglas en ese orden. Ejemplo: máximo 300 y saldo 100; depositás 90 (no
+    había retiros: saldo 190, máximo 390, caída 51,28 %) y después retirás 90
+    (saldo 100, el máximo baja en la misma proporción, a 205,26, y la caída
+    sigue en 51,28 %).
 - Si nunca anotaste el saldo, la app supone que empezaste el mes con la
   billetera mensual del perfil (300 USD) y te avisa: anotalo con `balance`.
 - Los multiplicadores se suman a los del régimen (día × semana = × 0,25) y van
@@ -312,7 +340,10 @@ Los frenos (todos los números en `config.yaml`, `circuit_breakers`, y en tu per
   la misma moneda cuenta (pueden saltar los dos stops). La consola lo dice en el
   plan: "Límite del día: hoy perdiste 30 USD y tenés 40 USD en juego en
   posiciones abiertas (lo que perdés si saltan sus stops): te quedan 30 USD de
-  100 USD".
+  100 USD". Si ya llegaste al límite del día, el plan no muestra esa línea (ya
+  dice "llegaste a tu límite"); si después ganaste algo, aclara "antes llegaste
+  a perder X": eso mantiene trabados los frenos que ya saltaron, pero lo que
+  queda se cuenta desde lo que perdés ahora.
 - **Bloqueo total**: la app escribe un informe del incidente en
   `data/incidents/` (qué operaciones, en qué régimen, qué decía el score y qué
   falló) y el archivo `data/LOCKED`. Mientras exista, la consola muestra un
@@ -320,6 +351,13 @@ Los frenos (todos los números en `config.yaml`, `circuit_breakers`, y en tu per
   Cargar operaciones no lo escribe (así podés terminar de cargar, por ejemplo,
   un depósito que faltaba): la línea de los frenos avisa que "al analizar o con
   make safety la app se va a bloquear"; lo escriben `make safety` y el análisis.
+  Si no se puede escribir el archivo LOCKED (permisos de la carpeta, disco
+  lleno), `make safety` y `make cli` dicen "No se pudo escribir el archivo
+  LOCKED (...): la app no arma planes hasta que se pueda escribir" y salen con
+  error; el informe queda guardado una sola vez, aunque lo intentes varias
+  veces.
+- Una pérdida que cargás tarde pero que cerró **antes** del bloqueo es parte de
+  ese incidente: no cuenta como una caída nueva después de desbloquear.
 - **Para salir del bloqueo**: leé el informe y borrá `data/LOCKED` a mano (la
   app no lo borra nunca). Desde ahí la caída se vuelve a medir desde el saldo
   del momento del bloqueo, como si empezara un mes nuevo
@@ -327,12 +365,21 @@ Los frenos (todos los números en `config.yaml`, `circuit_breakers`, y en tu per
   bloqueó; borrás LOCKED: se vuelve a bloquear solo si cae otro 70 % desde 90
   (a 27 USD). La sección de los frenos lo muestra: "la caída se mide de nuevo
   desde el bloqueo del 12/10 11:37 (que ya desbloqueaste)", y abajo, en gris,
-  la caída de todo el mes, que ya no cuenta para el bloqueo. El bloqueo queda
-  anotado en la base; si el LOCKED lo escribió una versión vieja de la app (o
-  la base falló al anotarlo, y la consola lo avisa), borrarlo vuelve a medir
-  desde el máximo del mes y se puede bloquear de nuevo enseguida.
+  la caída de todo el mes, que ya no cuenta para el bloqueo. Si se vuelve a
+  bloquear en el mismo mes, el cartel, el motivo, la fila del freno y la de la
+  billetera muestran la misma caída (la medida desde el bloqueo anterior, por
+  ejemplo "85 USD → 20 USD, 76,47 %"); la de todo el mes va aparte, en gris.
+- El bloqueo queda anotado en la base. Si hay un LOCKED de este mes que no
+  quedó anotado (lo escribió una versión vieja de la app o la base falló), la
+  próxima corrida lo anota sola con su fecha y lo dice
+  (`backfill_unrecorded_lock`): así, cuando lo borres, la caída se mide desde
+  ese bloqueo. Mientras la base siga fallando, la consola lo avisa en cada
+  corrida.
 - Una caída de más de 100 % solo pasa si el saldo calculado da negativo (casi
-  siempre un dato mal cargado, que tiene su aviso): se muestra como 100 %.
+  siempre un dato mal cargado, por ejemplo un resultado o un retiro con un cero
+  de más): se muestra "la billetera cayó más del 100 %" con un aviso de revisar
+  lo cargado, en los frenos, en las dos consolas, en el LOCKED y en el
+  informe.
 - **Correlación**: la consola muestra la matriz de correlación de los
   retornos de 1 h de los últimos 30 días entre la moneda, tus favoritas y las de
   tus posiciones abiertas (`*` = 0,8 o más: se mueven casi igual). Si tenés una
@@ -341,26 +388,36 @@ Los frenos (todos los números en `config.yaml`, `circuit_breakers`, y en tu per
   pueden arriesgar más de 1,5 × tu riesgo por operación (75 USD en el agresivo).
   El plan nuevo se achica a lo que entra; si queda debajo del mínimo operable,
   No operar. Una posición en la misma moneda pero al revés es cobertura: no
-  suma riesgo, pero el plan avisa que pueden saltar los dos stops.
+  suma al tope de posiciones correlacionadas (1,5 × tu riesgo), pero su riesgo
+  sí cuenta en lo que te queda del límite del día, porque pueden saltar los dos
+  stops (el aviso es solo para la misma moneda).
 - El margen de un plan nunca pasa del saldo de tu billetera que muestran los
   frenos (el anotado o, si nunca anotaste uno, el supuesto: la billetera
   mensual del perfil al empezar el mes más tus resultados), y la liquidación
   "modelo Nexo" usa ese saldo (con "saldo supuesto" si lo es). Si el saldo es 0
-  o menos: No operar ("no hay plata para poner de margen").
+  o menos: No operar ("no hay plata para poner de margen"); los niveles quedan
+  como referencia, pero las filas de margen, apalancamiento y liquidación dicen
+  "sin saldo" (no inventan una billetera).
 - `--trades-today` y `--pnl-today` siguen existiendo para probar: el plan usa
   esos números y lo avisa; los frenos siguen mirando lo cargado.
 - `make cli ARGS="--offline"` usa otra base de prueba (al lado de los modelos
   sintéticos, con su propio LOCKED): las pruebas nunca tocan tu estado real.
   `make trade ARGS="... --offline"` carga en esa base. `--db RUTA` (en las dos
-  consolas) usa otra base, con el LOCKED y los informes en su misma carpeta.
+  consolas) usa otra base, con **su propio** LOCKED y su carpeta de informes al
+  lado, con el nombre de la base: `--db data/prueba.db` usa `data/prueba.LOCKED`
+  y `data/prueba_incidents/`. Así una base de prueba en `data/` nunca bloquea
+  (ni desbloquea) la real. Con la ruta de la base real (`data/analyzer.db`) usa
+  `data/LOCKED` y `data/incidents/` de siempre.
 - **`--db` con una ruta relativa** en `make cli`, `make trade`, `make trades` y
   `make safety`: es relativa a la carpeta desde donde corriste `make` (la raíz,
   `backend/` o `frontend/`), no a `backend/`. Con una base que no existe,
   `make cli`, `make trades`, `make safety`, `close`, `update` y `delete` dicen
   "No existe la base ..." y no crean nada (¿ruta mal escrita?); el primer
-  `make trade` que carga algo la crea y lo avisa.
-- Las bases (`*.db`), el archivo `LOCKED` y las carpetas `incidents/` están en
-  `.gitignore` en cualquier carpeta del proyecto: tus datos nunca se suben a git.
+  `make trade` que carga algo la crea y lo avisa (si ese comando falla, por
+  ejemplo porque falta `--yes`, no queda la base creada).
+- Las bases (`*.db`), los archivos `LOCKED` y `*.LOCKED` y las carpetas
+  `incidents/` y `*_incidents/` están en `.gitignore` en cualquier carpeta del
+  proyecto: tus datos nunca se suben a git.
 - En JSON (`make cli ARGS="--json"`), los frenos van en `"safety"` (cada freno
   con umbral, valor actual y progreso, para el panel de riesgo del Hito 9) y la
   matriz con la exposición en `"correlation"`; si la app está bloqueada,
