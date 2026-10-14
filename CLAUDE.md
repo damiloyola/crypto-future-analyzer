@@ -110,6 +110,20 @@ El frontend solo muestra lo que devuelve la API; no calcula riesgo.
   nuevo (`restart_after_unlock`); "lo que queda del límite del día" también
   descuenta el riesgo de las posiciones abiertas
   (`trade_plan.daily_cap_includes_open_risk`).
+- **Frenos, tercera ronda (Hito 5):** un depósito primero devuelve lo retirado
+  en el mes sin cambiar el % y solo el resto sube el máximo
+  (`deposit_refills_withdrawals`); un LOCKED de este mes que no quedó anotado en
+  la base se anota solo con su fecha (`backfill_unrecorded_lock`); una pérdida
+  cargada tarde que cerró antes del bloqueo es parte de ese incidente (no
+  cuenta como caída nueva); con el máximo de operaciones del día alcanzado el
+  estado queda en ROJO (`max_trades_blocks_status`); con saldo calculado
+  negativo se muestra "cayó más del 100 %" con aviso de revisar los datos; con
+  "No operar" el plan igual muestra los niveles como referencia; el aviso de
+  "pueden saltar los dos stops" es solo para la misma moneda; el margen respeta
+  el saldo supuesto si nunca se anotó el saldo. Al cargar a mano se pide
+  `--yes` para resultados grandes, eventos de más de 7 días, retiros mayores
+  que el saldo y riesgo abierto mayor que el saldo o que 3 × el riesgo
+  (`app.manual_input`).
 - **Evento de alta volatilidad (Hito 5):** se guarda en la base con nota y
   hora de fin; bloquea todos los planes hasta esa hora y después se apaga solo.
   Una posición abierta en la misma moneda y dirección contraria es cobertura

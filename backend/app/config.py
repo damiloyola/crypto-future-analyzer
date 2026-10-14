@@ -50,6 +50,11 @@ class ManualInputConfig(_Strict):
     # Un evento de alta volatilidad que dura más que esto pide confirmación
     # (¿año mal tipeado?).
     confirm_event_longer_than_days: float = Field(7.0, gt=0)
+    # Un retiro más grande que el saldo calculado pide confirmación.
+    confirm_withdrawal_over_balance: bool = True
+    # Una posición abierta (open/update) con riesgo mayor que el saldo o que
+    # confirm_pnl_over_risk_multiple × el riesgo por operación pide confirmación.
+    confirm_open_risk_over_limits: bool = True
 
 
 class AppConfig(_Strict):
@@ -510,6 +515,13 @@ class MonthlyDrawdownLock(_Strict):
     # Después de que el usuario borra el LOCKED, la caída se mide desde el saldo
     # del momento del bloqueo (como un mes nuevo).
     restart_after_unlock: bool = True
+    # Un depósito primero "devuelve" lo retirado en el mes sin cambiar el % (como
+    # el retiro); solo lo que pase de eso sube el máximo en lo mismo. Así retirar
+    # y volver a depositar no borra la caída.
+    deposit_refills_withdrawals: bool = True
+    # Si existe un LOCKED de este mes que no quedó anotado en la base (versión
+    # vieja o falla de la base), la app lo anota sola con su fecha.
+    backfill_unrecorded_lock: bool = True
 
 
 class CircuitBreakersConfig(_Strict):
@@ -525,6 +537,9 @@ class CircuitBreakersConfig(_Strict):
     # Una vez que la pérdida del día/semana llegó a un umbral, el freno sigue
     # hasta que termina el período aunque después una ganancia mejore el neto.
     latch_until_period_end: bool = True
+    # Con el máximo de operaciones del día alcanzado, el estado de los frenos
+    # queda en ROJO ("no se generan planes hasta mañana"), como un freno más.
+    max_trades_blocks_status: bool = True
     month_starts: Literal["calendar"] = "calendar"
     link_analysis_within_hours: float = Field(24, gt=0)
 

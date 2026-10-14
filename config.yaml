@@ -33,6 +33,8 @@ app:
   manual_input:
     confirm_pnl_over_risk_multiple: 3   # resultado > saldo o > 3 × riesgo por operación
     confirm_event_longer_than_days: 7   # evento de volatilidad de más de 7 días
+    confirm_withdrawal_over_balance: true   # retiro más grande que el saldo
+    confirm_open_risk_over_limits: true     # riesgo abierto > saldo o > 3 × riesgo
 
 symbols:
   # Monedas que se muestran como favoritas en el selector.
@@ -501,6 +503,12 @@ circuit_breakers:
     #   saldo del momento del bloqueo (como un mes nuevo): solo se vuelve a
     #   bloquear si cae otra vez el % del tope desde ahí.
     restart_after_unlock: true
+    # - un depósito primero devuelve lo retirado en el mes sin cambiar el %;
+    #   solo lo que pase de eso sube el máximo (retirar y volver a depositar
+    #   no borra la caída);
+    deposit_refills_withdrawals: true
+    # - un LOCKED de este mes que no quedó anotado en la base se anota solo.
+    backfill_unrecorded_lock: true
   week_starts_on: "monday"
   # Decisiones del usuario (Hito 5):
   # - la pérdida del día y de la semana es el NETO (ganancias y pérdidas
@@ -510,6 +518,8 @@ circuit_breakers:
   #   sigue hasta que termina el período (00:00 o el lunes), aunque después una
   #   ganancia mejore el neto;
   latch_until_period_end: true
+  # - con el máximo de operaciones del día alcanzado, el estado queda en ROJO;
+  max_trades_blocks_status: true
   # - el mes de la billetera es el mes calendario (el día 1 el máximo vuelve a
   #   ser el saldo de ese momento; los depósitos lo suben);
   month_starts: "calendar"
