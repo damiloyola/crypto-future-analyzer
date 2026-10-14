@@ -108,9 +108,12 @@ from app.risk.rules import (
     json_safe,
 )
 from app.safety.incident import (
+    CHECK_LOADED_DATA_TEXT,
+    UNMEASURABLE_DRAWDOWN_TEXT,
     IncidentTrade,
     IncidentTrigger,
     analysis_test_marks,
+    drawdown_unmeasurable,
     find_identical_report,
     fmt_datetime,
     fmt_drawdown_pct,
@@ -882,9 +885,40 @@ class DrawdownMeasure:
         """El saldo calculado da negativo: la caída pasa el 100 % (dato mal cargado)."""
         return round(self.balance_usd, 2) < 0
 
+    @property
+    def unmeasurable(self) -> bool:
+        """Saldo negativo con el máximo en 0 o menos: la caída no se puede medir.
+
+        Pasa con un retiro más grande que el saldo o con la medida desde un
+        bloqueo que arrancó con el saldo negativo. El freno del mes no salta
+        hasta que se corrijan los datos (``incident.drawdown_unmeasurable``).
+        """
+        return drawdown_unmeasurable(self.balance_usd, self.drawdown_pct)
+
+    @property
+    def month_unmeasurable(self) -> bool:
+        """Lo mismo para la caída del mes calendario."""
+        return drawdown_unmeasurable(self.balance_usd, self.month_drawdown_pct)
+
     def drawdown_text(self, threshold_pct: float | None = None) -> str:
-        """``"73,33 %"`` o ``"más del 100 %"`` (``incident.fmt_drawdown_pct``)."""
+        """``"73,33 %"``, ``"más del 100 %"`` o ``"no se puede medir (saldo negativo)"``."""
+        if self.unmeasurable:
+            return f"{UNMEASURABLE_DRAWDOWN_TEXT} (saldo negativo)"
         return fmt_drawdown_pct(self.drawdown_pct, threshold_pct)
+
+    def month_drawdown_text(self, threshold_pct: float | None = None) -> str:
+        """La caída del mes calendario, escrita igual que ``drawdown_text``."""
+        if self.month_unmeasurable:
+            return f"{UNMEASURABLE_DRAWDOWN_TEXT} (saldo negativo)"
+        return fmt_drawdown_pct(self.month_drawdown_pct, threshold_pct)
+
+    def negative_warning(self) -> str | None:
+        """El aviso de revisar los datos con el saldo negativo (``None`` si no lo es)."""
+        return negative_balance_warning(
+            self.balance_usd,
+            self.drawdown_pct,
+            month_drawdown_pct=self.month_drawdown_pct if self.since_unlock else None,
+        )
 
     def to_dict(self, *, threshold_pct: float | None = None, tz: Any = None) -> dict[str, Any]:
         r = self.restart
@@ -899,9 +933,8 @@ class DrawdownMeasure:
                 "drawdown_pct": self.drawdown_pct,
                 "drawdown_text": self.drawdown_text(threshold_pct),
                 "negative_balance": self.negative_balance,
-                "negative_balance_warning": negative_balance_warning(
-                    self.balance_usd, self.drawdown_pct
-                ),
+                "unmeasurable": self.unmeasurable,
+                "negative_balance_warning": self.negative_warning(),
                 "measured_since": None if r is None else _iso(r.locked_at),
                 "measured_since_text": (
                     None if r is None or tz is None else _short_datetime(r.locked_at, tz)
@@ -913,7 +946,7 @@ class DrawdownMeasure:
                     "balance_usd": self.balance_usd,
                     "drawdown_usd": self.month_drawdown_usd,
                     "drawdown_pct": self.month_drawdown_pct,
-                    "drawdown_text": fmt_drawdown_pct(self.month_drawdown_pct, threshold_pct),
+                    "drawdown_text": self.month_drawdown_text(threshold_pct),
                 },
             }
         )
@@ -1045,15 +1078,17 @@ def monthly_drawdown_lock_breaker(
     dd_txt = m.drawdown_text(threshold)
     top = fmt_percent(threshold)
     trip = f"{fmt_usd(m.peak_usd)} → {fmt_usd(m.balance_usd)}"
-    assumed = (
+    supposed = (
         " (Ojo: el saldo es supuesto porque nunca lo anotaste; anotalo para que el cálculo "
         "sea exacto.)"
         if w.assumed
         else ""
     )
-    negative = negative_balance_warning(m.balance_usd, m.drawdown_pct)
+    assumed = supposed
+    negative = m.negative_warning()
     if negative is not None:
         assumed += f" {negative}"
+    unmeasurable = m.unmeasurable
     r = m.restart
     if r is not None:
         since = _short_datetime(r.locked_at, tz)
@@ -1063,14 +1098,25 @@ def monthly_drawdown_lock_breaker(
             f"desde el saldo de ese momento ({fmt_usd(r.start_balance_usd)})"
         )
         month_txt = ""
-        if round(m.month_drawdown_pct, 2) != round(current, 2):
+        if round(m.month_drawdown_pct, 2) != round(current, 2) and not (
+            unmeasurable and m.month_unmeasurable
+        ):
             month_txt = (
-                f" En todo el mes la caída es {fmt_drawdown_pct(m.month_drawdown_pct)} "
+                f" En todo el mes la caída es {m.month_drawdown_text()} "
                 f"({fmt_usd(m.month_peak_usd)} → {fmt_usd(m.balance_usd)}), pero esa cifra ya no "
                 "cuenta para el bloqueo."
             )
         assumed = month_txt + assumed
-        if triggered:
+        if unmeasurable:
+            # Arrancó (o quedó) con saldo negativo: no hay máximo del que medir.
+            # La caída del mes va aparte y el aviso de revisar los datos, una vez.
+            message = (
+                f"{after_unlock}: desde entonces el saldo calculado de tu billetera es negativo "
+                f"({fmt_usd(m.balance_usd)}), así que esa caída no se puede medir y el freno del "
+                f"mes no salta hasta que lo corrijas.{month_txt} {CHECK_LOADED_DATA_TEXT}"
+                f"{supposed}"
+            )
+        elif triggered:
             message = (
                 f"{after_unlock} y tu billetera volvió a caer {dd_txt} desde su máximo ({trip}); "
                 f"el tope es {top}. La app se vuelve a bloquear: no se generan planes hasta que "
@@ -1090,10 +1136,17 @@ def monthly_drawdown_lock_breaker(
         summary = (
             f"después del bloqueo del {since}, la billetera volvió a caer {dd_txt} (tope {top})"
             if triggered
+            else f"caída desde el bloqueo del {since}: {dd_txt}"
+            if unmeasurable
             else f"caída desde el bloqueo del {since}: {dd_txt} de {top}"
         )
     else:
-        if triggered:
+        if unmeasurable:
+            message = (
+                f"Tu máximo del mes quedó en {fmt_usd(m.peak_usd)} y tu saldo en "
+                f"{fmt_usd(m.balance_usd)}.{assumed}"
+            )
+        elif triggered:
             message = (
                 f"Tu billetera cayó {dd_txt} desde su máximo del mes ({trip}); el tope es {top}. "
                 "La app se bloquea por completo: no se generan planes hasta que leas el informe "
@@ -1112,6 +1165,8 @@ def monthly_drawdown_lock_breaker(
         summary = (
             f"la billetera del mes cayó {dd_txt} desde su máximo (tope {top})"
             if triggered
+            else f"caída del mes: {dd_txt}"
+            if unmeasurable
             else f"caída del mes {dd_txt} de {top}"
         )
     return BreakerStatus(
@@ -1127,7 +1182,7 @@ def monthly_drawdown_lock_breaker(
         current=current,
         unit="%",
         threshold_text=top,
-        current_text=dd_txt,
+        current_text=UNMEASURABLE_DRAWDOWN_TEXT if unmeasurable else dd_txt,
         progress=_progress(current, threshold),
         triggered=triggered,
         action="lock" if triggered else "none",
@@ -1668,7 +1723,7 @@ def _lock_reason(state: TradingState, settings: AppSettings, measure: DrawdownMe
             f" El saldo es supuesto: nunca se anotó, así que se tomó "
             f"{fmt_usd(w.assumed_start_usd or 0.0)} al empezar el mes."
         )
-    negative = negative_balance_warning(measure.balance_usd, measure.drawdown_pct)
+    negative = measure.negative_warning()
     if negative is not None:
         text += f" {negative}"
     return text

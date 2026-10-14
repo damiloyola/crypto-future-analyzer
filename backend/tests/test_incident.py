@@ -926,7 +926,7 @@ def test_drawdown_helpers() -> None:
     # Un retiro más grande que el saldo dejó el máximo en 0: la caída medida es 0 %.
     zero = negative_balance_warning(-800, 0.0)
     assert "pasa el 100 %" not in zero
-    assert "no se puede medir bien y el freno del mes no salta" in zero
+    assert "no se puede medir y el freno del mes no salta" in zero
 
 
 def test_month_totals_are_labelled_when_measured_since_an_unlock() -> None:

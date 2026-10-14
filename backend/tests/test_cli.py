@@ -1082,12 +1082,15 @@ def test_ctrl_c_exits_130_without_traceback(monkeypatch):
 
 def test_fractional_leverage_cap_is_not_rounded():
     # Antes: "tope de apalancamiento 26x" en una línea y "está en 25,5x" en la siguiente.
-    code, out, err = run("BTC", "--offline", "--no-regime", "--max-leverage", "25,5")
+    code, out, err = run(
+        "BTC", "--offline", "--no-regime", "--max-leverage", "25,5", "--now", FIXED_NOW_ISO
+    )
     assert code == 0, err
     header = out[: out.index("━━ Fuentes de datos")]
     assert "tope de apalancamiento 25,5x, cambiado a mano; el perfil trae 25x" in header
     assert "tope 25,5x" in _plan_block(out)
-    assert "26x" not in out
+    # Un "26x" suelto (no el "1,26x" de una tabla de indicadores, que depende de la hora).
+    assert re.search(r"(?<![\d,])26x", out) is None
 
 
 def test_pnl_today_followed_by_another_option_is_not_eaten(capsys):

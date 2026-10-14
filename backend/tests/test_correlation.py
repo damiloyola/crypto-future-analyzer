@@ -565,7 +565,7 @@ def test_exposure_skips_opposite_side_and_only_the_same_coin_is_a_hedge():
         "lo que te queda del límite del día, porque pueden saltar los dos stops."
     )
     with_cap = correlated_exposure(
-        "ETH", "long", positions, MATRIX, 0.8, limit_multiple=1.5, hedge_counts_in_day=False
+        "ETH", "long", positions, MATRIX, 0.8, limit_multiple=1.5, counts_in_day=False
     )
     assert with_cap.skipped[1].explanation == (
         "ETH está en short (venta), al revés del plan en la misma moneda: funciona como "
@@ -590,15 +590,19 @@ def test_other_coin_in_the_opposite_direction_is_explained_by_its_correlation():
     assert exp.counted == () and exp.existing_risk_usd == 0.0
     assert all(e.reason == REASON_OPPOSITE_SIDE for e in exp.skipped)
     texts = [e.explanation for e in exp.skipped]
+    day = (
+        ": no suma al tope de posiciones correlacionadas, pero su riesgo sí cuenta en lo que te "
+        "queda del límite del día."
+    )
     assert texts == [
         "ETH está en short (venta): va al revés del plan y se mueve parecido a BTC "
-        "(correlación 0,92): no suma riesgo.",
-        "XRP está en short (venta): va al revés del plan y no se mueve junto con BTC "
-        "(correlación 0,5): no suma riesgo.",
+        f"(correlación 0,92){day}",
+        f"XRP está en short (venta): va al revés del plan y no se mueve junto con BTC "
+        f"(correlación 0,5){day}",
         "NEW está en short (venta): va al revés del plan (no hay datos para saber si se mueve "
-        "junto con BTC): no suma riesgo.",
+        f"junto con BTC){day}",
         "PEPE está en short (venta): va al revés del plan (no hay datos para saber si se mueve "
-        "junto con BTC): no suma riesgo.",
+        f"junto con BTC){day}",
     ]
     assert not any("cobertura" in t for t in texts)
     # Sin matriz (falló la descarga), igual: sin dato, sin "cobertura".
@@ -820,3 +824,35 @@ def test_replace_keeps_matrix_frozen():
     with pytest.raises(AttributeError):
         MATRIX.min_overlap = 1  # type: ignore[misc]
     assert replace(MATRIX, high_threshold=0.9).high_threshold == 0.9
+
+
+def test_positions_that_do_not_add_say_their_risk_still_counts_in_the_day():
+    """Revisión 7 (D6): al revés o poco correlacionada no suma al tope, pero sí al día."""
+    positions = [Pos("XRP", "short", 40.0), Pos("XRP", "long", 25.0)]  # al revés / 0,5
+    exp = correlated_exposure("BTC", "long", positions, MATRIX, 0.8, limit_multiple=1.5)
+    assert [e.reason for e in exp.skipped] == [REASON_OPPOSITE_SIDE, REASON_LOW_CORRELATION]
+    scope = (
+        "no suma al tope de posiciones correlacionadas (1,5 × tu riesgo), pero su riesgo sí "
+        "cuenta en lo que te queda del límite del día."
+    )
+    assert exp.skipped[0].explanation == (
+        "XRP está en short (venta): va al revés del plan y no se mueve junto con BTC "
+        f"(correlación 0,5): {scope}"
+    )
+    assert exp.skipped[1].explanation == (
+        f"XRP no se mueve tan junto con BTC (correlación 0,5, por debajo de 0,8): {scope}"
+    )
+    assert exp.explanation == (
+        "No hay posiciones abiertas en long (compra) que se muevan junto con BTC: para el tope "
+        "de posiciones correlacionadas, el plan no suma riesgo con otras posiciones (el riesgo "
+        "de las que tenés abiertas sí cuenta en lo que te queda del límite del día)."
+    )
+    assert all("no suma riesgo." not in e.explanation for e in exp.skipped)
+    assert exp.to_dict()["skipped_count_in_day"] is True
+    off = correlated_exposure("BTC", "long", positions, MATRIX, 0.8, counts_in_day=False)
+    assert off.skipped[1].explanation.endswith(
+        "por debajo de 0,8): no suma al tope de posiciones correlacionadas."
+    )
+    assert "límite del día" not in off.explanation
+    none = correlated_exposure("BTC", "long", [], MATRIX, 0.8)
+    assert none.explanation.endswith("el plan no suma riesgo con otras posiciones.")

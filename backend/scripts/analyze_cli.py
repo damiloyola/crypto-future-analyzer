@@ -221,6 +221,7 @@ from app.safety.correlation import (
     fetch_correlation_matrix,
 )
 from app.safety.incident import (
+    UNMEASURABLE_DRAWDOWN_TEXT,
     analysis_test_marks,
     fmt_analysis_marks,
     fmt_drawdown_pct,
@@ -801,7 +802,7 @@ def exposures_for(
             matrix,
             threshold,
             limit_multiple=settings.correlation.max_combined_risk_multiplier,
-            hedge_counts_in_day=settings.trade_plan.daily_cap_includes_open_risk,
+            counts_in_day=settings.trade_plan.daily_cap_includes_open_risk,
         )
         for side in ("long", "short")
     }
@@ -2310,6 +2311,9 @@ def _breaker_amount(b: dict[str, Any]) -> str:
         return printable(b.get("current_text") or DASH)
     if unit == "pérdidas seguidas":
         return f"{fmt_num(b.get('current'), 0)} de {fmt_num(b.get('threshold'), 0)} seguidas"
+    if b.get("current_text") == UNMEASURABLE_DRAWDOWN_TEXT:
+        # Saldo calculado negativo con el máximo en 0: no hay % (E5).
+        return f"{UNMEASURABLE_DRAWDOWN_TEXT} (tope {printable(b.get('threshold_text'))})"
     return f"{printable(b.get('current_text'))} de {printable(b.get('threshold_text'))}"
 
 

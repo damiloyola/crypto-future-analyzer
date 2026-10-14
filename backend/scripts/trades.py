@@ -55,8 +55,10 @@ nada ni crear una base nueva)
   operación;
 - un riesgo abierto (``open``, ``update --risk``) más grande que el saldo o que
   esas mismas veces el riesgo por operación (``confirm_open_risk_over_limits``);
-- un retiro más grande que el saldo calculado en su fecha
-  (``confirm_withdrawal_over_balance``);
+- un retiro que deja el saldo calculado en negativo: más grande que el saldo
+  en su fecha o, con fecha atrasada, que deja negativo el saldo de más
+  adelante (``confirm_withdrawal_over_balance``; el saldo sale de todo lo
+  cargado, como en los frenos);
 - un evento de más de ``confirm_event_longer_than_days`` días.
 
 Opciones de todos los comandos: ``--db RUTA`` (otra base, con su propio LOCKED
@@ -116,7 +118,7 @@ from app.config import DEFAULT_CONFIG_PATH, AppSettings, load_settings
 from app.risk.profiles import EffectiveProfile, get_profile
 from app.safety.breakers import MONTHLY_DRAWDOWN_LOCK, LockWriteError
 from app.safety.incident import analysis_test_marks, fmt_analysis_marks, timezone_label
-from app.safety.state import load_trading_state
+from app.safety.state import load_trading_state, period_bounds, withdrawal_effect
 from app.storage import Repository
 from app.storage.repository import MAX_CLOCK_SKEW, StoredAnalysis, StoredTrade
 from scripts.analyze_cli import (
@@ -622,6 +624,12 @@ def _safety_lines(ctx: Context) -> None:
         f"Frenos de seguridad: {_VERDICT_TEXT.get(status, status)} · {data['headline']}",
         _VERDICT_COLOR.get(status),
     )
+    # Saldo calculado negativo (E5): justo después de cargar el dato que
+    # probablemente está mal tipeado, el mismo aviso que el freno y el LOCKED.
+    measure = sc.verdict.drawdown_measure
+    negative = None if measure is None else measure.negative_warning()
+    if negative is not None:
+        ctx.print(negative, "yellow")
     if sc.verdict.needs_lock and not sc.verdict.locked:
         ctx.print(_PENDING_LOCK_HINT, "alert")
     backfill = sc.backfill
@@ -713,23 +721,48 @@ def _check_open_risk(ctx: Context, risk: float, confirmed: bool) -> None:
 
 
 def _check_withdrawal(ctx: Context, amount: float, moment: datetime, confirmed: bool) -> None:
-    """Pide ``--yes`` si el retiro es más grande que el saldo calculado en su fecha (E9).
+    """Pide ``--yes`` si el retiro deja el saldo calculado en negativo (E9).
 
-    ``app.manual_input.confirm_withdrawal_over_balance``. Casi siempre es un
-    error de tipeo: dejaría el saldo en negativo y los números de la caída del
-    mes dejarían de tener sentido.
+    ``app.manual_input.confirm_withdrawal_over_balance``: más grande que el
+    saldo en su fecha, o (con fecha atrasada) que deja negativo el saldo de
+    más adelante por lo que se cargó después. El saldo se calcula con todo lo
+    cargado, como en los frenos (``state.withdrawal_effect``): un saldo
+    anotado después de la fecha también cuenta. Casi siempre es un error de
+    tipeo: con el saldo negativo, la caída del mes no se puede medir.
     """
     if confirmed or not ctx.settings.app.manual_input.confirm_withdrawal_over_balance:
         return
-    wallet = _wallet_at(ctx, moment)
-    if round(amount, 2) <= round(wallet.current_balance_usd, 2):
+    periods = period_bounds(ctx.now, ctx.tz, ctx.settings.circuit_breakers.week_starts_on)
+    effect = withdrawal_effect(
+        ctx.repo.list_wallet_events(),
+        ctx.repo.list_trades(),
+        amount,
+        moment,
+        now=ctx.now,
+        month_start=periods.month_start,
+        assumed_start_usd=ctx.profile.monthly_wallet_usd,
+    )
+    if not effect.leaves_negative:
         return
+    consequence = (
+        "Un retiro así deja el saldo en negativo: la caída del mes no se puede medir y el freno "
+        "del mes no salta hasta que lo corrijas. Si el saldo que ves en Nexo es otro, anotalo "
+        f'primero con make trade ARGS="balance --amount ...". {_RETYPE}'
+    )
+    assumed = ", supuesto: nunca lo anotaste" if effect.assumed else ""
+    before = f"{fmt_usd(effect.balance_before_usd)}{assumed}"
+    if round(amount, 2) > round(effect.balance_before_usd, 2):
+        raise NeedsConfirmationError(
+            f"Ojo: el retiro de {fmt_usd(amount)} es más grande que el saldo de tu billetera el "
+            f"{ctx.fmt_dt(moment)} ({before}). ¿No será un error de tipeo (un cero de más)? "
+            f"{consequence}"
+        )
     raise NeedsConfirmationError(
-        f"Ojo: el retiro de {fmt_usd(amount)} es más grande que el saldo de tu billetera el "
-        f"{ctx.fmt_dt(moment)} ({_balance_text(wallet)}). ¿No será un error de tipeo "
-        "(un cero de más)? Un retiro así deja el saldo en negativo y desarma las cuentas del "
-        "freno de la caída del mes. Si el saldo que ves en Nexo es otro, anotalo primero con "
-        f'make trade ARGS="balance --amount ...". {_RETYPE}'
+        f"Ojo: el {ctx.fmt_dt(moment)} tenías {before}, pero con este retiro de "
+        f"{fmt_usd(amount)} el saldo calculado quedaría en negativo el "
+        f"{ctx.fmt_dt(effect.negative_at)} ({fmt_usd(effect.negative_balance_usd)}), por lo que "
+        "cargaste después de esa fecha. ¿No será un error de tipeo o de fecha? "
+        f"{consequence}"
     )
 
 
@@ -1298,7 +1331,7 @@ def build_parser() -> argparse.ArgumentParser:
             w.add_argument(
                 "--yes",
                 action="store_true",
-                help="confirmar un retiro más grande que tu saldo (¿un cero de más?)",
+                help="confirmar un retiro que deja tu saldo en negativo (¿un cero de más?)",
             )
 
     ev = command("event", "marca un evento de alta volatilidad (bloquea los planes)")

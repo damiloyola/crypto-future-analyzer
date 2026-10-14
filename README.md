@@ -273,8 +273,12 @@ make safety                                                       # cómo están
   - una posición abierta (`open`, `update --risk`) con un riesgo más grande que
     tu saldo o que esos 150 USD (un 400 en vez de 40 te dejaría en "No operar"
     todo el día, porque el riesgo abierto cuenta en el límite del día);
-  - un retiro más grande que el saldo que tenías en esa fecha (un cero de más
-    deja el saldo en negativo y desarma las cuentas del freno del mes);
+  - un retiro que deja el saldo en negativo: más grande que el saldo que
+    tenías en esa fecha o, con fecha atrasada, que deja negativo el saldo de
+    más adelante por lo que cargaste después. El saldo se calcula con todo lo
+    cargado, como en los frenos (también con un saldo anotado después de esa
+    fecha). Un cero de más deja el saldo en negativo y la caída del mes no se
+    puede medir;
   - un evento de más de 7 días.
 
   Por ejemplo, `make trade ARGS="add --symbol BTC --side long --pnl -325"`
@@ -325,6 +329,12 @@ Los frenos (todos los números en `config.yaml`, `circuit_breakers`, y en tu per
     había retiros: saldo 190, máximo 390, caída 51,28 %) y después retirás 90
     (saldo 100, el máximo baja en la misma proporción, a 205,26, y la caída
     sigue en 51,28 %).
+  - Si retirás todo (saldo 0), la app recuerda el % de caída de antes del
+    retiro: cuando vuelve la plata, vuelve ese %. Lo que pase mientras tanto
+    cuenta: con máximo 300 y saldo 100 (66,67 %), retirás 100, perdés 10 con
+    una posición que seguía abierta y depositás 100: saldo 90, máximo 300,
+    caída 70 % (lo mismo que perder 10 sin retirar). Si anotás un saldo o
+    ganás algo antes de depositar, se mantiene el 66,67 %.
 - Si nunca anotaste el saldo, la app supone que empezaste el mes con la
   billetera mensual del perfil (300 USD) y te avisa: anotalo con `balance`.
 - Los multiplicadores se suman a los del régimen (día × semana = × 0,25) y van
@@ -378,8 +388,13 @@ Los frenos (todos los números en `config.yaml`, `circuit_breakers`, y en tu per
 - Una caída de más de 100 % solo pasa si el saldo calculado da negativo (casi
   siempre un dato mal cargado, por ejemplo un resultado o un retiro con un cero
   de más): se muestra "la billetera cayó más del 100 %" con un aviso de revisar
-  lo cargado, en los frenos, en las dos consolas, en el LOCKED y en el
-  informe.
+  lo cargado, en los frenos, en las dos consolas (también en la línea que
+  aparece después de cargar), en el LOCKED y en el informe. Si el saldo
+  negativo viene de un retiro más grande que el saldo (cargado con `--yes`),
+  el máximo del mes queda en 0: la caída dice "no se puede medir" y el freno
+  del mes no salta hasta que corrijas el dato (el aviso lo dice). Lo mismo si
+  borrás el LOCKED sin corregir un saldo negativo: desde el bloqueo la caída
+  no se puede medir.
 - **Correlación**: la consola muestra la matriz de correlación de los
   retornos de 1 h de los últimos 30 días entre la moneda, tus favoritas y las de
   tus posiciones abiertas (`*` = 0,8 o más: se mueven casi igual). Si tenés una
@@ -390,7 +405,9 @@ Los frenos (todos los números en `config.yaml`, `circuit_breakers`, y en tu per
   No operar. Una posición en la misma moneda pero al revés es cobertura: no
   suma al tope de posiciones correlacionadas (1,5 × tu riesgo), pero su riesgo
   sí cuenta en lo que te queda del límite del día, porque pueden saltar los dos
-  stops (el aviso es solo para la misma moneda).
+  stops (el aviso es solo para la misma moneda). Lo mismo con otra moneda al
+  revés o poco correlacionada: no suma al tope, pero su riesgo sí cuenta en lo
+  que te queda del límite del día, y la consola lo dice así.
 - El margen de un plan nunca pasa del saldo de tu billetera que muestran los
   frenos (el anotado o, si nunca anotaste uno, el supuesto: la billetera
   mensual del perfil al empezar el mes más tus resultados), y la liquidación

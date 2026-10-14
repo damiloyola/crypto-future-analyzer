@@ -85,6 +85,8 @@ Qué hay acá (todo puro salvo ``write_incident_report`` y ``create_new_file``)
       ``negative_balance_warning(balance)``: cómo se escribe una caída en todos
       lados (frenos, LOCKED, informe y consolas): ``"71,67 %"`` o, con el saldo
       calculado negativo, ``"más del 100 %"`` con el aviso de revisar los datos.
+      ``drawdown_unmeasurable(balance, pct)``: saldo negativo con el máximo en
+      0 o menos (un retiro más grande que el saldo): ``"no se puede medir"``.
     - ``incident_fingerprint(...)`` / ``find_identical_report(folder, huella)``:
       la "huella" de un informe (todo menos la hora) para no escribir dos
       veces el mismo informe si el LOCKED no se pudo escribir.
@@ -170,6 +172,16 @@ MAX_SHOWN_DRAWDOWN_PCT = 100.0
 
 #: Cómo se escribe una caída de más de 100 % (saldo calculado negativo).
 OVER_100_DRAWDOWN_TEXT = "más del 100 %"
+
+#: La caída con el saldo calculado negativo y el máximo en 0 o menos (por
+#: ejemplo, un retiro más grande que el saldo): no hay % que mostrar.
+UNMEASURABLE_DRAWDOWN_TEXT = "no se puede medir"
+
+#: El final del aviso del saldo calculado negativo: qué revisar y cómo.
+CHECK_LOADED_DATA_TEXT = (
+    "Revisá lo que cargaste: puede haber un resultado o un retiro mal tipeado (con make trade "
+    'ARGS="list" ves todo y con delete borrás lo que esté mal).'
+)
 
 #: Marca de la huella al final del informe (comentario de markdown).
 FINGERPRINT_PREFIX = "<!-- huella del informe: "
@@ -462,7 +474,22 @@ def fmt_drawdown_pct(value_pct: Any, threshold_pct: Any = None, decimals: int = 
     return fmt_percent(v, decimals)
 
 
-def negative_balance_warning(balance_usd: Any, drawdown_pct: Any = None) -> str | None:
+def drawdown_unmeasurable(balance_usd: Any, drawdown_pct: Any) -> bool:
+    """``True`` si el saldo calculado da negativo pero la caída no pasa el 100 %.
+
+    Pasa cuando el máximo quedó en 0 o menos (un retiro más grande que el
+    saldo, o la medida desde un bloqueo que arrancó con saldo negativo): no
+    hay % que mostrar y el freno del mes no salta hasta que se corrijan los
+    datos. Se escribe ``UNMEASURABLE_DRAWDOWN_TEXT``.
+    """
+    v = _finite(balance_usd)
+    pct = _finite(drawdown_pct)
+    return v is not None and round(v, 2) < 0 and pct is not None and not drawdown_over_100(pct)
+
+
+def negative_balance_warning(
+    balance_usd: Any, drawdown_pct: Any = None, *, month_drawdown_pct: Any = None
+) -> str | None:
     """El aviso de revisar los datos cuando el saldo calculado da negativo (``None`` si no).
 
     Va en todos los lugares donde se muestra la caída: con el saldo negativo
@@ -470,25 +497,32 @@ def negative_balance_warning(balance_usd: Any, drawdown_pct: Any = None) -> str 
     mal tipeado.
 
     ``drawdown_pct``: la caída que se midió. Si se pasa y no llega al 100 %
-    (un retiro más grande que el saldo dejó el máximo del mes en 0), el aviso
-    no dice "pasa el 100 %" sino que la caída no se puede medir bien y que el
-    freno del mes no salta.
+    (``drawdown_unmeasurable``: el máximo quedó en 0 o menos), el aviso no
+    dice "pasa el 100 %" sino que la caída no se puede medir y que el freno
+    del mes no salta. ``month_drawdown_pct``: con la medida desde un bloqueo
+    que ya se desbloqueó, la caída de todo el mes; si esa pasa el 100 % y la
+    medida desde el bloqueo no se puede medir, el aviso dice las dos cosas sin
+    contradecirse.
     """
     v = _finite(balance_usd)
     if v is None or round(v, 2) >= 0:
         return None
-    pct = _finite(drawdown_pct)
-    if pct is not None and not drawdown_over_100(pct):
-        why = (
-            "así que la caída del mes no se puede medir bien y el freno del mes no salta hasta "
-            "que lo corrijas"
-        )
+    if drawdown_unmeasurable(v, drawdown_pct):
+        if drawdown_over_100(month_drawdown_pct):
+            why = (
+                ": en todo el mes la caída pasa el 100 %, pero desde el bloqueo no se puede "
+                "medir y el freno del mes no salta hasta que lo corrijas"
+            )
+        else:
+            why = (
+                ", así que la caída del mes no se puede medir y el freno del mes no salta hasta "
+                "que lo corrijas"
+            )
     else:
-        why = "así que la caída pasa el 100 %"
+        why = ", así que la caída pasa el 100 %"
     return (
-        f"Ojo: el saldo calculado de tu billetera da negativo ({fmt_pnl(v)}), {why}. Revisá lo "
-        "que cargaste: puede haber un resultado o un retiro mal tipeado (con make trade "
-        'ARGS="list" ves todo y con delete borrás lo que esté mal).'
+        f"Ojo: el saldo calculado de tu billetera da negativo ({fmt_pnl(v)}){why}. "
+        f"{CHECK_LOADED_DATA_TEXT}"
     )
 
 
@@ -1990,6 +2024,7 @@ __all__ = [
     "OBS_TRADED_ON_NO_TRADE",
     "OBS_WIDENED_STOP",
     "OVER_100_DRAWDOWN_TEXT",
+    "UNMEASURABLE_DRAWDOWN_TEXT",
     "IncidentPosition",
     "IncidentProfile",
     "IncidentTrade",
@@ -2001,6 +2036,7 @@ __all__ = [
     "build_incident_report",
     "create_new_file",
     "drawdown_over_100",
+    "drawdown_unmeasurable",
     "find_identical_report",
     "find_observations",
     "fmt_analysis_marks",

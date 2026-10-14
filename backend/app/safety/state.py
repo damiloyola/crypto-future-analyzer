@@ -61,7 +61,9 @@ Reglas de cálculo (todos los números de ``config.yaml``)
       Cualquier pérdida que cierre durante la pausa (aunque en el medio haya
       una ganada) la estira ``cooldown_hours`` desde esa pérdida
       (``extend_cooldown_on_loss``, decisión del usuario; con ``false``
-      termina a la hora prevista). Con
+      termina a la hora prevista). Una pérdida que cierra en el mismo
+      instante que la que disparó la pausa (dos stops que saltan juntos) es
+      parte de esa racha: no la estira. Con
       ``reset_after_cooldown`` (decisión del usuario),
       terminada la pausa la cuenta vuelve a cero: las pérdidas cerradas antes del
       fin de la pausa ya no cuentan.
@@ -90,8 +92,12 @@ Reglas de cálculo (todos los números de ``config.yaml``)
     - **Depósito después de un retiro** (``deposit_refills_withdrawals``,
       decisión del usuario): un depósito primero "devuelve" lo retirado en el
       mes que todavía no se volvió a depositar, sin cambiar el % de caída (la
-      regla inversa al retiro proporcional; si el retiro dejó la billetera en
-      0, se recuerda el % de ese momento). Solo lo que pase de eso sube el
+      regla inversa al retiro proporcional). Si el retiro dejó la billetera en
+      0 (o menos), se recuerda el % de ese momento: un depósito que devuelve lo
+      retirado lo restituye y una pérdida hecha con la billetera vacía sigue
+      contando (retirar 100, perder 10 y depositar 100 da lo mismo que perder
+      10 sin retirar); si el saldo vuelve a ser positivo por otra cosa (un
+      saldo anotado o una ganancia), el % recordado se mantiene. Solo lo que pase de eso sube el
       máximo en lo mismo (``deposit_raises_peak``). Retirar X y depositar X
       deja el % igual que antes. Al revés (depositar y después retirar) se
       aplican las reglas en orden: el depósito sube el máximo y el retiro lo
@@ -954,6 +960,9 @@ def losing_streak_state(
     extended_by: int | None = None
     during = 0
     pending_reset = False
+    # La racha que empezó la pausa sigue sin cortarse (para sumarle las
+    # pérdidas que cerraron en el mismo instante que la que la disparó).
+    trigger_streak_open = False
     for trade in _sorted_by_close(trades):
         if trade.closed_at > moment:
             break
@@ -962,6 +971,7 @@ def losing_streak_state(
             count, ids, pending_reset = 0, [], False
         if not trade.is_loss:
             count, ids = 0, []
+            trigger_streak_open = False
             continue
         count += 1
         ids.append(trade.id)
@@ -969,17 +979,24 @@ def losing_streak_state(
         running = (
             cd_start is not None and cd_until is not None and cd_start <= trade.closed_at < cd_until
         )
-        if running:
+        if running and trigger_streak_open and trade.closed_at == cd_start:
+            # Cerró en el mismo instante que la pérdida que disparó la pausa
+            # (por ejemplo, dos stops que saltan juntos): es parte de esa racha,
+            # no una pérdida "durante" la pausa.
+            trigger_ids = tuple(ids)
+        elif running:
             # Perdió durante la pausa (aunque antes haya ganado una): la pausa
             # se estira desde esta pérdida, si así lo quiere el usuario.
             during += 1
-            if extend_cooldown_on_loss:
-                cd_until = trade.closed_at + pause
+            new_until = trade.closed_at + pause
+            if extend_cooldown_on_loss and cd_until is not None and new_until > cd_until:
+                cd_until = new_until
                 extended_at, extended_by = trade.closed_at, trade.id
         elif count >= required:
             cd_start = trade.closed_at
             cd_until = trade.closed_at + pause
             trigger_ids = tuple(ids)
+            trigger_streak_open = True
             extended_at, extended_by, during = None, None, 0
             pending_reset = reset_after_cooldown
     if pending_reset and cd_until is not None and moment >= cd_until:
@@ -1238,10 +1255,21 @@ def _walk_peak(
     que ya venía retirado de antes) con la regla inversa a la del retiro:
     ``"proportional"`` → el % de caída no cambia; ``"subtract"`` → el máximo
     sube lo mismo; ``"none"`` → el máximo no se toca. Solo lo que pase de eso
-    sigue ``deposit_raises_peak``. Si un retiro proporcional dejó la billetera
-    en 0 (o menos), se recuerda la relación máximo/saldo de antes del retiro
-    para devolverla con el depósito: así retirar todo y volver a depositarlo
-    deja el % igual.
+    sigue ``deposit_raises_peak``.
+
+    Billetera vaciada por un retiro proporcional (saldo 0 o menos): el % no
+    se puede medir con un máximo en 0, así que se recuerda la relación
+    máximo/saldo de antes del retiro (``ratio``) y el "nivel" de la billetera
+    (el saldo justo después del retiro, más los depósitos devueltos y menos
+    otros retiros; sin las operaciones). Mientras siga vacía:
+
+    - Un depósito que devuelve lo retirado deja el máximo en ``ratio × nivel``:
+      retirar todo y volver a depositarlo deja el % igual, y una pérdida hecha
+      con la billetera vacía sigue contando (300 → 100, retirar 100, perder
+      10 y depositar 100 → máximo 300, saldo 90: 70 %).
+    - Si el saldo vuelve a ser positivo por otra cosa (un saldo anotado o una
+      ganancia), el máximo pasa a ``ratio × saldo``: el % de antes del retiro
+      se mantiene (retirar 100, anotar un saldo de 5 y depositar 95 → 66,67 %).
     """
     walk = _PeakWalk(
         peak=start_balance,
@@ -1250,9 +1278,11 @@ def _walk_peak(
         withdrawn_open=max(0.0, start_withdrawn),
         history=[] if keep_history else None,
     )
+    remember_empty = deposit_refills_withdrawals and withdrawal_peak == "proportional"
     # Máximo / saldo de antes del retiro que vació la billetera (``None`` si no
-    # hay uno pendiente de devolver).
+    # está vacía por un retiro) y su nivel (ver el docstring).
     empty_ratio: float | None = None
+    empty_level = 0.0
     for i in indices:
         p = points[i]
         bal = after[i]
@@ -1263,32 +1293,41 @@ def _walk_peak(
                 walk.peak += p.amount
             elif withdrawal_peak == "proportional":
                 before = bal - p.amount
-                if before > 0:
+                if empty_ratio is not None:
+                    empty_level += p.amount  # otro retiro con la billetera ya vacía
+                elif before > 0:
                     # El máximo baja en la misma proporción que el saldo: el %
                     # de caída no cambia. Sacar todo (o más) lo deja en 0, pero
                     # se recuerda la proporción para cuando vuelva la plata.
                     ratio = walk.peak / before
                     walk.peak *= max(0.0, bal) / before
-                    empty_ratio = ratio if bal <= 0 else None
+                    if bal <= 0 and remember_empty:
+                        empty_ratio, empty_level = ratio, bal
         elif p.kind == POINT_DEPOSIT:
             walk.deposits += p.amount
             refill = min(p.amount, walk.withdrawn_open) if deposit_refills_withdrawals else 0.0
             excess = p.amount - refill
             if refill > 0:
                 walk.withdrawn_open -= refill
-                walk.peak = _refill_peak(
-                    walk.peak,
-                    bal - p.amount,
-                    refill,
-                    withdrawal_peak=withdrawal_peak,
-                    empty_ratio=empty_ratio,
-                )
+                if empty_ratio is not None:
+                    empty_level += refill
+                    if empty_level > 0:
+                        walk.peak = max(walk.peak, empty_ratio * empty_level)
+                else:
+                    walk.peak = _refill_peak(
+                        walk.peak, bal - p.amount, refill, withdrawal_peak=withdrawal_peak
+                    )
             if excess > 0 and deposit_raises_peak:
                 walk.peak += excess
         elif p.kind == POINT_TRADE:
             walk.trading += p.amount
-        if bal > 0:
-            empty_ratio = None  # la billetera ya no está vacía: manda el saldo de ahora
+        if empty_ratio is not None and bal > 0:
+            # La billetera ya no está vacía. Si no fue un depósito que devolvió
+            # lo retirado (un saldo anotado, una ganancia), se mantiene el % de
+            # antes del retiro.
+            if not (p.kind == POINT_DEPOSIT and empty_level > 0):
+                walk.peak = max(walk.peak, empty_ratio * bal)
+            empty_ratio = None
         if bal > walk.peak:
             walk.peak, walk.peak_at = bal, p.ts
         walk.lowest = min(walk.lowest, bal)
@@ -1313,28 +1352,20 @@ def _refill_peak(
     refill: float,
     *,
     withdrawal_peak: WithdrawalPeak,
-    empty_ratio: float | None,
 ) -> float:
     """El máximo después de devolver ``refill`` USD retirados (la regla inversa a la del retiro).
 
     ``before`` es el saldo justo antes del depósito. Con ``"proportional"`` el
     % de caída queda igual: el máximo pasa a ``máximo / saldo × (saldo +
-    devuelto)``; si el saldo era 0 o menos porque un retiro vació la
-    billetera, usa la proporción recordada (``empty_ratio``). Si no hay forma
-    de mantener el % (saldo en 0 o menos por pérdidas), el máximo sube lo
-    devuelto, como cualquier depósito.
+    devuelto)``. Si no hay forma de mantener el % (saldo en 0 o menos por
+    pérdidas), el máximo sube lo devuelto, como cualquier depósito. La
+    billetera vaciada por un retiro se maneja en ``_walk_peak``.
     """
     if withdrawal_peak == "none":
         return peak
-    if withdrawal_peak == "subtract":
+    if withdrawal_peak == "subtract" or before <= 0 or peak <= 0:
         return peak + refill
-    ratio = peak / before if before > 0 and peak > 0 else empty_ratio
-    if ratio is None:
-        return peak + refill
-    after = before + refill
-    if after <= 0:
-        return peak  # sigue en 0 o menos: no hay % que mantener todavía
-    return max(peak, ratio * after)
+    return max(peak, peak / before * (before + refill))
 
 
 def _drawdown(peak: float, current: float) -> tuple[float, float, float, float]:
@@ -1344,6 +1375,138 @@ def _drawdown(peak: float, current: float) -> tuple[float, float, float, float]:
     drawdown = _cents(max(0.0, peak_c - current_c))
     pct = drawdown * 100.0 / peak_c if peak_c > 0 else 0.0
     return peak_c, current_c, drawdown, pct
+
+
+@dataclass(frozen=True)
+class _WalletPoints:
+    """Los puntos de la billetera en orden y el saldo después de cada uno (uso interno)."""
+
+    points: list[_Point]
+    after: list[float]
+    initial: float  # saldo antes del primer punto
+    balances: list[WalletRecord]  # los saldos anotados, en orden
+    assumed: bool  # nunca se anotó un saldo: se supuso ``assumed_value`` al empezar el mes
+
+
+def _wallet_points(
+    wallet_events: Iterable[Any],
+    trades: Iterable[Any],
+    moment: datetime,
+    *,
+    start: datetime,
+    assumed_value: float,
+) -> _WalletPoints:
+    """Ordena lo cargado hasta ``moment`` y calcula el saldo después de cada punto.
+
+    Hacia adelante desde el primer saldo (anotado o, si nunca se anotó uno, el
+    supuesto al empezar el mes en ``start``) y hacia atrás antes de él.
+    """
+    events = sorted(
+        (e for e in (WalletRecord.from_value(x) for x in wallet_events) if e.ts <= moment),
+        key=lambda e: (e.ts, e.id if e.id is not None else 0),
+    )
+    closed = [t for t in _sorted_by_close(trades) if t.closed_at <= moment]
+
+    points: list[_Point] = []
+    for e in events:
+        if e.kind == "balance":
+            points.append(
+                _Point(e.ts, _RANK_SNAPSHOT, len(points), POINT_BALANCE, e.amount_usd, e.id)
+            )
+        elif e.kind == "deposit":
+            points.append(
+                _Point(e.ts, _RANK_MOVEMENT, len(points), POINT_DEPOSIT, e.amount_usd, e.id)
+            )
+        else:
+            points.append(
+                _Point(e.ts, _RANK_MOVEMENT, len(points), POINT_WITHDRAWAL, -e.amount_usd, e.id)
+            )
+    for t in closed:
+        points.append(
+            _Point(t.closed_at, _RANK_MOVEMENT, len(points), POINT_TRADE, t.pnl_usd, t.id, t.symbol)
+        )
+    balances = [e for e in events if e.kind == "balance"]
+    assumed = not balances
+    if assumed:
+        points.append(_Point(start, _RANK_ASSUMED, -1, POINT_ASSUMED_START, assumed_value))
+    points.sort(key=lambda p: (p.ts, p.rank, p.seq))
+
+    first = next(i for i, p in enumerate(points) if p.is_snapshot)
+    after = [0.0] * len(points)
+    running = 0.0
+    for i in range(first, len(points)):
+        p = points[i]
+        running = p.amount if p.is_snapshot else running + p.amount
+        after[i] = running
+    back = points[first].amount
+    for i in range(first - 1, -1, -1):
+        after[i] = back
+        back -= points[i].amount
+    return _WalletPoints(points, after, back, balances, assumed)
+
+
+@dataclass(frozen=True)
+class WithdrawalEffect:
+    """Cómo quedaría la billetera con un retiro nuevo (para confirmarlo al cargarlo, E9).
+
+    - ``balance_before_usd``: el saldo justo antes del retiro, en su fecha.
+    - ``negative_at`` / ``negative_balance_usd``: el primer momento desde el
+      retiro (incluido) en que el saldo calculado queda negativo y ese saldo
+      (``None`` si nunca): en su fecha o más tarde, por lo cargado después.
+    - ``assumed``: nunca se anotó un saldo (se usó el supuesto).
+    """
+
+    balance_before_usd: float
+    negative_at: datetime | None
+    negative_balance_usd: float | None
+    assumed: bool
+
+    @property
+    def leaves_negative(self) -> bool:
+        return self.negative_at is not None
+
+
+def withdrawal_effect(
+    wallet_events: Iterable[Any],
+    trades: Iterable[Any],
+    amount_usd: float,
+    moment: datetime,
+    *,
+    now: datetime,
+    month_start: datetime,
+    assumed_start_usd: float,
+) -> WithdrawalEffect:
+    """Simula un retiro de ``amount_usd`` en ``moment`` con todo lo cargado hasta ``now`` (pura).
+
+    Usa las mismas reglas que los frenos: un saldo anotado **después** del
+    retiro cuenta (antes del primer saldo anotado, el saldo se calcula hacia
+    atrás desde él, así que un retiro con fecha anterior sube el saldo de
+    antes en vez de bajar el de después). Si nunca se anotó un saldo, se
+    supone ``assumed_start_usd`` al empezar el mes ``month_start``. La usa
+    ``scripts.trades`` para pedir ``--yes`` (``app.manual_input``).
+    """
+    when = _aware_utc(moment, "La hora")
+    amount = _number(amount_usd, "El monto del retiro")
+    events = [WalletRecord.from_value(x) for x in wallet_events]
+    new_id = max((e.id or 0 for e in events), default=0) + 1
+    events.append(WalletRecord(id=new_id, ts=when, kind="withdrawal", amount_usd=amount))
+    w = _wallet_points(
+        events,
+        trades,
+        max(_aware_utc(now, "La hora actual"), when),
+        start=_aware_utc(month_start, "El inicio del mes"),
+        assumed_value=_number(assumed_start_usd, "El saldo supuesto"),
+    )
+    idx = next(
+        i for i, p in enumerate(w.points) if p.kind == POINT_WITHDRAWAL and p.ref_id == new_id
+    )
+    negative = next((i for i in range(idx, len(w.points)) if _cents(w.after[i]) < 0), None)
+    return WithdrawalEffect(
+        balance_before_usd=_cents(w.after[idx] + amount),
+        negative_at=None if negative is None else w.points[negative].ts,
+        negative_balance_usd=None if negative is None else _cents(w.after[negative]),
+        assumed=w.assumed,
+    )
 
 
 def wallet_state(
@@ -1392,50 +1555,9 @@ def wallet_state(
     restart_moment = _opt_aware_utc(restart_at, "La hora del bloqueo")
     if restart_moment is not None:
         lock_moments[restart_moment] = restart_lock_id
-    events = sorted(
-        (e for e in (WalletRecord.from_value(x) for x in wallet_events) if e.ts <= moment),
-        key=lambda e: (e.ts, e.id if e.id is not None else 0),
-    )
-    closed = [t for t in _sorted_by_close(trades) if t.closed_at <= moment]
-
-    points: list[_Point] = []
-    for e in events:
-        if e.kind == "balance":
-            points.append(
-                _Point(e.ts, _RANK_SNAPSHOT, len(points), POINT_BALANCE, e.amount_usd, e.id)
-            )
-        elif e.kind == "deposit":
-            points.append(
-                _Point(e.ts, _RANK_MOVEMENT, len(points), POINT_DEPOSIT, e.amount_usd, e.id)
-            )
-        else:
-            points.append(
-                _Point(e.ts, _RANK_MOVEMENT, len(points), POINT_WITHDRAWAL, -e.amount_usd, e.id)
-            )
-    for t in closed:
-        points.append(
-            _Point(t.closed_at, _RANK_MOVEMENT, len(points), POINT_TRADE, t.pnl_usd, t.id, t.symbol)
-        )
-    balances = [e for e in events if e.kind == "balance"]
-    assumed = not balances
-    if assumed:
-        points.append(_Point(start, _RANK_ASSUMED, -1, POINT_ASSUMED_START, assumed_value))
-    points.sort(key=lambda p: (p.ts, p.rank, p.seq))
-
-    # Saldo después de cada punto: hacia adelante desde el primer saldo
-    # (anotado o supuesto) y hacia atrás antes de él.
-    first = next(i for i, p in enumerate(points) if p.is_snapshot)
-    after = [0.0] * len(points)
-    running = 0.0
-    for i in range(first, len(points)):
-        p = points[i]
-        running = p.amount if p.is_snapshot else running + p.amount
-        after[i] = running
-    back = points[first].amount
-    for i in range(first - 1, -1, -1):
-        after[i] = back
-        back -= points[i].amount
-    initial = back
+    walked = _wallet_points(wallet_events, trades, moment, start=start, assumed_value=assumed_value)
+    points, after, initial = walked.points, walked.after, walked.initial
+    balances, assumed = walked.balances, walked.assumed
 
     # Lo de antes del mes, más un saldo anotado justo en el primer instante
     # (01/MM 00:00): ese saldo es el de arranque del mes (incluye lo que pasó
@@ -1882,6 +2004,7 @@ __all__ = [
     "WalletPoint",
     "WalletRecord",
     "WalletState",
+    "WithdrawalEffect",
     "WithdrawalPeak",
     "build_trading_state",
     "count_opened_in",
@@ -1891,4 +2014,5 @@ __all__ = [
     "period_pnl",
     "resolve_user_timezone",
     "wallet_state",
+    "withdrawal_effect",
 ]

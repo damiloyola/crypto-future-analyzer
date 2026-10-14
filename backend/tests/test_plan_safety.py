@@ -978,3 +978,21 @@ def test_a_tiny_wallet_says_the_wallet_is_what_limits_the_position(settings, pro
     assert rule.suggestion.startswith(
         "El margen está limitado por el saldo supuesto de tu billetera"
     )
+
+
+def test_correlation_rule_says_open_risk_still_counts_in_the_day(settings, profile):
+    """Revisión 7 (D6): sin posiciones que sumen al tope, el riesgo abierto igual va al día."""
+    positions = [_obj({"symbol": "DOGE", "side": "short", "risk_usd": 40.0})]
+    exposures = {s: correlated_exposure("BTC", s, positions, None, 0.8) for s in ("long", "short")}
+    plan = plan_with(settings, profile, correlation=exposures, open_risk_usd=40.0)
+    rule = next(r for r in plan.rules if r.code == CORRELATION_RULE)
+    assert rule.ok
+    assert rule.message == (
+        "No tenés posiciones abiertas en long (compra) que se muevan junto con BTC: para el tope "
+        "de posiciones correlacionadas, el plan no suma riesgo con otras (lo que tenés en juego "
+        "en tus posiciones abiertas sí cuenta en lo que te queda del límite del día)."
+    )
+    assert "no suma riesgo." not in exposures["long"].skipped[0].explanation
+    alone = plan_with(settings, profile, correlation=exposures, open_risk_usd=0.0)
+    rule = next(r for r in alone.rules if r.code == CORRELATION_RULE)
+    assert rule.message.endswith("el plan no suma riesgo con otras.")

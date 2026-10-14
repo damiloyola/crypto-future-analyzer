@@ -1589,3 +1589,65 @@ def test_a_late_loss_before_the_lock_does_not_relock_after_unlocking(
     r = state.wallet.restart
     assert r is not None and r.start_balance_usd == 20.0 and r.drawdown_pct == 0.0
     assert len(flow.reports()) == 1
+
+
+def test_two_stops_at_the_trigger_minute_do_not_say_the_pause_was_stretched(settings, profile):
+    """Revisión 7: BTC y ETH saltan juntos a las 11:00 (la 3.ª y la 4.ª pérdida)."""
+    trades = [trade(local(10, 13, h), -5.0) for h in (9, 10, 11)]
+    trades.append(trade(local(10, 13, 11), -5.0, symbol="ETH"))
+    now = local(10, 13, 12)
+    state = state_for(settings, profile, trades=trades, now=now)
+    b = losing_streak_breaker(state, profile, settings, now)
+    assert b.triggered and b.until == local(10, 13, 15).astimezone(UTC)
+    assert b.message.startswith(
+        "Perdiste 4 operaciones seguidas (la última cerró el 13/10/2026 11:00)"
+    )
+    assert "se estiró" not in b.message and "durante la pausa" not in b.message
+    assert b.summary == "pausa por 4 pérdidas seguidas"
+
+
+def test_a_negative_balance_from_a_withdrawal_cannot_be_measured(settings, profile):
+    """Revisión 7 (E5): saldo negativo por un retiro: "no se puede medir", no "0 %"."""
+    withdrawal = {"id": next(_ids), "ts": local(10, 6, 10), "kind": "withdrawal"}
+    events = [START_BALANCE, {**withdrawal, "amount_usd": 1000.0}]
+    state = state_for(settings, profile, trades=[trade(local(10, 5), -100.0)], events=events)
+    b = monthly_drawdown_lock_breaker(state, profile, settings, NOW)
+    assert not b.triggered and b.current_text == "no se puede medir"
+    assert b.summary == "caída del mes: no se puede medir (saldo negativo)"
+    assert b.message.startswith("Tu máximo del mes quedó en 0 USD y tu saldo en -800 USD. Ojo:")
+    assert "la caída del mes no se puede medir y el freno del mes no salta" in b.message
+    assert "0 %" not in b.message
+    v = evaluate_breakers(state, profile, settings, NOW, lock=NO_LOCK)
+    d = v.to_dict()["drawdown_measure"]
+    assert d["unmeasurable"] is True
+    assert d["drawdown_text"] == "no se puede medir (saldo negativo)"
+    assert d["month"]["drawdown_text"] == "no se puede medir (saldo negativo)"
+
+
+def test_a_restart_from_a_negative_balance_does_not_say_at_its_peak(settings, profile):
+    """Revisión 7 (E5): bloqueo con saldo -50, LOCKED borrado sin corregir el dato."""
+    events = [START_BALANCE]
+    trades = [trade(local(10, 5, 11), -350.0)]
+    locks = [{"id": 1, "triggered_at": local(10, 5, 15), "trigger_code": MONTHLY_DRAWDOWN_LOCK}]
+    state = build_trading_state(
+        trades=trades,
+        open_positions=[],
+        wallet_events=events,
+        volatility_events=[],
+        settings=settings,
+        profile=profile,
+        now=NOW,
+        safety_locks=locks,
+    )
+    b = monthly_drawdown_lock_breaker(state, profile, settings, NOW)
+    assert not b.triggered
+    assert "en su máximo" not in b.message
+    assert "desde entonces el saldo calculado de tu billetera es negativo (-50 USD)" in b.message
+    assert "En todo el mes la caída es más del 100 % (300 USD → -50 USD)" in b.message
+    assert b.message.count("Revisá lo que cargaste") == 1
+    assert "no se puede medir bien" not in b.message
+    v = evaluate_breakers(state, profile, settings, NOW, lock=NO_LOCK)
+    warning = v.to_dict()["drawdown_measure"]["negative_balance_warning"]
+    assert "en todo el mes la caída pasa el 100 %, pero desde el bloqueo no se puede medir" in (
+        warning
+    )

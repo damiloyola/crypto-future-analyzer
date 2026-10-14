@@ -1325,3 +1325,139 @@ def test_records_keep_the_planned_risk(settings, profile):
     assert t.planned_risk_usd == 50.0 and t.to_dict()["initial_risk_usd"] == 50.0
     state = build(settings, profile, positions=[pos, legacy])
     assert state.open_risk_usd == 30.0  # el límite del día usa el riesgo de ahora
+
+
+# --- revisión 7: billetera vaciada por un retiro ---------------------------------------
+
+
+def empty_wallet_state(settings, profile, middle_events=(), middle_trades=(), deposits=(100.0,)):
+    """300 → 100 (66,67 %), retira 100 (todo) el 06/10, lo del medio y los depósitos del 07/10."""
+    events = [
+        *REFILL_BASE,
+        wallet(local(10, 6, 10), "withdrawal", 100.0),
+        *middle_events,
+        *(wallet(local(10, 7, 10 + i), "deposit", a) for i, a in enumerate(deposits)),
+    ]
+    return build(settings, profile, trades=[*REFILL_TRADES, *middle_trades], events=events)
+
+
+def test_a_balance_noted_while_the_wallet_is_empty_keeps_the_remembered_drawdown(settings, profile):
+    """Revisión 7: retirar todo, anotar el saldo real (5) y depositar 95 sigue en 66,67 %."""
+    note = [wallet(local(10, 6, 12), "balance", 5.0)]
+    w = empty_wallet_state(settings, profile, note, deposits=()).wallet
+    assert (w.current_balance_usd, w.month_peak_usd) == (5.0, 15.0)
+    assert w.drawdown_pct == pytest.approx(200 / 3)
+    w = empty_wallet_state(settings, profile, note, deposits=(95.0,)).wallet
+    assert (w.current_balance_usd, w.month_peak_usd) == (100.0, 300.0)
+    assert w.drawdown_pct == pytest.approx(200 / 3)
+
+
+def test_a_win_while_the_wallet_is_empty_keeps_the_remembered_drawdown(settings, profile):
+    """Revisión 7: retirar todo, ganar 2 y depositar 100; después perder 60 bloquea."""
+    from app.safety.breakers import MONTHLY_DRAWDOWN_LOCK, evaluate_breakers
+    from app.safety.lockfile import LockInfo
+
+    win = [trade(local(10, 6, 12), 2.0)]
+    w = empty_wallet_state(settings, profile, middle_trades=win).wallet
+    assert w.current_balance_usd == 102.0
+    assert w.drawdown_pct == pytest.approx(200 / 3)
+    state = empty_wallet_state(
+        settings, profile, middle_trades=[*win, trade(local(10, 8, 12), -60.0)]
+    )
+    assert state.wallet.current_balance_usd == 42.0
+    assert state.wallet.drawdown_pct > 70.0  # antes daba 58,82 % y no bloqueaba
+    v = evaluate_breakers(state, profile, settings, NOW, lock=LockInfo(False, "LOCKED"))
+    assert v.breaker(MONTHLY_DRAWDOWN_LOCK).triggered
+
+
+@pytest.mark.parametrize("deposits", [(100.0,), (5.0, 95.0), (50.0, 50.0)])
+def test_a_loss_while_the_wallet_is_empty_still_counts_after_the_refill(
+    settings, profile, deposits
+):
+    """Revisión 7: retirar todo, perder 10 y volver a depositar da 70 %, como sin retirar."""
+    from app.safety.breakers import MONTHLY_DRAWDOWN_LOCK, evaluate_breakers
+    from app.safety.lockfile import LockInfo
+
+    loss = [trade(local(10, 6, 12), -10.0)]
+    state = empty_wallet_state(settings, profile, middle_trades=loss, deposits=deposits)
+    w = state.wallet
+    if deposits == (50.0, 50.0):
+        # El primer depósito ya deja saldo positivo (40, máximo 150: 73,33 %) y
+        # el segundo devuelve el resto sin cambiar ese % (las reglas en orden).
+        assert w.drawdown_pct == pytest.approx(110 / 150 * 100)
+    else:
+        assert (w.current_balance_usd, w.month_peak_usd) == (90.0, 300.0)
+        assert w.drawdown_pct == pytest.approx(70.0)
+    v = evaluate_breakers(state, profile, settings, NOW, lock=LockInfo(False, "LOCKED"))
+    assert v.breaker(MONTHLY_DRAWDOWN_LOCK).triggered
+    plain = build(settings, profile, trades=[*REFILL_TRADES, *loss], events=REFILL_BASE).wallet
+    assert plain.drawdown_pct == pytest.approx(70.0)
+
+
+def test_withdrawing_more_than_the_balance_and_back_keeps_the_drawdown(settings, profile):
+    """Retirar 120 con 100 de saldo (-20), otro retiro de 10, ganar 15 y devolver 130."""
+    events = [
+        *REFILL_BASE,
+        wallet(local(10, 6, 10), "withdrawal", 120.0),
+        wallet(local(10, 6, 11), "withdrawal", 10.0),
+        wallet(local(10, 7, 10), "deposit", 130.0),
+    ]
+    w = build(
+        settings, profile, trades=[*REFILL_TRADES, trade(local(10, 6, 12), 15.0)], events=events
+    ).wallet
+    # Como si no hubiera retirado nada: 300 → 100 y +15 → 115 (61,67 %).
+    assert (w.current_balance_usd, w.month_peak_usd) == (115.0, 300.0)
+    assert w.drawdown_pct == pytest.approx(185 / 3)
+    assert w.month_withdrawn_open_usd == 0.0
+
+
+def test_losses_closed_at_the_same_instant_as_the_trigger_belong_to_it():
+    """Revisión 7: dos stops que saltan juntos a las 11:00 no "estiran" la pausa."""
+    trades = [trade(local(10, 13, h), -5.0) for h in (9, 10, 11)]
+    same = trade(local(10, 13, 11), -5.0, symbol="ETH")
+    s = streak([*trades, same], now=local(10, 13, 12))
+    assert s.cooldown_started_at == local(10, 13, 11)
+    assert s.cooldown_until == local(10, 13, 15)
+    assert s.cooldown_trigger_ids == (*(t["id"] for t in trades), same["id"])
+    assert s.cooldown_extended_at is None and s.cooldown_extended_by_id is None
+    assert s.losses_during_cooldown == 0
+    later = trade(local(10, 13, 12), -5.0)  # esta sí la estira
+    s = streak([*trades, same, later], now=local(10, 13, 12, 30))
+    assert s.cooldown_until == local(10, 13, 16)
+    assert s.cooldown_extended_by_id == later["id"] and s.losses_during_cooldown == 1
+
+
+def test_withdrawal_effect_uses_balances_noted_later():
+    """Revisión 7 (E9): un retiro con fecha anterior al primer saldo anotado sube el de antes."""
+    from app.safety.state import withdrawal_effect
+
+    events = [wallet(local(10, 10), "balance", 1000.0)]
+    trades = [trade(local(10, 7), -100.0)]
+    args = {"now": NOW, "month_start": MONTH_START, "assumed_start_usd": 300.0}
+    e = withdrawal_effect(events, trades, 400.0, local(10, 5, 10), **args)
+    # 05/10: 1.000 + 100 (la pérdida del 07/10) + 400 (el retiro) = 1.500 antes del retiro.
+    assert (e.balance_before_usd, e.leaves_negative, e.assumed) == (1500.0, False, False)
+    # Después del saldo anotado: baja el saldo de hoy.
+    e = withdrawal_effect(events, trades, 1200.0, local(10, 12), **args)
+    assert (e.balance_before_usd, e.negative_balance_usd) == (1000.0, -200.0)
+    assert e.negative_at == local(10, 12).astimezone(UTC)
+    # Sin saldos anotados: el supuesto al empezar el mes.
+    e = withdrawal_effect([], trades, 100.0, local(10, 8), **args)
+    assert (e.balance_before_usd, e.assumed) == (200.0, True)
+
+
+def test_withdrawal_effect_sees_a_later_balance_go_negative():
+    """Revisión 7 (E9): 300 el 01/10, -100 el 05/10, retiro de 200 hoy; otro de 250 el 02/10."""
+    from app.safety.state import withdrawal_effect
+
+    events = [
+        wallet(local(10, 1, 9), "balance", 300.0),
+        wallet(local(10, 13, 9), "withdrawal", 200.0),
+    ]
+    trades = [trade(local(10, 5, 10), -100.0)]
+    args = {"now": NOW, "month_start": MONTH_START, "assumed_start_usd": 300.0}
+    e = withdrawal_effect(events, trades, 250.0, local(10, 2, 10), **args)
+    assert e.balance_before_usd == 300.0  # en su fecha alcanzaba...
+    # ...pero con la pérdida del 05/10 queda en -50 (y hoy, con el otro retiro, en -250).
+    assert e.leaves_negative and e.negative_balance_usd == -50.0
+    assert e.negative_at == local(10, 5, 10).astimezone(UTC)

@@ -1157,11 +1157,11 @@ def test_a_withdrawal_bigger_than_the_balance_needs_yes(db):
 def test_the_withdrawal_check_uses_the_balance_at_its_date(db):
     run(db, "balance", "--amount", "300", "--date", "2026-10-01 09:00")
     run(db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-100", "--closed", "05/10 10:00")
-    # El 04/10 el saldo era 300: retirar 250 entra.
-    code, _, err = run(db, "withdraw", "--amount", "250", "--date", "04/10 10:00")
+    # El 04/10 el saldo era 300: retirar 150 entra (el 05/10 queda en 50).
+    code, _, err = run(db, "withdraw", "--amount", "150", "--date", "04/10 10:00")
     assert code == 0, err
     code, _, err = run(db, "withdraw", "--amount", "250", "--date", "06/10 10:00")
-    assert code == 1 and "el 06/10 10:00 (-50,00 USD)" in err
+    assert code == 1 and "el 06/10 10:00 (50,00 USD)" in err
 
 
 def test_withdrawal_confirmation_can_be_turned_off(tmp_path, db):
@@ -1454,5 +1454,77 @@ def test_a_confirmed_oversized_withdrawal_says_the_monthly_brake_is_off(db):
     assert code == 0, err
     _, out, _ = run(db, "status")
     assert "saldo -800,00 USD" in out
-    assert "no se puede medir bien y el freno del mes no salta hasta que lo corrijas" in out
+    assert "no se puede medir y el freno del mes no salta hasta que lo corrijas" in out
     assert "pasa el 100 %" not in out
+
+
+def test_the_line_after_loading_warns_about_a_negative_balance(db):
+    """Revisión 7 (E5): la línea de los frenos después de cargar trae el aviso de revisar."""
+    run(db, "balance", "--amount", "300", "--date", "2026-10-01 00:00")
+    code, out, _ = run(
+        db,
+        "add",
+        "--symbol",
+        "BTC",
+        "--side",
+        "long",
+        "--pnl",
+        "-350",
+        "--closed",
+        "05/10 10:00",
+        "--yes",
+    )
+    assert code == 0
+    first = out.index("Frenos de seguridad: ROJO")
+    assert "la billetera del mes cayó más del 100 % desde su máximo" in out[first:]
+    assert (
+        "Ojo: el saldo calculado de tu billetera da negativo (-50 USD), así que la caída "
+        in (out[first:])
+    )
+    assert "Revisá lo que cargaste" in out[first:]
+
+
+def test_a_withdrawal_that_leaves_the_balance_negative_is_not_shown_as_zero(db):
+    """Revisión 7 (E5): retiro mayor que el saldo (con --yes): "no se puede medir", no "0 %"."""
+    run(db, "balance", "--amount", "300", "--date", "2026-10-01 00:00")
+    run(db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-100", "--closed", "05/10 10:00")
+    code, out, _ = run(db, "withdraw", "--amount", "1000", "--date", "06/10 10:00", "--yes")
+    assert code == 0
+    assert "Ojo: el saldo calculado de tu billetera da negativo (-800 USD)" in out
+    assert "la caída del mes no se puede medir" in out
+    _, out, _ = run(db, "status")
+    assert "no se puede medir (tope 70 %)" in out
+    assert "caída no se puede medir (saldo negativo)" in out
+    assert "caída 0 %" not in out and "0 % de 70 %" not in out
+
+
+def test_a_backdated_withdrawal_uses_the_balance_noted_later(db):
+    """Revisión 7 (E9): el saldo del 05/10 sale hacia atrás desde el anotado el 10/10."""
+    run(db, "balance", "--amount", "1000", "--date", "10/10 00:00")
+    code, out, err = run(db, "withdraw", "--amount", "400", "--date", "05/10 10:00")
+    assert code == 0, err  # el 05/10 había 1.400 (1.000 + los 400 que se retiraron)
+    assert "Retiro #2 guardado" in out
+    # Antes del primer saldo anotado, un retiro sube el saldo de antes (el anotado ya lo
+    # incluye): nunca deja nada en negativo.
+    code, out, err = run(db, "withdraw", "--amount", "2000", "--date", "04/10 10:00")
+    assert code == 0, err
+    # Después del saldo anotado sí se compara con él.
+    code, out, err = run(db, "withdraw", "--amount", "1200", "--date", "11/10 10:00")
+    assert code == 1
+    assert "más grande que el saldo de tu billetera el 11/10 10:00 (1.000,00 USD)" in err
+    assert "supuesto" not in err and "nunca lo anotaste" not in err
+    assert len(repo(db).list_wallet_events()) == 3  # no se guardó
+
+
+def test_a_backdated_withdrawal_that_leaves_today_negative_needs_yes(db):
+    """Revisión 7 (E9): en su fecha alcanzaba, pero con lo cargado después queda negativo."""
+    run(db, "balance", "--amount", "300", "--date", "01/10 09:00")
+    run(db, "add", "--symbol", "BTC", "--side", "long", "--pnl", "-100", "--closed", "05/10 10:00")
+    assert run(db, "withdraw", "--amount", "200", "--date", "13/10 09:00")[0] == 0
+    code, _, err = run(db, "withdraw", "--amount", "250", "--date", "02/10 10:00")
+    assert code == 1
+    assert "el 02/10 10:00 tenías 300,00 USD, pero con este retiro de 250,00 USD" in err
+    assert "quedaría en negativo el 05/10 10:00 (-50,00 USD)" in err
+    assert "No se guardó nada" in err
+    assert len(repo(db).list_wallet_events()) == 2
+    assert run(db, "withdraw", "--amount", "250", "--date", "02/10 10:00", "--yes")[0] == 0

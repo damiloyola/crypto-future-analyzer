@@ -2053,22 +2053,31 @@ def _correlation_rule(
     capped: bool,
     cap_enabled: bool,
     full: bool = False,
+    open_risk_in_day: float = 0.0,
 ) -> RuleResult:
     """Riesgo combinado con las posiciones correlacionadas: dentro del tope o no.
 
     ``full``: las posiciones abiertas ya llenan el tope (no queda nada para el
-    plan nuevo).
+    plan nuevo). ``open_risk_in_day``: el riesgo de las posiciones abiertas
+    que ya se descontó de lo que queda del límite del día
+    (``trade_plan.daily_cap_includes_open_risk``); si hay, el texto aclara
+    que "no suma" es solo para el tope de posiciones correlacionadas (D6).
     """
     side = _SIDE_TEXT[exposure.side]
     if not exposure.counted:
-        return RuleResult(
-            code=CORRELATION_RULE,
-            ok=True,
-            message=(
+        if open_risk_in_day > 0:
+            message = (
+                f"No tenés posiciones abiertas en {side} que se muevan junto con {symbol}: para "
+                "el tope de posiciones correlacionadas, el plan no suma riesgo con otras (lo "
+                "que tenés en juego en tus posiciones abiertas sí cuenta en lo que te queda del "
+                "límite del día)."
+            )
+        else:
+            message = (
                 f"No tenés posiciones abiertas en {side} que se muevan junto con {symbol}: el "
                 "plan no suma riesgo con otras."
-            ),
-        )
+            )
+        return RuleResult(code=CORRELATION_RULE, ok=True, message=message)
     existing = exposure.existing_risk_usd
     combined = existing + new_risk
     phrase = _exposure_phrase(exposure, symbol)
@@ -2721,6 +2730,7 @@ def _build(
                     capped=capped_by_corr,
                     cap_enabled=bool(corr_cfg.cap_new_risk_to_limit),
                     full=full,
+                    open_risk_in_day=daily_open_risk,
                 )
             )
         hedge = _hedge_warning(

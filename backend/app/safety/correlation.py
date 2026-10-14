@@ -681,7 +681,9 @@ class Exposure:
     (cobertura en la misma moneda, otra moneda en dirección contraria o
     correlación baja). ``existing_risk_usd`` es la suma del riesgo
     de ``counted``: lo que hay que sumarle al riesgo del plan nuevo antes de
-    compararlo con ``combined_risk_limit``.
+    compararlo con ``combined_risk_limit``. ``skipped_count_in_day``: el
+    riesgo de las salteadas igual cuenta en lo que queda del límite del día
+    (``trade_plan.daily_cap_includes_open_risk``); los textos lo aclaran.
     """
 
     new_symbol: str
@@ -690,6 +692,7 @@ class Exposure:
     counted: tuple[ExposureEntry, ...]
     skipped: tuple[ExposureEntry, ...]
     matrix_as_of: datetime | None = None
+    skipped_count_in_day: bool = False
 
     @property
     def existing_risk_usd(self) -> float:
@@ -725,9 +728,20 @@ class Exposure:
         side = _SIDE_WORD[self.new_side]
         new = self.new_symbol
         if not self.counted:
+            head = f"No hay posiciones abiertas en {side} que se muevan junto con {new}"
+            if not self.skipped:
+                return f"{head}: el plan no suma riesgo con otras posiciones."
+            # Hay otras posiciones (al revés o poco correlacionadas): no suman
+            # al tope, pero su riesgo puede contar en el límite del día (D6).
+            day = (
+                " (el riesgo de las que tenés abiertas sí cuenta en lo que te queda del límite "
+                "del día)"
+                if self.skipped_count_in_day
+                else ""
+            )
             return (
-                f"No hay posiciones abiertas en {side} que se muevan junto con "
-                f"{new}: el plan no suma riesgo con otras posiciones."
+                f"{head}: para el tope de posiciones correlacionadas, el plan no suma riesgo con "
+                f"otras posiciones{day}."
             )
         known = [e for e in self.counted if e.reason != REASON_UNKNOWN_CORRELATION]
         unknown = [e for e in self.counted if e.reason == REASON_UNKNOWN_CORRELATION]
@@ -793,6 +807,7 @@ class Exposure:
                 "unknown_symbols": list(self.unknown_symbols),
                 "has_unknown_correlation": self.has_unknown_correlation,
                 "matrix_as_of": _iso(self.matrix_as_of),
+                "skipped_count_in_day": self.skipped_count_in_day,
                 "explanation": self.explanation,
             }
         )
@@ -818,7 +833,7 @@ def _entry(
     threshold: float,
     *,
     limit_multiple: float | None = None,
-    hedge_counts_in_day: bool = True,
+    counts_in_day: bool = True,
 ) -> ExposureEntry:
     symbol = _norm_symbol(position.symbol)
     side = _norm_side(position.side)
@@ -846,7 +861,7 @@ def _entry(
                 False,
                 REASON_HEDGE,
                 hedge_explanation(
-                    symbol, side, limit_multiple=limit_multiple, counts_in_day=hedge_counts_in_day
+                    symbol, side, limit_multiple=limit_multiple, counts_in_day=counts_in_day
                 ),
             )
         if corr is None:
@@ -858,7 +873,8 @@ def _entry(
         return make(
             False,
             REASON_OPPOSITE_SIDE,
-            f"{symbol} está en {_SIDE_WORD[side]}: va al revés del plan{relation}: no suma riesgo.",
+            f"{symbol} está en {_SIDE_WORD[side]}: va al revés del plan{relation}"
+            + _skipped_scope(limit_multiple, counts_in_day),
         )
     if symbol == new_symbol:
         return make(
@@ -886,8 +902,23 @@ def _entry(
         False,
         REASON_LOW_CORRELATION,
         f"{symbol} no se mueve tan junto con {new_symbol} (correlación {corr_text}, por "
-        f"debajo de {fmt_num(threshold, 2)}): no suma riesgo.",
+        f"debajo de {fmt_num(threshold, 2)})" + _skipped_scope(limit_multiple, counts_in_day),
     )
+
+
+def _skipped_scope(limit_multiple: float | None, counts_in_day: bool) -> str:
+    """Qué significa que una posición no sume: al tope sí, al límite del día no (D6).
+
+    ``": no suma al tope de posiciones correlacionadas (1,5 × tu riesgo), pero
+    su riesgo sí cuenta en lo que te queda del límite del día."`` con
+    ``trade_plan.daily_cap_includes_open_risk`` (``counts_in_day``), el mismo
+    alcance que ``hedge_explanation``.
+    """
+    cap = "" if limit_multiple is None else f" ({fmt_num(limit_multiple, 2)} × tu riesgo)"
+    text = f": no suma al tope de posiciones correlacionadas{cap}"
+    if counts_in_day:
+        return f"{text}, pero su riesgo sí cuenta en lo que te queda del límite del día."
+    return f"{text}."
 
 
 def hedge_explanation(
@@ -926,7 +957,7 @@ def correlated_exposure(
     threshold: float,
     *,
     limit_multiple: float | None = None,
-    hedge_counts_in_day: bool = True,
+    counts_in_day: bool = True,
 ) -> Exposure:
     """Qué posiciones abiertas suman su riesgo al de un plan nuevo.
 
@@ -942,8 +973,10 @@ def correlated_exposure(
     también se saltean, con su motivo.
 
     ``threshold`` va de 0 (excluido) a 1, como ``correlation.high_threshold``.
-    ``limit_multiple`` / ``hedge_counts_in_day``: solo para el texto de una
-    cobertura (``hedge_explanation``; pasar
+    ``limit_multiple`` / ``counts_in_day``: solo para los textos de las
+    posiciones que no suman (cobertura, al revés o poco correlacionadas: "no
+    suma al tope de posiciones correlacionadas (1,5 × tu riesgo), pero su
+    riesgo sí cuenta en lo que te queda del límite del día"; pasar
     ``correlation.max_combined_risk_multiplier`` y
     ``trade_plan.daily_cap_includes_open_risk``).
     ``ValueError`` si un lado no es long/short, un símbolo está vacío o un
@@ -964,7 +997,7 @@ def correlated_exposure(
             matrix,
             threshold,
             limit_multiple=limit_multiple,
-            hedge_counts_in_day=hedge_counts_in_day,
+            counts_in_day=counts_in_day,
         )
         (counted if entry.counted else skipped).append(entry)
     return Exposure(
@@ -974,6 +1007,7 @@ def correlated_exposure(
         counted=tuple(counted),
         skipped=tuple(skipped),
         matrix_as_of=None if matrix is None else matrix.as_of,
+        skipped_count_in_day=counts_in_day,
     )
 
 
