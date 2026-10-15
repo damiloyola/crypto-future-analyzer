@@ -124,6 +124,15 @@ El frontend solo muestra lo que devuelve la API; no calcula riesgo.
   `--yes` para resultados grandes, eventos de más de 7 días, retiros mayores
   que el saldo y riesgo abierto mayor que el saldo o que 3 × el riesgo
   (`app.manual_input`).
+- **Frenos, cuarta ronda (Hito 5):** el bloqueo del mes mira la **peor caída**
+  a la que llegó el mes o desde el último desbloqueo, aunque después haya
+  mejorado (`latch_worst_drawdown`); un saldo calculado negativo por un retiro
+  deja el estado en ROJO "datos de la billetera inconsistentes" sin LOCKED
+  hasta corregirlo (`inconsistent_balance_blocks`); un bloqueo que con los
+  datos corregidos no habría saltado se ignora (`ignore_lock_if_not_reproducible`);
+  después de desbloquear, lo retirado antes del bloqueo ya no cuenta como "a
+  devolver" (`unlock_resets_withdrawals`); un saldo anotado más alto que el
+  calculado, con plata retirada pendiente, primero cuenta como devolución.
 - **Evento de alta volatilidad (Hito 5):** se guarda en la base con nota y
   hora de fin; bloquea todos los planes hasta esa hora y después se apaga solo.
   Una posición abierta en la misma moneda y dirección contraria es cobertura

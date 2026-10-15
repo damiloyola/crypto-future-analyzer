@@ -522,6 +522,20 @@ class MonthlyDrawdownLock(_Strict):
     # Si existe un LOCKED de este mes que no quedó anotado en la base (versión
     # vieja o falla de la base), la app lo anota sola con su fecha.
     backfill_unrecorded_lock: bool = True
+    # El bloqueo mira la PEOR caída a la que llegó el mes (o desde el último
+    # desbloqueo), no solo la de ahora: si en algún momento llegó al tope, se
+    # bloquea aunque después un depósito o una ganancia la haya mejorado.
+    latch_worst_drawdown: bool = True
+    # Saldo calculado negativo por un retiro (dato imposible): estado ROJO
+    # "datos de la billetera inconsistentes" sin LOCKED ni informe, hasta que
+    # el saldo vuelva a 0 o más.
+    inconsistent_balance_blocks: bool = True
+    # Un bloqueo que con los datos corregidos no habría saltado (error de
+    # tipeo) se ignora: la caída se mide con el mes entero.
+    ignore_lock_if_not_reproducible: bool = True
+    # Después de desbloquear se arranca de cero también con lo retirado antes
+    # del bloqueo: un depósito posterior sube el máximo como cualquier depósito.
+    unlock_resets_withdrawals: bool = True
 
 
 class CircuitBreakersConfig(_Strict):
